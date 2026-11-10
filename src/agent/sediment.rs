@@ -129,6 +129,10 @@ pub struct SedimentDeps<'a> {
     /// capability_*）对照本表校验，不符拒写+warn（错误结论不固化）；
     /// 空表=无锚，清单类断言一律拒写
     pub available_tools: Vec<String>,
+    /// 存储保留期与硬配额清扫上下文（None=缺省策略未激活或装配面缺席 →
+    /// 收口钩子整体短路，现行为零变化；判定与执行细节见 `storage_retention`
+    /// 模块头）。runner 调用侧按 memory.retention_policy() 装配
+    pub retention: Option<crate::agent::storage_retention::RetentionSweepCtx>,
 }
 
 /// 沉淀结果
@@ -381,6 +385,29 @@ pub async fn sediment(
                 );
             }
         }
+    }
+
+    // 7.5 存储保留期与硬配额清扫（会话收口钩子；缺省策略短路零发生）。
+    //    读路径零参与：触发位=收口（本钩子）+ 启动巡检（serve 装配面）。
+    //    fail-soft：错误只登记不重试（无重试风暴），绝不阻断收口主流程。
+    //    活跃写者文件本轮跳过重写（Windows 打开句柄不可 rename），文件级
+    //    释放由后续收口/巡检轮转覆盖。
+    if let Some(ctx) = deps.retention.take() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let report = crate::agent::storage_retention::run_retention_sweep(ctx, now_ms).await;
+        tracing::info!(
+            session_id = %session_id,
+            files_scanned = report.files_scanned,
+            files_modified = report.files_modified,
+            released = report.released_count,
+            payload_released = report.payload_released,
+            exempt_skipped = report.exempt_skipped,
+            aborted = report.aborted.len(),
+            "sediment: retention sweep done (fail-soft; default policy = zero-op)"
+        );
     }
 
     // 8. 离线积压事件补写（CacheOnly→Persisted 对账闭环）:会话收尾网络
@@ -2008,6 +2035,8 @@ mod tests {
             event_store: None,
             auditor: Some(&auditor),
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let lines = vec![
             JournalLine {
@@ -2098,6 +2127,8 @@ mod tests {
                 },
                 hashes: None,
             }],
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let result = sediment(
             &mut deps,
@@ -2148,6 +2179,8 @@ mod tests {
             event_store: None,
             auditor: Some(&auditor),
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let mut result = SedimentResult::default();
         // 账本加载离线失败 → best-effort skip(不 panic 不写账)
@@ -2355,6 +2388,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let result = rollup_old_summaries(&mut deps, &cfg).await;
         assert!(result.is_ok(), "below threshold / no server should be Ok");
@@ -2376,6 +2411,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let messages = vec![Message::User {
             content: "hello".to_string(),
@@ -2409,6 +2446,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let messages = vec![Message::User {
             content: "hello".to_string(),
@@ -2446,6 +2485,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let messages = vec![
             Message::User {
@@ -2503,6 +2544,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let messages = vec![Message::User {
             content: "记住这件事,系统做了上下文自检".to_string(),
@@ -2546,6 +2589,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let messages = vec![Message::User {
             content: "今天是我生日".to_string(),
@@ -2585,6 +2630,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let messages = vec![Message::User {
             content: "今天天气不错".to_string(),
@@ -2689,6 +2736,8 @@ mod tests {
             event_store: None,
             auditor: Some(&auditor),
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let messages = vec![Message::User {
             content: "第一条".to_string(),
@@ -2769,6 +2818,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         // 4 条消息：长度过前置闸，证明跳过来自开关而非长度
         let messages = vec![
@@ -2818,6 +2869,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let messages = vec![
             Message::User {
@@ -2860,6 +2913,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let messages = vec![
             Message::User {
@@ -2919,6 +2974,8 @@ mod tests {
             event_store: None,
             auditor: Some(&auditor),
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let messages = vec![Message::User {
             content: "第一条".to_string(),
@@ -2996,6 +3053,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let candidates = vec![KnowledgeCandidateOut {
             knowledge_kind: "model".to_string(),
@@ -3111,6 +3170,8 @@ mod tests {
             event_store: None,
             auditor: Some(&auditor),
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let mut result = SedimentResult::default();
         consolidate_knowledge_candidates(&mut deps, &cfg, "s-pref", &mut result).await;
@@ -3210,6 +3271,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let mut result = SedimentResult::default();
         propose_ready_candidates(&mut deps, &cfg, "s-prop", "tb-contracts", &mut result).await;
@@ -3285,6 +3348,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let mut result = SedimentResult::default();
         propose_ready_candidates(&mut deps, &cfg, "s-prop", "tb-contracts", &mut result).await;
@@ -3355,6 +3420,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let messages = vec![
             Message::User {
@@ -3420,6 +3487,8 @@ mod tests {
             event_store: None,
             auditor: None,
             journal_lines: Vec::new(),
+            // 测试面无保留期清扫上下文(缺省策略亦整体短路)
+            retention: None,
         };
         let messages = vec![
             Message::User {

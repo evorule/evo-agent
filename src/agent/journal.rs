@@ -736,6 +736,29 @@ pub enum JournalEvent {
         /// {error}|{skipped:true})
         services: serde_json::Value,
     },
+    /// 存储保留期压缩执行落账：保留期/硬配额触发的大字段物理释放随事件
+    /// 落账（压缩判定=确定性纯函数，动作落账可回放——释放了什么、原文
+    /// digest 是什么、豁免跳过了什么均有账面依据）。形态对齐既有
+    /// CompactionPerformed / EmergencyTrimPerformed（前后统计+计数清单）。
+    /// 本事件自身属 digest 链摘要卡类，豁免面永久成员（链上节点不可释放）。
+    RetentionCompactionPerformed {
+        /// 触发形态（"age"=保留期超龄；"quota"=硬配额超限）
+        trigger: String,
+        /// 本文件压缩前累计字节（journal 行字节扫描口径）
+        before_bytes: u64,
+        /// 本文件压缩后累计字节
+        after_bytes: u64,
+        /// 释放的大字段条数
+        released_count: usize,
+        /// 豁免跳过条数（受治理豁免清单保护未触碰的候选数）
+        exempt_skipped: usize,
+        /// 释放原文的 digest 清单（evorule-hash 口径 "blake3:"+64hex；
+        /// 与摘要卡互证——「数据曾存在、内容是该哈希」可机器验证）
+        released_digests: Vec<String>,
+        /// 释放行锚点（"seq={seq};ts={ts};type={type}" 逐条；账面定位键，
+        /// 供 ATIF 导出对账与回放验证）
+        released_anchors: Vec<String>,
+    },
 }
 
 /// 单行 journal 记录(读侧重放消费形态)
@@ -981,6 +1004,16 @@ pub struct JournalWriter {
 /// 进程内活跃写者注册表(键=sanitized session_id)
 static ACTIVE_WRITERS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
     std::sync::Mutex::new(None);
+
+/// 写者活跃查询(注册表快照):保留期清扫跳过活跃会话文件用(与离线 GC 的
+/// 拒绝闸同源;此处 fail-soft 跳过而非拒绝,收口位不阻塞)。键=文件 stem
+/// (sanitized session_id)。
+pub fn writer_active_for(stem: &str) -> bool {
+    ACTIVE_WRITERS
+        .lock()
+        .map(|g| g.as_ref().is_some_and(|set| set.contains(stem)))
+        .unwrap_or(false)
+}
 
 impl Drop for JournalWriter {
     fn drop(&mut self) {
@@ -1833,6 +1866,30 @@ impl JournalWriter {
             round,
             content_hash: content_hash.to_string(),
             wire_len,
+        })
+    }
+
+    /// 存储保留期压缩执行落账(保留期/硬配额清扫经 writer 追加;文件重写后
+    /// 以 Resume 模式续写,同 gc 补落账先例)。best-effort 调用方决定失败处置。
+    #[allow(clippy::too_many_arguments)]
+    pub fn retention_compaction_performed(
+        &self,
+        trigger: &str,
+        before_bytes: u64,
+        after_bytes: u64,
+        released_count: usize,
+        exempt_skipped: usize,
+        released_digests: Vec<String>,
+        released_anchors: Vec<String>,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::RetentionCompactionPerformed {
+            trigger: trigger.to_string(),
+            before_bytes,
+            after_bytes,
+            released_count,
+            exempt_skipped,
+            released_digests,
+            released_anchors,
         })
     }
 

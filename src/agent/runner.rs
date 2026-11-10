@@ -3356,6 +3356,8 @@ impl AgentRunner {
             event_store: self.memory_event_store.as_mut(),
             auditor: self.summarizer.as_ref().and_then(|s| s.auditor()),
             journal_lines: Vec::new(),
+            // 空闲巩固面不做保留期清扫(收口钩子专属位;缺省策略亦整体短路)
+            retention: None,
         };
         let mut result = sediment::SedimentResult::default();
         sediment::consolidate_knowledge_candidates(
@@ -3383,6 +3385,24 @@ impl AgentRunner {
             // 「下一次」检查。新序:sediment 先捕获→lifecycle 紧随检查,事件
             // 出生即受检;已水合的历史事件同批受检(断点5-水合配合)。
             let recipe = memory.recipe.clone().unwrap_or_default();
+            // 存储保留期与硬配额清扫上下文：缺省策略=整体短路不装配（收口
+            // 钩子零发生，现行为零变化）；显式配置后随收口钩子执行。
+            // journal_dir 未启用=仅 payload 面（journal 面零扫描）。
+            let retention = if !memory.retention_policy().is_default() {
+                Some(crate::agent::storage_retention::RetentionSweepCtx {
+                    policy: memory.retention_policy(),
+                    journal_dir: self
+                        .journal_dir
+                        .clone()
+                        .unwrap_or_else(|| std::path::PathBuf::from("data/sessions")),
+                    client: self.evorule_client.clone(),
+                    namespace: self.sediment_config.namespace.clone(),
+                    session_id: session_id.to_string(),
+                    archive_dir_override: None,
+                })
+            } else {
+                None
+            };
             let mut deps = sediment::SedimentDeps {
                 // O-487①:实况工具注册表快照(stable fact 落账前校验工具清单类断言)
                 available_tools: self.tool_handler.tool_names(),
@@ -3397,6 +3417,8 @@ impl AgentRunner {
                 journal_lines: journal
                     .map(|j| j.read_lines().unwrap_or_default())
                     .unwrap_or_default(),
+                // 存储保留期清扫上下文(缺省策略=不装配;见上注释)
+                retention,
             };
             // sediment 四项结果落 journal——此前被 `let _ =` 丢弃，
             // 沉淀成功与否无对账依据（受信通道持久化信号闭环的最后半程）

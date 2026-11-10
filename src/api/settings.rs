@@ -707,6 +707,36 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "window",
         },
         SettingEntry {
+            key: "storage.retention.period",
+            kind: SettingType::Enum,
+            default: json!("forever"),
+            enum_values: Some(vec!["forever", "10y", "3y", "1y", "90d"]),
+            range: None,
+            category: "存储",
+            description: "存储保留期：超过保留期的会话 journal 大字段与 session payload 大原文在会话收口/启动巡检时物理释放（摘要卡+digest 链续接，审计可验证）。按记录最后活动时间计，恰在上限当刻不释放、严格超出才释放。默认 forever=永不释放（现行为零变化）；物理释放不可逆，释放前可选导出归档（storage.retention.action）",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "storage.retention.action",
+            kind: SettingType::Enum,
+            default: json!("compact"),
+            enum_values: Some(vec!["compact", "export_then_compact", "delete"]),
+            range: None,
+            category: "存储",
+            description: "超龄/超限数据的处置动作：compact=释放大字段并留摘要卡与 digest（压缩为摘要链）；export_then_compact=先把原文写出单个 JSONL 归档包（用户可见目录）成功后再压缩，写出失败放弃本轮；delete=物理移除原文（不可逆；digest 卡仍落账，链不断）。默认 compact",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "storage.quota.maxBytes",
+            kind: SettingType::Enum,
+            default: json!("unlimited"),
+            enum_values: Some(vec!["unlimited", "5gb", "2gb", "1gb"]),
+            range: None,
+            category: "存储",
+            description: "存储硬配额：journal+payload 记录字节累计超限时按最旧优先对可压缩记录执行保留期动作直至回落配额内（治理豁免面跳过）。默认 unlimited=不限（现行为零变化）；扫描在会话收口/启动巡检时进行，不阻塞会话主流程",
+            scope: "window",
+        },
+        SettingEntry {
             key: "mentions.maxFileLines",
             kind: SettingType::Number,
             default: json!(600),
@@ -1069,7 +1099,10 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 65); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键;审计摘要卡 audit_summary 接入 +1;共享记忆读取时衰减 memory.decay.enabled/maxIdleAgeSecs 两键 +2;对话流时间戳开关 workbench.showTimestamps +1)
+        assert_eq!(settings.len(), 68); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键;审计摘要卡 audit_summary 开关键;存储保留期与硬配额三键:封闭枚举+缺省=现行为(永久/压缩/不限,零回归))
+        assert_eq!(settings["storage.retention.period"], json!("forever"));
+        assert_eq!(settings["storage.retention.action"], json!("compact"));
+        assert_eq!(settings["storage.quota.maxBytes"], json!("unlimited"));
         assert_eq!(settings["agentTools.audit_summary"], json!(false));
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
