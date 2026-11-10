@@ -995,6 +995,14 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/lsp/status",
             axum::routing::get(crate::api::lsp_api::status),
         )
+        // 均衡观测代理面(工作台均衡仪表面,纯读态):经进程内 EvoruleClient
+        // 透传 evorule-server companion status 的 equilibrium 观测块(最小
+        // 暴露,管理面字段剥离);G16 中间件自动覆盖;上游不可达/旧版一律
+        // 503 结构化错误,前端灰置降级(零写零扰动,观测正交)
+        .route(
+            "/api/equilibrium/status",
+            axum::routing::get(crate::api::equilibrium_api::status),
+        )
         .route(
             "/api/lsp/ws",
             axum::routing::get(crate::api::lsp_api::lsp_ws),
