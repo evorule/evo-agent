@@ -5262,6 +5262,42 @@ impl AgentRunner {
             info!(dropped = dropped_images, "B1: window image budget enforced");
         }
 
+        // 发送前字节门:实测序列化字节,1.5MB 预警、2MB 主动紧急裁剪(与
+        // 承载方缺省请求体上限同源对齐;裁剪与 413 恢复路径同口径落账)
+        let gate = enforce_payload_byte_gate(&mut messages_to_send);
+        if gate.warned {
+            warn!(
+                %session_id,
+                bytes_before = gate.bytes_before,
+                bytes_after = gate.bytes_after,
+                "payload byte gate: warn threshold reached (1.5MB)"
+            );
+        }
+        if gate.trimmed {
+            if let Some(tr) = &gate.trim_report {
+                if let Some(j) = self.active_journal.as_deref() {
+                    if let Err(je) = j.emergency_trim_performed(
+                        tr.before_chars,
+                        tr.after_chars,
+                        tr.elided_tool_results,
+                        tr.folded_approvals,
+                        tr.history_compacted,
+                    ) {
+                        tracing::warn!(session_id = %session_id, error = %je, "emergency_trim_performed journal failed (best-effort)");
+                    }
+                }
+                info!(
+                    %session_id,
+                    bytes_before = gate.bytes_before,
+                    bytes_after = gate.bytes_after,
+                    elided_tool_results = tr.elided_tool_results,
+                    folded_approvals = tr.folded_approvals,
+                    elided_images = tr.elided_images,
+                    "payload byte gate: proactive emergency trim applied (2MB)"
+                );
+            }
+        }
+
         let serde_messages = serde_json::to_value(&messages_to_send)
             .map_err(|e| AgentError::Internal(format!("serialize messages: {}", e)))?;
         let tcb_messages = serde_messages.clone();
@@ -8897,6 +8933,37 @@ impl AgentRunner {
                                                // 非 413 错误与成功路径行为零变化。
                                                let mut payload_retry_used = false;
                                                'payload_attempt: loop {
+                                                   // 发送前字节门(每圈实测):1.5MB 预警、2MB 主动紧急
+                                                   // 裁剪——裁剪与 413 恢复路径同口径落账;主动裁剪后
+                                                   // 仍超限由下方 413 恢复路径兜底
+                                                   let gate = enforce_payload_byte_gate(&mut messages_to_send);
+                                                   if gate.warned {
+                                                       warn!(session_id = %session_id, bytes = gate.bytes_before, "payload byte gate: warn threshold reached (1.5MB)");
+                                                   }
+                                                   if gate.trimmed {
+                                                       if let Some(tr) = &gate.trim_report {
+                                                           if let Some(j) = &journal {
+                                                               if let Err(je) = j.emergency_trim_performed(
+                                                                   tr.before_chars,
+                                                                   tr.after_chars,
+                                                                   tr.elided_tool_results,
+                                                                   tr.folded_approvals,
+                                                                   tr.history_compacted,
+                                                               ) {
+                                                                   tracing::warn!(session_id = %session_id, error = %je, "emergency_trim_performed journal failed (best-effort)");
+                                                               }
+                                                           }
+                                                           info!(
+                                                               session_id = %session_id,
+                                                               bytes_before = gate.bytes_before,
+                                                               bytes_after = gate.bytes_after,
+                                                               elided_tool_results = tr.elided_tool_results,
+                                                               folded_approvals = tr.folded_approvals,
+                                                               elided_images = tr.elided_images,
+                                                               "payload byte gate: proactive emergency trim applied (2MB)"
+                                                           );
+                                                       }
+                                                   }
                                                let serde_messages = match serde_json::to_value(&messages_to_send) {
                                                    Ok(v) => v,
                                                    Err(e) => {
@@ -11476,9 +11543,9 @@ const EMERGENCY_TRIM_KEEP_ROUNDS: usize = 2;
 /// 紧急裁剪报告(落账口径)
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct EmergencyTrimReport {
-    /// 裁剪前全量消息字符数(与 compaction 落账同口径)
+    /// 裁剪前全量消息字符数(与 compaction 落账同口径;含旁路图片 base64)
     pub before_chars: usize,
-    /// 裁剪后全量消息字符数
+    /// 裁剪后全量消息字符数(含旁路图片 base64)
     pub after_chars: usize,
     /// 折叠为占位的工具结果条数
     pub elided_tool_results: usize,
@@ -11486,6 +11553,41 @@ pub(crate) struct EmergencyTrimReport {
     pub folded_approvals: usize,
     /// 是否触发了整段历史压缩兜底层
     pub history_compacted: bool,
+    /// 被清空旁路的图片张数(指纹引用已随折叠标记/压缩占位留痕可回取)
+    pub elided_images: usize,
+}
+
+/// ③层压缩占位符携带的图片指纹引用条数上限(超出收敛为 +N more)
+const EMERGENCY_TRIM_IMAGE_REF_CAP: usize = 8;
+
+/// 图片旁路裁剪的指纹引用(纯函数):blake3 对解码后字节,与 B1 落盘
+/// `data/agent-images/<fingerprint>.<ext>` 内容寻址口径同源,按指纹可回取
+/// 原图。解码失败降级为不可解码注记(fail-visible 于引用面,不阻断裁剪)。
+fn image_fingerprint_ref(img: &crate::agent::translator::ImageData) -> String {
+    use base64::Engine as _;
+    let fp = base64::engine::general_purpose::STANDARD
+        .decode(&img.data_base64)
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .unwrap_or_else(|_| "undecodable".to_string());
+    format!("blake3:{}({},{})", fp, img.mime_type, img.data_base64.len())
+}
+
+/// 单条消息图片清空的引用注记(空图返回空串;超出 cap 收敛为 +N more)
+fn image_elision_note(images: &[crate::agent::translator::ImageData], cap: usize) -> String {
+    if images.is_empty() {
+        return String::new();
+    }
+    let refs: Vec<String> = images.iter().map(image_fingerprint_ref).collect();
+    let (shown, more) = if refs.len() > cap {
+        (refs[..cap].to_vec(), Some(refs.len() - cap))
+    } else {
+        (refs, None)
+    };
+    let mut s = format!(" images elided: {}", shown.join(", "));
+    if let Some(m) = more {
+        s.push_str(&format!(" (+{m} more)"));
+    }
+    s
 }
 
 /// 审批往返形态识别(保守判定):User 轮 content 为含审批留痕键的 JSON
@@ -11500,21 +11602,36 @@ fn is_approval_roundtrip(content: &str) -> bool {
 /// 可判「仍超限」,三层一次性上齐是确定性边界。
 ///
 /// 1. 折叠最老工具结果:近程边界(最近 KEEP_ROUNDS 轮)之前的 tool 消息
-///    content 替换为占位(消息数/角色不变,旁路图连带清空防预算门被架空);
+///    content 替换为占位(消息数/角色不变,旁路图连带清空防预算门被架空,
+///    清空前以 blake3 指纹引用留痕,与 B1 落盘口径同源可回取);
 /// 2. 折叠审批往返:审批留痕 JSON 载荷收敛为单行决策记录(决策语义保留,
-///    不自动批准任何待审项);
+///    不自动批准任何待审项,旁路图同①层留指纹引用);
 /// 3. 整段压缩兜底:system 全保留 + 最近 KEEP_ROUNDS 轮保留,中段替换为
-///    单条占位(轮界切分,不破 assistant↔tool 配对)。
+///    单条占位(轮界切分,不破 assistant↔tool 配对;被压缩段残留图片的
+///    指纹引用收割进占位符,禁只留文字占位)。
 ///
 /// 注:两处近程边界以同一 KEEP_ROUNDS 计,①的可折叠区与③的压缩区重合——
 /// ③触发时①的折叠产出随中段被整段占位吸收;①保留独立执行作为③未来收紧
 /// 触发条件时的兜底,elided_tool_results 仍如实落账供观测。
 pub(crate) fn emergency_trim_for_payload_limit(messages: &mut Vec<Message>) -> EmergencyTrimReport {
-    let count_chars = |ms: &[Message]| ms.iter().map(|m| m.content().len()).sum::<usize>();
+    let count_chars = |ms: &[Message]| {
+        ms.iter()
+            .map(|m| {
+                let mut n = m.content().len();
+                // 计数含旁路图片 base64(媒体失明会让重试判据误判「裁剪无收益」)
+                if let Message::User { images, .. } | Message::Tool { images, .. } = m {
+                    n += images.iter().map(|i| i.data_base64.len()).sum::<usize>();
+                }
+                n
+            })
+            .sum::<usize>()
+    };
     let mut report = EmergencyTrimReport {
         before_chars: count_chars(messages),
         ..Default::default()
     };
+    // ①/②层清空图片时收指纹引用,③层占位符统一携带(层间不丢引用)
+    let mut cleared_image_refs: Vec<String> = Vec::new();
 
     // 近程边界:system 段之后,倒数第 KEEP_ROUNDS 个 user 轮起点
     let system_end = messages
@@ -11545,7 +11662,12 @@ pub(crate) fn emergency_trim_for_payload_limit(messages: &mut Vec<Message>) -> E
             if n == 0 {
                 continue;
             }
-            *content = format!("[tool result elided: {n} bytes]");
+            let note = image_elision_note(images, 4);
+            if !images.is_empty() {
+                cleared_image_refs.extend(images.iter().map(image_fingerprint_ref));
+                report.elided_images += images.len();
+            }
+            *content = format!("[tool result elided: {n} bytes]{note}");
             *images = Vec::new();
             report.elided_tool_results += 1;
         }
@@ -11563,7 +11685,13 @@ pub(crate) fn emergency_trim_for_payload_limit(messages: &mut Vec<Message>) -> E
                             .and_then(|d| d.as_str().map(str::to_string))
                     })
                     .unwrap_or_else(|| "unknown".to_string());
-                *content = format!("[approval roundtrip elided: {n} bytes; decision: {decision}]");
+                let note = image_elision_note(images, 4);
+                if !images.is_empty() {
+                    cleared_image_refs.extend(images.iter().map(image_fingerprint_ref));
+                    report.elided_images += images.len();
+                }
+                *content =
+                    format!("[approval roundtrip elided: {n} bytes; decision: {decision}]{note}");
                 *images = Vec::new();
                 report.folded_approvals += 1;
             }
@@ -11574,12 +11702,40 @@ pub(crate) fn emergency_trim_for_payload_limit(messages: &mut Vec<Message>) -> E
     if let Some((sys_end, split)) = compaction_region_bounds(messages, EMERGENCY_TRIM_KEEP_ROUNDS) {
         if split > sys_end {
             let elided = split - sys_end;
+            // 被压缩段残留旁路图收指纹引用(①层只清 Tool 图;User 图随段消失前
+            // 必须落进占位符)+ ①/②层已清图片的指纹引用,统一带 cap 收敛
+            let mut refs = cleared_image_refs;
+            for m in &messages[sys_end..split] {
+                if let Message::User { images, .. } | Message::Tool { images, .. } = m {
+                    if !images.is_empty() {
+                        refs.extend(images.iter().map(image_fingerprint_ref));
+                        report.elided_images += images.len();
+                    }
+                }
+            }
+            let note = if refs.is_empty() {
+                String::new()
+            } else {
+                let (shown, more) = if refs.len() > EMERGENCY_TRIM_IMAGE_REF_CAP {
+                    (
+                        refs[..EMERGENCY_TRIM_IMAGE_REF_CAP].to_vec(),
+                        Some(refs.len() - EMERGENCY_TRIM_IMAGE_REF_CAP),
+                    )
+                } else {
+                    (refs, None)
+                };
+                let mut s = format!("; images elided: {}", shown.join(", "));
+                if let Some(m) = more {
+                    s.push_str(&format!(" (+{m} more)"));
+                }
+                s
+            };
             messages.drain(sys_end..split);
             messages.insert(
                 sys_end,
                 Message::System {
                     content: format!(
-                        "[history compacted due to request body limit: {elided} messages removed]"
+                        "[history compacted due to request body limit: {elided} messages removed]{note}"
                     ),
                 },
             );
@@ -11588,6 +11744,58 @@ pub(crate) fn emergency_trim_for_payload_limit(messages: &mut Vec<Message>) -> E
     }
 
     report.after_chars = count_chars(messages);
+    report
+}
+
+/// 发送前字节门:预警阈值(1.5MB)。达到即观测面告警,提示媒体/历史载荷
+/// 增长,便于提前治理。
+const PAYLOAD_WARN_BYTES: usize = 3 * 1024 * 1024 / 2;
+
+/// 发送前字节门:主动裁剪阈值(2MB)——与承载方缺省请求体上限(axum
+/// DefaultBodyLimit 缺省 2MB)同源对齐。达到即主动执行紧急裁剪(与 413
+/// 恢复路径同口径落账);门只裁一次不循环,裁后仍超限由 413 恢复路径兜底。
+const PAYLOAD_TRIM_BYTES: usize = 2 * 1024 * 1024;
+
+/// 发送前字节门报告(观测口径)
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct PayloadGateReport {
+    /// 门控前实测序列化字节数
+    pub bytes_before: usize,
+    /// 门控后实测序列化字节数
+    pub bytes_after: usize,
+    /// 是否越过预警阈值(1.5MB)
+    pub warned: bool,
+    /// 是否执行了主动紧急裁剪
+    pub trimmed: bool,
+    /// 主动裁剪报告(trimmed 时非 None)
+    pub trim_report: Option<EmergencyTrimReport>,
+}
+
+/// 统一发送前字节门(纯函数,只作用于发送副本):实测序列化字节 →
+/// 1.5MB 预警、2MB 主动紧急裁剪。测量面=完整 messages 序列化字节(含旁路
+/// 图片 base64——纯 token 计数对媒体载荷失明,字节墙必须实测字节)。
+/// 主动裁剪后仍超限不在此处循环,交由 413 恢复路径(裁一次+重试一次)
+/// 兜底;非流式路径无 413 恢复,超限走 fail-visible。
+pub(crate) fn enforce_payload_byte_gate(messages: &mut Vec<Message>) -> PayloadGateReport {
+    let measure = |ms: &[Message]| {
+        serde_json::to_vec(ms)
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX)
+    };
+    let bytes_before = measure(messages);
+    let mut report = PayloadGateReport {
+        bytes_before,
+        bytes_after: bytes_before,
+        warned: bytes_before >= PAYLOAD_WARN_BYTES,
+        trimmed: false,
+        trim_report: None,
+    };
+    if bytes_before >= PAYLOAD_TRIM_BYTES {
+        let tr = emergency_trim_for_payload_limit(messages);
+        report.trimmed = true;
+        report.trim_report = Some(tr);
+        report.bytes_after = measure(messages);
+    }
     report
 }
 
