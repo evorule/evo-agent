@@ -1,4 +1,4 @@
-# 拉起 evorule-server(18080) - 幂等: 探活通过则跳过
+﻿# 拉起 evorule-server(18080) - 幂等: 探活通过则跳过
 $OpsDir = $PSScriptRoot
 . (Join-Path $OpsDir '_common.ps1')
 $cfg = Get-OpsConfig -OpsDir $OpsDir
