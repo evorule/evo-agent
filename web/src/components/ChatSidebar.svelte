@@ -20,6 +20,8 @@
     loadOlderTranscript,
     openGuideTab,
     pushPanelEvent,
+    connBanner,
+    stepCount,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
   // Svelte 5 不深度代理原生 Set(add/delete 不触发重渲染,点击开合会失明),
@@ -46,7 +48,7 @@
     markApprovalReceipt,
   } from '../lib/approvalMemory.js';
   import { buildTurnLayout } from '../lib/chat-layout.js';
-  import { toolCallSummary } from '../lib/tool-call-text.js';
+  import { toolCallSummary, approvalPreview } from '../lib/tool-call-text.js';
   import { switchWorkspace } from '../lib/workspace.js';
   import DirectoryBrowser from './DirectoryBrowser.svelte';
   import { chatWidth } from '../lib/layout.js';
@@ -653,6 +655,20 @@
     if (expandedReceiptAggs.has(id)) expandedReceiptAggs.delete(id);
     else expandedReceiptAggs.add(id);
   }
+  // 活状态条数据源:运行中回合的当前工具与已运行时长——滚看历史时不丢当前态
+  const runningTool = $derived.by(() => {
+    const arr = visibleMessages;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const m = arr[i];
+      if (m.kind === 'tool' && m.running) return m;
+    }
+    return null;
+  });
+  const runningToolElapsed = $derived(
+    $turnActive && runningTool?.startedAt
+      ? formatTook(Math.max(0, nowTick - runningTool.startedAt))
+      : null,
+  );
   async function onLoadOlder() {
     if (loadingOlder) return;
     loadingOlder = true;
@@ -724,6 +740,11 @@
   const expandedTools = new SvelteSet();
   const fullResults = new SvelteSet();
   const TOOL_RESULT_CAP = 4000; // 展开态预览截断帽(「查看全部」解锁全文)
+  // 「查看全部」展开后的次级帽:全文仍超此长度时首尾夹展示(超长输出不在
+  // 对话流内全量铺开;完整输出以 journal 留痕为准)
+  const FULL_EXPAND_CAP = 20000;
+  const FULL_EXPAND_HEAD = 16000;
+  const FULL_EXPAND_TAIL = 2000;
 
   function toggleTool(id) {
     if (expandedTools.has(id)) expandedTools.delete(id);
@@ -1490,6 +1511,11 @@
                     class="tool-full"
                     onclick={() => toggleFull(m.id)}
                   >查看全部(共 {text.length} 字符)</button>
+                {:else if fullResults.has(m.id) && text.length > FULL_EXPAND_CAP}
+                  <!-- 全文仍超大:首尾夹展示,中间省略——超长输出不在对话流内全量铺开 -->
+                  <pre class="tool-payload mono">{text.slice(0, FULL_EXPAND_HEAD)}</pre>
+                  <div class="tb-mid-gap">⋯ 中间已省 {text.length - FULL_EXPAND_HEAD - FULL_EXPAND_TAIL} 字符(完整输出以 journal 留痕为准) ⋯</div>
+                  <pre class="tool-payload mono">{text.slice(-FULL_EXPAND_TAIL)}</pre>
                 {:else}
                   <pre class="tool-payload mono">{text}</pre>
                 {/if}
@@ -1534,9 +1560,25 @@
           <button class="ac-open" onclick={() => openFile(m.path)}>在编辑器打开</button>
         </div>
       {:else if m.kind === 'approval'}
+        {@const pv = approvalPreview(m.toolName, m.command)}
         <div class="approval-card">
           <div class="ap-head">需要审批 · {m.toolName}</div>
-          <pre class="ap-cmd mono">{m.command}</pre>
+          {#if pv.kind === 'file'}
+            <div class="ap-file">
+              <span class="ap-verb">{pv.verb}</span>
+              <span class="ap-path mono" title={pv.path}>{pv.path || '(路径未知)'}</span>
+              {#if pv.path}
+                <button
+                  type="button"
+                  class="ap-open"
+                  onclick={() => openFile(pv.path)}
+                  title="在编辑器打开该目标的当前内容(新建类文件可能尚不存在)"
+                >查看现状</button>
+              {/if}
+            </div>
+          {:else}
+            <pre class="ap-cmd mono">{m.command}</pre>
+          {/if}
           {#if m.alternative}
             <div class="ap-alt">替代方案:{m.alternative}</div>
           {/if}
@@ -2075,6 +2117,17 @@
         {/if}
       </div>
     </div>
+    {#if $turnActive}
+      <div class="live-strip" role="status">
+        <span class="ls-dot" aria-hidden="true"></span>
+        <span class="ls-text mono">
+          第 {$stepCount || '·'} 步{runningTool
+            ? ` · ${runningTool.name} 运行中${runningToolElapsed ? ` · ${runningToolElapsed}` : ''}`
+            : ''}
+        </span>
+        <button type="button" class="ls-stop" onclick={interrupt}>中断</button>
+      </div>
+    {/if}
     {#if engineStalled}
       <div class="heartbeat-stall" role="status">
         ⚠ 引擎已 {stallSeconds}s 无事件返回——长程工具或引擎停滞;持续无响应可中断后重试
@@ -2720,6 +2773,102 @@
   /* 框内回执去左缘标线(一体边框由过程框承担);框外兜底回执保留标线 */
   .process-body .approval-receipt {
     border-left-color: transparent;
+  }
+  /* 活状态条:运行中回合在 composer 上方常驻(步数/当前工具/时长/中断) */
+  .live-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 10px;
+    margin: 0 0 6px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-card);
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+  .live-strip .ls-dot {
+    flex-shrink: 0;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--brand);
+    animation: ls-pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes ls-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.25;
+    }
+  }
+  .live-strip .ls-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .live-strip .ls-stop {
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--danger);
+    border-radius: 4px;
+    padding: 2px 8px;
+    cursor: pointer;
+    font-size: 11px;
+  }
+  .live-strip .ls-stop:hover {
+    background: var(--bg-hover);
+  }
+  /* 审批卡文件族预览行:操作动词+目标路径+查看现状(审批帧不带内容载荷,
+     内容级 diff 不可达——编辑器打开即看现状) */
+  .approval-card .ap-file {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    background: var(--bg-page);
+    font-size: 11px;
+  }
+  .approval-card .ap-verb {
+    flex-shrink: 0;
+    font-weight: var(--fw-sb);
+    color: var(--warning);
+  }
+  .approval-card .ap-path {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--text-primary);
+  }
+  .approval-card .ap-open {
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-secondary);
+    border-radius: 4px;
+    padding: 2px 8px;
+    cursor: pointer;
+    font-size: 11px;
+  }
+  .approval-card .ap-open:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+  /* 「查看全部」展开后仍超长的首尾夹中缝 */
+  .tb-mid-gap {
+    padding: 4px 0;
+    font-size: 10px;
+    color: var(--text-muted);
+    text-align: center;
   }
   /* 未选择工作区的引导条(术语白话化批):缺省目录对用户是黑盒,显式引导选择 */
   .ws-hint {

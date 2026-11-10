@@ -53,3 +53,29 @@ export function toolCallSummary(name, args, cap = 64) {
   }
   return '';
 }
+
+// ---- 审批卡结构化预览分派(纯函数):审批请求帧只携带 command 单文本描述,
+// 内嵌内容级 diff 不可达;文件族按操作动词+目标路径预览(配「在编辑器查看
+// 现状」),其余工具沿用命令文本块。 ----
+
+/** 文件族工具 → 操作动词(中文名) */
+const FILE_TOOL_VERBS = {
+  file_write: '覆写',
+  file_create: '新建',
+  file_move: '移动',
+  file_delete: '删除',
+  search_replace: '编辑',
+  edit_file: '编辑',
+};
+
+/**
+ * 审批卡预览分派(纯函数):文件族返回 {kind:'file', verb, path}(path=command
+ * 文本,即目标路径描述);其余返回 {kind:'text'}(沿用命令文本块)。
+ */
+export function approvalPreview(toolName, command) {
+  const verb = FILE_TOOL_VERBS[toolName];
+  if (verb) {
+    return { kind: 'file', verb, path: String(command ?? '').trim() };
+  }
+  return { kind: 'text' };
+}
