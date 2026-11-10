@@ -168,8 +168,9 @@ describe('自动批准 POST 409 no_pending_item 静默收卡(后端 T0 已决)',
 });
 
 describe('approver=workspace-allowlist 回执映射(后端 T0 静默批准)', () => {
-  it('pending 卡收场转「已批准(工作区清单)」回执+映射信息条', async () => {
-    // 清单镜像为空(未加载/加载失败)→ 前端判 ask 推待批卡,后端 T0 已决
+  it('pending 卡收场转「已批准(工作区清单)」回执,信息条不再双写', async () => {
+    // 清单镜像为空(未加载/加载失败)→ 前端判 ask 推待批卡,后端 T0 已决;
+    // 收卡转回执后事实已表达,结果帧不再追加「审批结果」信息条(回执在场语义)
     MockWebSocket.last.deliver({
       type: 'ApprovalRequired',
       tool_name: 'shell_exec',
@@ -193,11 +194,36 @@ describe('approver=workspace-allowlist 回执映射(后端 T0 静默批准)', ()
     expect(receipts[0].decision).toBe('sent');
     expect(receipts[0].sentApproved).toBe(true);
     const infos = msgOf('info').filter((m) => String(m.text).startsWith('审批结果'));
-    expect(infos).toHaveLength(1);
-    expect(infos[0].text).toBe('审批结果:已批准(工作区清单)(工具 shell_exec)');
+    expect(infos).toHaveLength(0);
   });
 
-  it('普通人工批准(approver=user)文案不变', async () => {
+  it('人工批准路径:回执在场(本窗口已决策)不重复信息条', async () => {
+    const { markApprovalReceipt } = await import('../src/lib/approvalMemory.js');
+    // 模拟人工决策:待批卡在位且已原位转回执(decideApproval 同面打点)
+    MockWebSocket.last.deliver({
+      type: 'ApprovalRequired',
+      tool_name: 'shell_exec',
+      command: 'find src',
+      risk: 'low',
+      proposal_id: 'p-manual',
+    });
+    markApprovalReceipt('shell_exec', 'p-manual');
+    MockWebSocket.last.deliver({
+      type: 'ApprovalResult',
+      tool_name: 'shell_exec',
+      approved: true,
+      approver: 'user',
+      auto_rejected: false,
+      proposal_id: 'p-manual',
+    });
+    await flush();
+    const infos = msgOf('info').filter((m) => String(m.text).startsWith('审批结果'));
+    expect(infos).toHaveLength(0);
+  });
+
+  it('人工批准路径:本窗口无回执(跨窗口决策)保留信息条兜底', async () => {
+    // 无 ApprovalRequired 先行(决策发生在其他窗口/刷新后)→ 本窗口无回执,
+    // 信息条兜底一行,事实不丢
     MockWebSocket.last.deliver({
       type: 'ApprovalResult',
       tool_name: 'shell_exec',
@@ -208,13 +234,15 @@ describe('approver=workspace-allowlist 回执映射(后端 T0 静默批准)', ()
     });
     await flush();
     const infos = msgOf('info').filter((m) => String(m.text).startsWith('审批结果'));
+    expect(infos).toHaveLength(1);
     expect(infos[0].text).toBe('审批结果:已批准(工具 shell_exec)');
   });
 });
 
-describe('approver=in-workspace 回执映射(B-156 判据②后端工作区内写默认 T0)', () => {
-  it('pending 卡收场转「已批准(工作区内)」回执,不留僵尸卡', async () => {
-    // 判据②是后端默认规则,前端记忆/清单镜像均不命中→必先推待批卡
+describe('approver=in-workspace 回执映射(后端工作区内写默认 T0)', () => {
+  it('pending 卡收场转「已批准(工作区内)」回执,不留僵尸卡,信息条不再双写', async () => {
+    // 判据②是后端默认规则,前端记忆/清单镜像均不命中→必先推待批卡;
+    // 收卡转回执后事实已表达,信息条不再追加(回执在场语义)
     MockWebSocket.last.deliver({
       type: 'ApprovalRequired',
       tool_name: 'file_create',
@@ -238,7 +266,6 @@ describe('approver=in-workspace 回执映射(B-156 判据②后端工作区内�
     expect(receipts[0].decision).toBe('sent');
     expect(receipts[0].sentApproved).toBe(true);
     const infos = msgOf('info').filter((m) => String(m.text).startsWith('审批结果'));
-    expect(infos).toHaveLength(1);
-    expect(infos[0].text).toBe('审批结果:已批准(工作区内)(工具 file_create)');
+    expect(infos).toHaveLength(0);
   });
 });

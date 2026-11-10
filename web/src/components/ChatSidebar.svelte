@@ -43,7 +43,10 @@
     approvalReceiptText,
     aggregateSummary,
     AGGREGATE_THRESHOLD,
+    markApprovalReceipt,
   } from '../lib/approvalMemory.js';
+  import { buildTurnLayout } from '../lib/chat-layout.js';
+  import { toolCallSummary } from '../lib/tool-call-text.js';
   import { switchWorkspace } from '../lib/workspace.js';
   import DirectoryBrowser from './DirectoryBrowser.svelte';
   import { chatWidth } from '../lib/layout.js';
@@ -632,46 +635,23 @@
   // 即整框自动折叠成一行(约一行字高);点击头部展开,再点收起。开合状态
   // 按组键记忆,用户手动开合覆写默认。
   const expandedGroups = new SvelteSet();
+  // 回合布局纯函数(归组/回答提取/回执折叠阈值)在 lib/chat-layout.js,vitest 锁;
+  // 组件只持交互态(手动开合覆写自动折叠缺省)。轮次收尾后,末尾未闭合段
+  // (实时活动)改判闭合——完成态整框自动折叠成一行,不再挂着「进行中」
   const turnLayout = $derived.by(() => {
-    // 归组判定按「连续 agent 活动段」两遍扫描:段内最后一条带正文的
-    // assistant 是回答(single 留框外),其余(tool/纯思考/带中间陈述的
-    // 思考步)全进过程框。背景:MiniMax-M3 型推理模型每个思考步都带
-    // 中间陈述文本,旧判定(仅无正文 assistant 算活动)把它们全部散开
-    // 成 N 个「已深度思考」框(真机实锤=7 步 7 框撑爆对话区)。
-    const out = [];
-    let buf = null;
-    const flushBuf = (closed) => {
-      if (!buf) return;
-      let answerIdx = -1;
-      for (let i = buf.items.length - 1; i >= 0; i--) {
-        const m = buf.items[i];
-        if (m.kind === 'assistant' && (m.text || '').trim()) { answerIdx = i; break; }
-      }
-      const boxed = buf.items.filter((_, i) => i !== answerIdx);
-      if (boxed.length) {
-        out.push({ type: 'process', key: `p${boxed[0].id}`, items: boxed, closed });
-      }
-      if (answerIdx >= 0) {
-        out.push({ type: 'single', key: `m${buf.items[answerIdx].id}`, m: buf.items[answerIdx] });
-      }
-      buf = null;
-    };
-    for (const m of layoutMessages) {
-      if (m.kind === 'tool' || m.kind === 'assistant') {
-        if (!buf) buf = { items: [] };
-        buf.items.push(m);
-      } else {
-        flushBuf(true);
-        out.push({ type: 'single', key: `m${m.id}`, m });
-      }
-    }
-    // 末尾未闭合段=进行中的实时活动,保持框内展开(closed=false)
-    flushBuf(false);
-    return out;
+    const groups = buildTurnLayout(layoutMessages);
+    if ($turnActive) return groups;
+    return groups.map((g) => (g.type === 'process' && !g.closed ? { ...g, closed: true } : g));
   });
   function toggleGroup(key) {
     if (expandedGroups.has(key)) expandedGroups.delete(key);
     else expandedGroups.add(key);
+  }
+  // 回执汇总行(receipt_agg)展开态:点击展开逐条,再点收起
+  const expandedReceiptAggs = new SvelteSet();
+  function toggleReceiptAgg(id) {
+    if (expandedReceiptAggs.has(id)) expandedReceiptAggs.delete(id);
+    else expandedReceiptAggs.add(id);
   }
   async function onLoadOlder() {
     if (loadingOlder) return;
@@ -1107,6 +1087,8 @@
       sentApproved: approved,
       errText: null,
     });
+    // 回执入轨:结果帧据此不再追加重复的「审批结果」信息条(双写消除)
+    markApprovalReceipt(m.toolName, m.proposalId);
     if (approved && scope === 'session') recordSessionAllow(m.toolName, m.command);
     if (approved && scope === 'workspace') {
       // python_exec 提案无 command 字段——放行条目以工具名自匹配
@@ -1339,7 +1321,18 @@
         {/if}
       </button>
     {/if}
-    {#snippet renderMsg(m)}
+    {#snippet renderReceiptRow(r)}
+      <div class="approval-receipt mono" title={r.command}>
+        <span
+          class="ar-mark"
+          class:ok={r.decision === 'sent' && r.sentApproved}
+          class:bad={r.decision === 'error' || r.decision === 'timeout' || r.decision === 'expired' || (r.decision === 'sent' && r.sentApproved === false)}
+        >{approvalReceiptMark(r)}</span>
+        <span class="ar-text">{approvalReceiptText(r)}</span>
+      </div>
+    {/snippet}
+
+    {#snippet renderMsg(m, meta = null)}
       {#if m.kind === 'user'}
         <div class="row user">
           <div class="user-col">
@@ -1423,6 +1416,11 @@
                     />
                   </span>
                 {/if}
+                {#if meta && meta.steps > 0}
+                  <div class="msg-meta mono">
+                    {meta.steps} 步{meta.tookMs ? ` · ${formatTook(meta.tookMs)}` : ''}
+                  </div>
+                {/if}
               </div>
             {/if}
           </div>
@@ -1438,9 +1436,12 @@
           >
             <span class="tool-chev">▸</span>
             <span class="tool-name mono">{m.name}</span>
+            {#if toolCallSummary(m.name, m.args)}
+              <span class="tool-sum mono" title={toolCallSummary(m.name, m.args)}>{toolCallSummary(m.name, m.args)}</span>
+            {/if}
             <span class="tool-state">
               {m.running
-                ? '执行中…'
+                ? `执行中 · ${formatTook(Math.max(0, nowTick - (m.startedAt || nowTick)))}`
                 : m.tookMs !== undefined
                   ? `完成·${formatTook(m.tookMs)}`
                   : '完成'}
@@ -1578,13 +1579,32 @@
           {/if}
         </div>
       {:else if m.kind === 'approval_receipt'}
-        <div class="approval-receipt mono" title={m.command}>
-          <span
-            class="ar-mark"
-            class:ok={m.decision === 'sent' && m.sentApproved}
-            class:bad={m.decision === 'error' || m.decision === 'timeout' || m.decision === 'expired' || (m.decision === 'sent' && m.sentApproved === false)}
-          >{approvalReceiptMark(m)}</span>
-          <span class="ar-text">{approvalReceiptText(m)}</span>
+        {@render renderReceiptRow(m)}
+      {:else if m.kind === 'receipt_agg'}
+        {@const aggOpen = expandedReceiptAggs.has(m.id)}
+        <div class="receipt-agg" class:open={aggOpen}>
+          <button
+            type="button"
+            class="ra-head mono"
+            onclick={() => toggleReceiptAgg(m.id)}
+            title="点击{aggOpen ? '收起' : '展开'}逐条回执"
+          >
+            <span class="tool-chev" class:rot={aggOpen}>▸</span>
+            <span
+              class="ar-mark"
+              class:ok={m.outcome === 'ok'}
+              class:bad={m.outcome !== 'ok'}
+            >{m.outcome === 'ok' ? '✓' : '✗'}</span>
+            <span class="ar-text">
+              {m.toolName} ×{m.count} ·
+              {m.outcome === 'ok' ? '已批准' : m.outcome === 'deny' ? '已拒绝' : '已失效/失败'}
+            </span>
+          </button>
+          {#if aggOpen}
+            <div class="ra-items">
+              {#each m.items as r (r.id)}{@render renderReceiptRow(r)}{/each}
+            </div>
+          {/if}
         </div>
       {:else if m.kind === 'approval_aggregate'}
         <div class="approval-card aggregate">
@@ -1707,7 +1727,7 @@
         <div class="process-box" class:live={!g.closed}>
           <button type="button" class="process-head" onclick={() => toggleGroup(g.key)}>
             <span class="tool-chev" class:rot={open}>▸</span>
-            <span>过程（{g.items.length} 步 · 思考与工具调用）</span>
+            <span>过程（{g.steps ?? g.items.length} 步{g.tookMs ? ` · ${formatTook(g.tookMs)}` : ''} · 思考与工具调用）</span>
             {#if !g.closed}<span class="process-live">· 进行中</span>{/if}
           </button>
           {#if open}
@@ -1717,7 +1737,7 @@
           {/if}
         </div>
       {:else}
-        {@render renderMsg(g.m)}
+        {@render renderMsg(g.m, g.meta)}
       {/if}
     {/each}
 
@@ -2533,6 +2553,69 @@
     margin-left: 10px;
     overflow: hidden;
   }
+  .tool-head .tool-sum {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+  /* 答案气泡 meta 行:本回合步数与工具耗时合计(数据来自回合布局段) */
+  .msg-meta {
+    margin-top: 4px;
+    font-size: 10px;
+    color: var(--text-muted);
+    opacity: 0.85;
+  }
+  /* 回执汇总行:同工具同结局连续回执 ≥阈值收敛为一行,点击展开逐条 */
+  .receipt-agg {
+    margin-left: 10px;
+  }
+  .receipt-agg .ra-head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-sm);
+    width: 100%;
+    padding: 2px var(--sp-sm);
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: var(--fs-2xs);
+    line-height: 1.6;
+    text-align: left;
+    user-select: none;
+  }
+  .receipt-agg .ra-head:hover {
+    background: var(--bg-hover);
+    color: var(--text-secondary);
+  }
+  .receipt-agg .ra-head .tool-chev {
+    display: inline-block;
+    font-size: 10px;
+    transition: transform var(--tr-fast);
+  }
+  .receipt-agg .ra-head .tool-chev.rot {
+    transform: rotate(90deg);
+  }
+  .receipt-agg .ra-head .ar-mark {
+    flex-shrink: 0;
+    font-weight: var(--fw-sb);
+  }
+  .receipt-agg .ra-head .ar-mark.ok {
+    color: var(--success);
+  }
+  .receipt-agg .ra-head .ar-mark.bad {
+    color: var(--danger);
+  }
+  .receipt-agg .ra-items {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 2px 0 2px 18px;
+  }
   .tool-card.running {
     border-left-color: var(--brand);
   }
@@ -2633,6 +2716,10 @@
   }
   .process-body .row {
     margin-top: 0;
+  }
+  /* 框内回执去左缘标线(一体边框由过程框承担);框外兜底回执保留标线 */
+  .process-body .approval-receipt {
+    border-left-color: transparent;
   }
   /* 未选择工作区的引导条(术语白话化批):缺省目录对用户是黑盒,显式引导选择 */
   .ws-hint {
