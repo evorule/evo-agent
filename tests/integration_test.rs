@@ -979,6 +979,8 @@ async fn test_sediment_rollup_marks_old_summaries_as_rolled_up() {
         journal_lines: Vec::new(),
         // 实况校验锚:空注册表=无锚,工具清单类断言拒写(本测无工具类事实)
         available_tools: Vec::new(),
+        // 存储保留清扫上下文:None=不执行清扫(缺省不变式,本测与保留期无关)
+        retention: None,
     };
     let messages = vec![Message::User {
         content: "some conversation".to_string(),
