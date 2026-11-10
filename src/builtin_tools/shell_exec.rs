@@ -674,11 +674,63 @@ impl Drop for LiveGuard<'_> {
     }
 }
 
-/// 排空管道到缓冲(与 `Command::output` 同语义;不排空会撑满管道死锁)
-fn drain_pipe<R: std::io::Read>(pipe: &mut Option<R>) -> Vec<u8> {
+/// 运行中工具输出尾随(观察态):全局单槽 tap——工具执行前安装,执行结束
+/// RAII 摘除。drain 线程读到的每段输出原样发往槽内通道(失败静默——观察
+/// 态永不影响执行);仅直跑后端开启(容器两后端二期,见立项设计稿分批)。
+/// 通道用 tokio unbounded(send 为同步方法,跨 std 线程无阻塞);环帽/节流
+/// 在 runner 接收侧做,本层零缓冲零节流。
+pub struct OutputTapGuard;
+
+static OUTPUT_TAP: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>> =
+    StdMutex::new(None);
+
+/// 安装输出尾随 tap(返回 RAII 守卫,drop 即摘除;多次安装为后装覆盖——
+/// 安装点在工具执行段,串行 ReAct 下天然单飞)
+pub fn install_output_tap(tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) -> OutputTapGuard {
+    if let Ok(mut slot) = OUTPUT_TAP.lock() {
+        *slot = Some(tx);
+    }
+    OutputTapGuard
+}
+
+/// 观察段发送(仅 drain 线程调用;tap 未安装/通道关闭均静默)
+fn tap_send(seg: &[u8]) {
+    if let Ok(slot) = OUTPUT_TAP.lock() {
+        if let Some(tx) = slot.as_ref() {
+            let _ = tx.send(seg.to_vec());
+        }
+    }
+}
+
+impl Drop for OutputTapGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = OUTPUT_TAP.lock() {
+            *slot = None;
+        }
+    }
+}
+
+/// 排空管道到缓冲(与 `Command::output` 同语义;不排空会撑满管道死锁)。
+/// `stream_tap`=直跑后端开启尾随:分段读取逐段原样发往输出 tap(观察态,
+/// 发送失败静默),累积结果与关闭态完全一致(字节等价)。
+fn drain_pipe<R: std::io::Read>(pipe: &mut Option<R>, stream_tap: bool) -> Vec<u8> {
     let mut buf = Vec::new();
     if let Some(p) = pipe {
-        let _ = std::io::Read::read_to_end(p, &mut buf);
+        if stream_tap {
+            let mut seg = [0u8; 8192];
+            loop {
+                match std::io::Read::read(p, &mut seg) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        tap_send(&seg[..n]);
+                        buf.extend_from_slice(&seg[..n]);
+                    }
+                    Err(_) => break,
+                }
+            }
+        } else {
+            let _ = std::io::Read::read_to_end(p, &mut buf);
+        }
     }
     buf
 }
@@ -1179,7 +1231,7 @@ impl ShellExecTool {
     ///
     /// 容器后端注记:宿主侧在飞程序= docker CLI,本机制回收的是宿主进程
     /// 族;容器内侧进程生命周期属容器域策略面,不在本机制范围。
-    fn run_family(&self, mut cmd: Command, timeout: Duration) -> FamilyOutcome {
+    fn run_family(&self, mut cmd: Command, timeout: Duration, stream_tap: bool) -> FamilyOutcome {
         // Unix:子进程独立进程组(pgid=pid),组级 kill 覆盖全部子孙
         #[cfg(unix)]
         {
@@ -1206,11 +1258,12 @@ impl ShellExecTool {
             live: &self.live,
         };
 
-        // stdout/stderr 读者线程(与 Command::output 同语义)
+        // stdout/stderr 读者线程(与 Command::output 同语义;stream_tap=直跑
+        // 后端逐段上报输出尾随 tap)
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
-        let stdout_reader = std::thread::spawn(move || drain_pipe(&mut stdout_pipe));
-        let stderr_reader = std::thread::spawn(move || drain_pipe(&mut stderr_pipe));
+        let stdout_reader = std::thread::spawn(move || drain_pipe(&mut stdout_pipe, stream_tap));
+        let stderr_reader = std::thread::spawn(move || drain_pipe(&mut stderr_pipe, stream_tap));
 
         // 有界等待轮询:到期即终止进程族
         let started = std::time::Instant::now();
@@ -1544,7 +1597,7 @@ impl ShellExecTool {
             cmd.current_dir(dir);
         }
 
-        match self.run_family(cmd, self.timeout) {
+        match self.run_family(cmd, self.timeout, true) {
             FamilyOutcome::Failed(e) => Err(spawn_failure_message(program, &e)),
             FamilyOutcome::Terminated {
                 output,
@@ -1727,7 +1780,7 @@ impl ShellExecTool {
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
 
-        match self.run_family(cmd, self.timeout) {
+        match self.run_family(cmd, self.timeout, false) {
             FamilyOutcome::Failed(e) => Err(format!(
                 "failed to spawn '{}': {} (is docker installed and in PATH?)",
                 argv[0], e
