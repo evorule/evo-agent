@@ -574,6 +574,8 @@ function handleFrame(f) {
         argsMeta: cappedArgs.truncated ? { originalLen: cappedArgs.originalLen } : null,
         running: true,
         startedAt: toolStartedAt,
+        streamOut: '',
+        streamTruncated: false,
       });
       // S4:记下 file_write 的目标与内容(草稿基线),待成功结果确认
       if (f.name === 'file_write' && f.args && typeof f.args.path === 'string') {
@@ -593,6 +595,28 @@ function handleFrame(f) {
       }
       break;
     }
+    case 'ToolOutputChunk': {
+      // 运行中工具输出尾随(观察态):running 工具卡流式段追加,环形帽截尾;
+      // ToolResult 到达即清(权威段接管,防双源混淆)
+      const TOOL_STREAM_RING = 16 * 1024;
+      if (lastToolMsgId !== null) {
+        const list = get(messages);
+        for (let i = list.length - 1; i >= 0; i--) {
+          const m = list[i];
+          if (m.id === lastToolMsgId && m.kind === 'tool' && m.running) {
+            let next = (m.streamOut || '') + (f.chunk || '');
+            let truncated = !!m.streamTruncated;
+            if (next.length > TOOL_STREAM_RING) {
+              next = next.slice(next.length - TOOL_STREAM_RING);
+              truncated = true;
+            }
+            updateMessage(lastToolMsgId, { streamOut: next, streamTruncated: truncated });
+            break;
+          }
+        }
+      }
+      break;
+    }
     case 'ToolResult': {
       if (lastToolMsgId !== null) {
         const cappedResult = cappedJson(f.result, TOOL_PAYLOAD_CAP);
@@ -600,6 +624,8 @@ function handleFrame(f) {
           running: false,
           result: cappedResult.text,
           resultMeta: cappedResult.truncated ? { originalLen: cappedResult.originalLen } : null,
+          streamOut: '',
+          streamTruncated: false,
         };
         if (toolStartedAt) patch.tookMs = Date.now() - toolStartedAt;
         updateMessage(lastToolMsgId, patch);

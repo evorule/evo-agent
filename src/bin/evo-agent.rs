@@ -2584,6 +2584,11 @@ fn cmd_run_blocking(
                 Ok(AgentEvent::ToolCall { name, .. }) => {
                     eprintln!("[tool call: {}]", name);
                 }
+                Ok(AgentEvent::ToolOutputChunk { chunk, .. }) => {
+                    use std::io::Write as _;
+                    eprint!("{}", chunk);
+                    let _ = std::io::stderr().flush();
+                }
                 Ok(AgentEvent::ToolResult { name, .. }) => {
                     eprintln!("[tool result: {}]", name);
                 }
@@ -2690,6 +2695,11 @@ fn cmd_run_streaming(
                     // LLM 增量文本 → stdout(不换行,实时显示)
                     print!("{}", text);
                     let _ = std::io::stdout().flush();
+                }
+                Ok(AgentEvent::ToolOutputChunk { chunk, .. }) => {
+                    // 运行中工具输出尾随(观察态) → stderr 实时显示
+                    eprint!("{}", chunk);
+                    let _ = std::io::stderr().flush();
                 }
                 Ok(AgentEvent::PlanSubmitted { plan_id, plan }) => {
                     eprintln!(
@@ -4860,6 +4870,11 @@ fn run_repl_turn(
                 Ok(AgentEvent::SessionCreated { session_id, .. }) => {
                     eprintln!("[session: {}]", session_id);
                     got_session = Some(session_id);
+                }
+                Ok(AgentEvent::ToolOutputChunk { chunk, .. }) => {
+                    // 运行中工具输出尾随(观察态) → stderr 实时显示,不污染 stdout
+                    eprint!("{}", chunk);
+                    let _ = std::io::stderr().flush();
                 }
                 Ok(AgentEvent::CompactionPerformed {
                     before_chars,

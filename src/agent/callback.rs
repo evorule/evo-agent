@@ -213,6 +213,10 @@ impl EventCallback for LoggingCallback {
             AgentEvent::ToolResult { name, result } => {
                 tracing::info!(%name, result = %result, "callback: tool result");
             }
+            AgentEvent::ToolOutputChunk { tool_name, .. } => {
+                // 尾随观察段:trace 级不进审计正文(非权威内容)
+                tracing::trace!(%tool_name, "callback: tool output chunk");
+            }
             AgentEvent::ApprovalRequired {
                 tool_name, risk, ..
             } => {
@@ -383,6 +387,7 @@ mod tests {
                 AgentEvent::PlanSubmitted { plan_id, .. } => format!("plan_submitted:{}", plan_id),
                 AgentEvent::ApprovalRequired { .. } => "approval_required".to_string(),
                 AgentEvent::ApprovalResult { .. } => "approval_result".to_string(),
+                AgentEvent::ToolOutputChunk { .. } => "tool_output_chunk".to_string(),
                 AgentEvent::AskUser { question_id, .. } => format!("ask_user:{}", question_id),
                 AgentEvent::AskUserResult { question_id, .. } => {
                     format!("ask_user_result:{}", question_id)

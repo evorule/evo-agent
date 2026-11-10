@@ -1461,6 +1461,18 @@ pub fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json:
             "answered": answered,
             "timed_out": timed_out,
         }),
+        // 运行中工具输出尾随(观察态帧):前端 running 工具卡尾随段消费;
+        // 不落 journal 不进账,权威结果仍以 ToolResult 为准
+        Ok(AgentEvent::ToolOutputChunk {
+            tool_name,
+            chunk,
+            truncated,
+        }) => serde_json::json!({
+            "type": "ToolOutputChunk",
+            "tool_name": tool_name,
+            "chunk": chunk,
+            "truncated": truncated,
+        }),
         // 主动压缩观测帧(前端一次性提示;与 journal compaction_performed 同源)
         Ok(AgentEvent::CompactionPerformed {
             before_chars,

@@ -955,6 +955,17 @@ pub enum AgentEvent {
         /// 工具返回结果
         result: serde_json::Value,
     },
+    /// 运行中工具输出尾随段(观察态):进程类工具执行期间的增量 stdout/stderr。
+    /// 纯观察面——不落 journal 不进账,权威结果仍以 ToolResult/journal 为准;
+    /// 服务端环形缓冲截尾(超帽丢最旧)+合帧节流,慢消费者丢帧不反压执行。
+    ToolOutputChunk {
+        /// 工具名称
+        tool_name: String,
+        /// 输出增量(UTF-8 lossy 文本段)
+        chunk: String,
+        /// 本次会话该工具的尾随流是否已发生环形截尾(丢过最旧内容)
+        truncated: bool,
+    },
     /// LLM 输出完成(本轮)
     LlmDone {
         /// 完整内容(聚合自所有 delta)
@@ -9771,10 +9782,57 @@ impl AgentRunner {
                                                        let write_advisory = runner
                                                            .write_intent_advisory(&tc.name, &tc.arguments)
                                                            .await;
-                                                       let outcome_res = match runner
-                                                           .execute_tool_stage(&session_id, &tc.name, &tc.arguments, journal.as_deref())
-                                                           .await
-                                                       {
+                                                       // 运行中工具输出尾随(观察态,直跑后端):
+                                                       // tap 安装→chunk 转发——不落 journal 不进账,
+                                                       // 权威结果仍以 ToolResult/journal 为准;环形
+                                                       // 缓冲截尾(丢最旧)+合帧节流,慢消费者不反压执行。
+                                                       // stage_fut 收内层块:借用不跨后续 runner 可变操作
+                                                       let outcome_res = {
+                                                           let (tap_tx, mut tap_rx) =
+                                                               tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                                                           let _output_tap = crate::builtin_tools::shell_exec::install_output_tap(tap_tx);
+                                                           let mut stage_fut = std::pin::pin!(
+                                                               runner.execute_tool_stage(&session_id, &tc.name, &tc.arguments, journal.as_deref())
+                                                           );
+                                                           let mut tap_open = true;
+                                                           let mut tap_ring: Vec<u8> = Vec::new();
+                                                           let mut tap_truncated = false;
+                                                           let mut tap_flush_at = std::time::Instant::now();
+                                                           const TAP_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+                                                           const TAP_RING: usize = 16 * 1024;
+                                                           loop {
+                                                               tokio::select! {
+                                                                   biased;
+                                                                   res = &mut stage_fut => break res,
+                                                                   seg = tap_rx.recv(), if tap_open => {
+                                                                       match seg {
+                                                                           Some(bytes) => {
+                                                                               tap_ring.extend_from_slice(&bytes);
+                                                                               if tap_ring.len() > TAP_RING {
+                                                                                   let drop_n = tap_ring.len() - TAP_RING;
+                                                                                   tap_ring.drain(..drop_n);
+                                                                                   tap_truncated = true;
+                                                                               }
+                                                                               if tap_flush_at.elapsed() >= TAP_WINDOW && !tap_ring.is_empty() {
+                                                                                   let text = String::from_utf8_lossy(&tap_ring).into_owned();
+                                                                                   tap_ring.clear();
+                                                                                   tap_flush_at = std::time::Instant::now();
+                                                                                   yield Ok(AgentEvent::ToolOutputChunk {
+                                                                                       tool_name: tc.name.clone(),
+                                                                                       chunk: text,
+                                                                                       truncated: tap_truncated,
+                                                                                   });
+                                                                               }
+                                                                           }
+                                                                           None => { tap_open = false; }
+                                                                       }
+                                                                   }
+                                                               }
+                                                           }
+                                                       };
+                                                       // 尾随环形缓冲残余不发送:权威 ToolResult 即将
+                                                       // 到达并包含全量输出,残余段重发属重复信息
+                                                       let outcome_res = match outcome_res {
                                                            Err(e) => Err(e),
                                                            Ok(ToolExecStage::Done(o)) => Ok(o),
                                                            Ok(ToolExecStage::Pending(req)) => {

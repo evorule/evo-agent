@@ -1505,6 +1505,16 @@
                   <pre class="tool-payload mono">{argsText(m)}</pre>
                 {/if}
               {/if}
+              {#if m.running && m.streamOut}
+                <!-- 运行中输出尾随(观察态):环形帽截尾,ToolResult 到达即被权威段接管 -->
+                <div class="tb-label">
+                  <span>输出流</span>
+                  {#if m.streamTruncated}
+                    <span class="tb-trunc">已环形截尾（仅保留最近内容）</span>
+                  {/if}
+                </div>
+                <pre class="tool-payload stream mono">{m.streamOut}<span class="cursor on">▌</span></pre>
+              {/if}
               {#if m.result != null}
                 <div class="tb-label">
                   <span>结果</span>
@@ -2917,6 +2927,12 @@
     margin-left: 2px;
   }
   /* 动作/结果两段式小节标题与截断徽标 */
+  /* 尾随流段:running 工具卡的观察态输出(权威结果到达即切换) */
+  .tool-payload.stream {
+    color: var(--text-secondary);
+    background: var(--bg-hover);
+    border-radius: var(--r-sm);
+  }
   .tb-label {
     display: flex;
     align-items: center;
