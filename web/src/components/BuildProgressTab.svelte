@@ -180,7 +180,12 @@
     <div class="bp-banner">等待事件文件出现(engine 构建时重建)…</div>
   {/if}
   {#if assetWsPath && assetEvent}
-    <ShotPreviewCard path={assetWsPath} kind={assetKind} bytes={assetEvent.asset.bytes ?? 0} />
+  <!-- D1 修复:key=事件 ts(epoch 浮点每轮构建唯一,seq 会重排不可用)。
+     新 done 事件到 → 卡重挂 → $effect 重跑 → fetch 新产物 → 新 blob;
+     旧 objectUrl 由卡内 $effect 清理回收。 -->
+  {#key assetEvent.ts}
+  <ShotPreviewCard path={assetWsPath} kind={assetKind} bytes={assetEvent.asset.bytes ?? 0} />
+  {/key}
   {/if}
   <div class="bp-list">
     {#each events as e}
