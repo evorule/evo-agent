@@ -2165,6 +2165,67 @@ impl Drop for TurnEndGuard {
     }
 }
 
+/// 审批事件对投影（transcript 旁路,读侧）:单条审批请求的决策结果快照。
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct JournalApproval {
+    /// 决策时刻(unix ms,取 ApprovalResolved 行时间戳)
+    pub ts: u64,
+    /// 工具名
+    pub tool: String,
+    /// 审批载荷摘要(command,写入侧已截 256 字符)
+    pub command: String,
+    /// 决定标签:approved / rejected / auto_rejected(写入侧原样)
+    pub decision: String,
+}
+
+/// 审批事件对投影(读侧):ApprovalRequested/ApprovalResolved 按 approval_id
+/// 配对成单条决策快照,按决策时刻升序。未配对的悬挂请求(超窗无决定/会话
+/// 中断)不投影——转录面只回放已落地的决策。文件缺失/解析失败 → 空,
+/// fail-soft 不阻断转录主流程。
+pub fn project_approvals(path: &Path) -> Vec<JournalApproval> {
+    let lines = match read_all_tolerant(path) {
+        Ok(l) => l,
+        Err(_) => return Vec::new(),
+    };
+    #[derive(Clone)]
+    struct Pending {
+        tool: String,
+        payload: String,
+    }
+    let mut pending: std::collections::HashMap<String, Pending> = std::collections::HashMap::new();
+    let mut out: Vec<(u64, JournalApproval)> = Vec::new();
+    for line in lines {
+        match line.event {
+            JournalEvent::ApprovalRequested {
+                approval_id,
+                tool,
+                payload,
+            } => {
+                pending.insert(approval_id, Pending { tool, payload });
+            }
+            JournalEvent::ApprovalResolved {
+                approval_id,
+                decision,
+            } => {
+                if let Some(p) = pending.remove(&approval_id) {
+                    out.push((
+                        line.ts,
+                        JournalApproval {
+                            ts: line.ts,
+                            tool: p.tool,
+                            command: p.payload,
+                            decision,
+                        },
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    out.sort_by_key(|(ts, _)| *ts);
+    out.into_iter().map(|(_, a)| a).collect()
+}
+
 /// 容忍尾部半行的顺序重放(扫尾/恢复装配用):强杀切在写入中间的最后一个
 /// 不完整行是崩溃的自然产物,截断忽略;中间损坏仍 fail-visible。
 pub fn read_all_tolerant(path: &Path) -> Result<Vec<JournalLine>, JournalError> {
@@ -2574,6 +2635,35 @@ pub fn verify_journal_file(path: &std::path::Path) -> Result<JournalVerifyReport
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_project_approvals_pairs_and_order() {
+        let dir = std::env::temp_dir().join(format!("jf-pa-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-pa").unwrap();
+            w.approval_requested("ap-1", "shell_exec", "find src").unwrap();
+            w.approval_requested("ap-2", "python_exec", "print(1)").unwrap();
+            w.approval_resolved("ap-2", "approved").unwrap();
+            w.approval_resolved("ap-1", "rejected").unwrap();
+            // 悬挂请求(无决定)不投影
+            w.approval_requested("ap-3", "file_write", "x.txt").unwrap();
+        }
+        let path = dir.join("s-pa.jsonl");
+        let approvals = project_approvals(&path);
+        assert_eq!(approvals.len(), 2, "悬挂请求不投影");
+        assert_eq!(approvals[0].tool, "python_exec", "按决策时刻升序");
+        assert_eq!(approvals[0].decision, "approved");
+        assert_eq!(approvals[1].tool, "shell_exec");
+        assert_eq!(approvals[1].command, "find src");
+    }
+
+    #[test]
+    fn test_project_approvals_missing_file_is_empty() {
+        let empty = project_approvals(Path::new("Z:/definitely/not/here.jsonl"));
+        assert!(empty.is_empty(), "文件缺失 fail-soft 空数组");
+    }
 
     #[test]
     fn test_self_audit_stage_fields_and_backcompat() {

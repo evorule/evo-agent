@@ -55,7 +55,12 @@ export const messages = writable([]);
 
 let seq = 0;
 export function pushMessage(msg) {
-  messages.update((arr) => [...arr, { id: ++seq, ...msg }]);
+  // ts(unix 秒)随消息统一注入:时间戳显示开关与回执旁路定位的数据源;
+  // 显式传入的 ts 优先(回灌路径)
+  messages.update((arr) => [
+    ...arr,
+    { id: ++seq, ts: Math.floor(Date.now() / 1000), ...msg },
+  ]);
   return seq;
 }
 export function updateMessage(id, patch) {
@@ -83,8 +88,11 @@ export async function refreshSessions() {
  *  历史回灌不得出现字面量 "null" 渲染。reasoning(思考留痕)挂到 assistant
  *  气泡的 thinking 字段,历史思考卡(收起态)由此渲染。 */
 export function recordToMessage(r) {
+  // ts(unix 秒,持久化记录自带)透传:时间戳开关显示数据源;实时流由
+  // pushMessage 统一注入同形字段
+  const ts = typeof r.timestamp === 'number' ? r.timestamp : undefined;
   if (r.role === 'user') {
-    return { kind: 'user', text: r.content };
+    return { kind: 'user', text: r.content, ts };
   }
   if (r.role === 'assistant') {
     const reasoning = typeof r.reasoning === 'string' && r.reasoning ? r.reasoning : undefined;
@@ -105,14 +113,14 @@ export function recordToMessage(r) {
       running: false,
     }));
     if (cards.length === 0) {
-      return { kind: 'assistant', text: r.content, thinking: reasoning };
+      return { kind: 'assistant', text: r.content, thinking: reasoning, ts };
     }
     if (typeof r.content === 'string' && r.content.trim()) {
-      return [{ kind: 'assistant', text: r.content, thinking: reasoning }, ...cards];
+      return [{ kind: 'assistant', text: r.content, thinking: reasoning, ts }, ...cards];
     }
     if (reasoning) {
       // 仅思考无叙述:思考卡单独成行(不丢)
-      return [{ kind: 'assistant', text: '', thinking: reasoning }, ...cards];
+      return [{ kind: 'assistant', text: '', thinking: reasoning, ts }, ...cards];
     }
     return cards;
   }
@@ -123,6 +131,7 @@ export function recordToMessage(r) {
       args: null,
       result: r.content,
       running: false,
+      ts,
     };
   }
   return null; // system 等不渲染
@@ -156,9 +165,14 @@ export function mergeToolPairs(entries) {
   return out;
 }
 
-/** 历史消息回灌(清空当前消息,按投影顺序渲染;工具调用/结果配对合并) */
-export function loadTranscriptInto(records) {
+/** 审批回执旁路(投影重跑数据源,与 transcriptSource 同生命周期) */
+let transcriptApprovals = [];
+
+/** 历史消息回灌(清空当前消息,按投影顺序渲染;工具调用/结果配对合并;
+ *  approvals=审批回执旁路,按决策时刻插入消息流,缺省空) */
+export function loadTranscriptInto(records, approvals = []) {
   transcriptSource = Array.isArray(records) ? [...records] : [];
+  transcriptApprovals = Array.isArray(approvals) ? approvals : [];
   projectTranscript();
 }
 
@@ -204,8 +218,35 @@ function projectTranscript() {
       out.push({ id: ++id, ...m });
     }
   }
+  insertApprovalReceipts(out);
   messages.set(mergeToolPairs(out));
   if (out.length > 0) seq = Math.max(seq, id);
+}
+
+/** 审批回执旁路插入(transcript 投影):journal 投影的已决策审批按决策时刻
+ *  邻近插入消息流(插到最后一条 ts≤决策时刻的消息之后),形态与实时回执一致;
+ *  无 ts 的旧记录不参与定位,回执按剩余顺序贴尾。 */
+function insertApprovalReceipts(out) {
+  if (!Array.isArray(transcriptApprovals) || transcriptApprovals.length === 0) return;
+  const receiptMsgs = transcriptApprovals.map((a, i) => ({
+    id: `ap${i}`,
+    kind: 'approval_receipt',
+    toolName: a.tool || 'tool',
+    command: a.command || '',
+    ts: typeof a.ts === 'number' ? Math.floor(a.ts / 1000) : null,
+    decision: 'sent',
+    sentApproved: a.decision !== 'rejected' && a.decision !== 'auto_rejected',
+    timedOut: a.decision === 'auto_rejected',
+  }));
+  let cursor = 0;
+  for (const r of receiptMsgs) {
+    let pos = cursor;
+    for (let i = cursor; i < out.length; i++) {
+      if (typeof out[i].ts === 'number' && out[i].ts <= r.ts) pos = i + 1;
+    }
+    out.splice(pos, 0, r);
+    cursor = pos + 1;
+  }
 }
 
 // ---- 编辑器 tabs(标准 IDE 基础阶段) ----
