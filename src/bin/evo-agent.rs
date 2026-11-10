@@ -3576,6 +3576,9 @@ fn cmd_serve(
     {
         config.llm.model = m;
     }
+    // 存储保留期启动巡检用客户端克隆（state 构造移走原值；巡检面为独立
+    // 低频 HTTP 客户端，与 serve 主链无共享状态）
+    let retention_patrol_client = evorule_client.clone();
     let mut state = AgentApiState::new_with_metrics(
         definitions,
         evorule_client,
@@ -3987,6 +3990,50 @@ fn cmd_serve(
                 }
             }
         });
+    }
+
+    // 存储保留期与硬配额启动巡检（低频；缺省策略短路零发生——现行为零变化）。
+    // 触发位之二：会话收口钩子在 sediment 同批（收口位专属），本钩子覆盖
+    // 「长期不收口的存量账本」面。journal 文件面为主（启动期无活跃写者，
+    // 全量覆盖）；payload 面为收口钩子专属位（启动期无"当前会话"，本钩子
+    // 不装配 payload 面——空 session_id 即跳过，边界见 storage_retention 模块
+    // 头）。fail-soft：错误只登记不重试，绝不阻断启动主流程。
+    {
+        let policy = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+            .map(|s| {
+                evo_agent::agent::storage_retention::StorageRetentionPolicy::from_settings(
+                    &s.merged().0,
+                )
+            })
+            .unwrap_or_default();
+        if !policy.is_default() {
+            let journal_dir = workdir.join("data").join("sessions");
+            let client = retention_patrol_client;
+            runtime.spawn(async move {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let ctx = evo_agent::agent::storage_retention::RetentionSweepCtx {
+                    policy,
+                    journal_dir,
+                    client,
+                    namespace: String::new(),
+                    session_id: String::new(),
+                    archive_dir_override: None,
+                };
+                let report =
+                    evo_agent::agent::storage_retention::run_retention_sweep(ctx, now_ms).await;
+                eprintln!(
+                    "[retention] startup sweep: files_scanned={} files_modified={} released={} exempt_skipped={} aborted={}",
+                    report.files_scanned,
+                    report.files_modified,
+                    report.released_count,
+                    report.exempt_skipped,
+                    report.aborted.len()
+                );
+            });
+        }
     }
 
     // 7. 绑定 + 启动

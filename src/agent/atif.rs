@@ -436,6 +436,9 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             // 周期自审结论:观测面留痕(判据确定性可由帧流离线重算),非对话
             // 步,不映射为轨迹步(自审观测面)
             JournalEvent::SelfAudit { .. } => continue,
+            // 存储保留期压缩执行落账:存储治理观测面(释放动作审计凭据),
+            // 非对话步,不映射为轨迹步
+            JournalEvent::RetentionCompactionPerformed { .. } => continue,
             JournalEvent::TurnStarted { goal, .. } => {
                 // 轮界:上一个 agent 步必已随 turn_ended 收步;开用户步
                 let message = match user_msgs.get(user_ordinal) {

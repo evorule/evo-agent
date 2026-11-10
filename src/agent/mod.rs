@@ -51,6 +51,7 @@ pub mod skill_store;
 pub mod skills_mirror;
 pub mod stagnation;
 pub mod steering;
+pub mod storage_retention;
 pub mod summarizer;
 pub mod summary_fidelity;
 pub mod tool_intent;

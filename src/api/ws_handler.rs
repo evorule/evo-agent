@@ -1250,6 +1250,17 @@ async fn construct_runner(
         mem = mem.with_decay_policy(crate::agent::memory_decay::DecayPolicy::from_settings(
             &merged_settings,
         ));
+        // 存储保留期与硬配额策略接线(设置键消费面,与 DecayPolicy::from_settings
+        // 同款装配口径)。缺省 forever/compact/unlimited=清扫整体短路、现行为
+        // 零变化(缺省不变式);设置面板显式配置后,会话收口/启动巡检触发物理
+        // 释放(摘要卡+digest 链续接,判定与释放边界见 storage_retention 模块头;
+        // 读路径零参与)。只接 serve 主会话面——子代理/HTTP 观测面维持缺省,
+        // 策略口径单一源。
+        mem = mem.with_retention_policy(
+            crate::agent::storage_retention::StorageRetentionPolicy::from_settings(
+                &merged_settings,
+            ),
+        );
         // F-618 阶段1:LexStore 检索缓存注入(与 runner 构造路径同款;缺省
         // 未声明=None=全量拉取路径零影响)。缺此注入时 serve 流即使定义
         // 声明 lex_store 也不生效(缓存与 lex_cache_stats 观测同源失活)

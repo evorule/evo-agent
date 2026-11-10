@@ -1383,6 +1383,9 @@ pub struct MemoryManager {
     /// 共享记忆读取时衰减策略（缺省关闭=现行为零变化；显式配置激活）。
     /// 只作用于共享分区读视图；判定与存储细节见 `memory_decay` 模块头。
     decay: crate::agent::memory_decay::DecayPolicy,
+    /// 存储保留期与硬配额策略（缺省 forever/compact/unlimited=清扫整体
+    /// 短路零发生；判定与释放细节见 `storage_retention` 模块头）。
+    retention: crate::agent::storage_retention::StorageRetentionPolicy,
 }
 
 /// 投影读取的三种结果（改进1：读路径"投影优先 + cache 离线兜底"）
@@ -1423,6 +1426,7 @@ impl MemoryManager {
                 crate::agent::memory_prefix_index::PrefixIndexState::default(),
             ),
             decay: crate::agent::memory_decay::DecayPolicy::default(),
+            retention: crate::agent::storage_retention::StorageRetentionPolicy::default(),
         }
     }
 
@@ -1475,6 +1479,26 @@ impl MemoryManager {
     /// 获取读取时衰减策略
     pub fn decay_policy(&self) -> crate::agent::memory_decay::DecayPolicy {
         self.decay
+    }
+
+    /// 设置存储保留期与硬配额策略（builder 风格）
+    ///
+    /// 缺省 = [`crate::agent::storage_retention::StorageRetentionPolicy::default()`]
+    /// （forever/compact/unlimited）：清扫整体短路，既有行为逐字节不变。
+    /// 显式配置后，会话收口与启动巡检触发保留期/配额清扫——超龄/超限大
+    /// 字段物理释放，摘要卡与 digest 链续接（判定与执行细节见
+    /// `storage_retention` 模块头；读路径零参与）。
+    pub fn with_retention_policy(
+        mut self,
+        policy: crate::agent::storage_retention::StorageRetentionPolicy,
+    ) -> Self {
+        self.retention = policy;
+        self
+    }
+
+    /// 获取存储保留期与硬配额策略
+    pub fn retention_policy(&self) -> crate::agent::storage_retention::StorageRetentionPolicy {
+        self.retention.clone()
     }
 
     /// 设置 session_id（可变引用）
