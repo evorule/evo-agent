@@ -1505,15 +1505,22 @@
                   <pre class="tool-payload mono">{argsText(m)}</pre>
                 {/if}
               {/if}
-              {#if m.running && m.streamOut}
-                <!-- 运行中输出尾随(观察态):环形帽截尾,ToolResult 到达即被权威段接管 -->
+              {#if m.running && (m.streamOut || m.streamErr)}
+                <!-- 运行中输出尾随(观察态):环形帽截尾,ToolResult 到达即被权威段接管;
+                     stderr 分色红调便于一眼区分错误流 -->
                 <div class="tb-label">
                   <span>输出流</span>
-                  {#if m.streamTruncated}
+                  {#if m.streamOutTruncated || m.streamErrTruncated}
                     <span class="tb-trunc">已环形截尾（仅保留最近内容）</span>
                   {/if}
                 </div>
-                <pre class="tool-payload stream mono">{m.streamOut}<span class="cursor on">▌</span></pre>
+                {#if m.streamOut}
+                  <pre class="tool-payload stream mono">{m.streamOut}</pre>
+                {/if}
+                {#if m.streamErr}
+                  <pre class="tool-payload stream-err mono">{m.streamErr}</pre>
+                {/if}
+                <pre class="stream-cursor mono"><span class="cursor on">▌</span></pre>
               {/if}
               {#if m.result != null}
                 <div class="tb-label">
@@ -2927,11 +2934,21 @@
     margin-left: 2px;
   }
   /* 动作/结果两段式小节标题与截断徽标 */
-  /* 尾随流段:running 工具卡的观察态输出(权威结果到达即切换) */
+  /* 尾随流段:running 工具卡的观察态输出(权威结果到达即切换);
+     stderr 分色红调,与 stdout 默认色一眼区分 */
   .tool-payload.stream {
     color: var(--text-secondary);
     background: var(--bg-hover);
     border-radius: var(--r-sm);
+  }
+  .tool-payload.stream-err {
+    color: var(--danger);
+    background: var(--bg-hover);
+    border-radius: var(--r-sm);
+  }
+  .stream-cursor {
+    margin-top: 2px;
+    color: var(--text-muted);
   }
   .tb-label {
     display: flex;

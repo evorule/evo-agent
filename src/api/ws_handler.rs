@@ -1476,11 +1476,13 @@ pub fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json:
         // 不落 journal 不进账,权威结果仍以 ToolResult 为准
         Ok(AgentEvent::ToolOutputChunk {
             tool_name,
+            stream,
             chunk,
             truncated,
         }) => serde_json::json!({
             "type": "ToolOutputChunk",
             "tool_name": tool_name,
+            "stream": stream,
             "chunk": chunk,
             "truncated": truncated,
         }),

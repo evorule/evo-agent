@@ -2743,10 +2743,11 @@ fn agent_event_to_sse(event: Result<AgentEvent, AgentError>) -> Result<Event, In
             .data(serde_json::json!({ "name": name, "result": result }).to_string()),
         Ok(AgentEvent::ToolOutputChunk {
             tool_name,
+            stream,
             chunk,
             truncated,
         }) => Event::default().event("tool_output_chunk").data(
-            serde_json::json!({ "tool_name": tool_name, "chunk": chunk, "truncated": truncated })
+            serde_json::json!({ "tool_name": tool_name, "stream": stream, "chunk": chunk, "truncated": truncated })
                 .to_string(),
         ),
         Ok(AgentEvent::LlmDone {

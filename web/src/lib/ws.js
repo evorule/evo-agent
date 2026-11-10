@@ -575,7 +575,9 @@ function handleFrame(f) {
         running: true,
         startedAt: toolStartedAt,
         streamOut: '',
-        streamTruncated: false,
+        streamErr: '',
+        streamOutTruncated: false,
+        streamErrTruncated: false,
       });
       // S4:记下 file_write 的目标与内容(草稿基线),待成功结果确认
       if (f.name === 'file_write' && f.args && typeof f.args.path === 'string') {
@@ -597,20 +599,24 @@ function handleFrame(f) {
     }
     case 'ToolOutputChunk': {
       // 运行中工具输出尾随(观察态):running 工具卡流式段追加,环形帽截尾;
-      // ToolResult 到达即清(权威段接管,防双源混淆)
+      // stdout/stderr 分色双缓冲(stream 字段),ToolResult 到达即清(权威段
+      // 接管,防双源混淆)
       const TOOL_STREAM_RING = 16 * 1024;
       if (lastToolMsgId !== null) {
+        const isErr = f.stream === 'err';
         const list = get(messages);
         for (let i = list.length - 1; i >= 0; i--) {
           const m = list[i];
           if (m.id === lastToolMsgId && m.kind === 'tool' && m.running) {
-            let next = (m.streamOut || '') + (f.chunk || '');
-            let truncated = !!m.streamTruncated;
+            const bufKey = isErr ? 'streamErr' : 'streamOut';
+            const truncKey = isErr ? 'streamErrTruncated' : 'streamOutTruncated';
+            let next = (m[bufKey] || '') + (f.chunk || '');
+            let truncated = !!m[truncKey];
             if (next.length > TOOL_STREAM_RING) {
               next = next.slice(next.length - TOOL_STREAM_RING);
               truncated = true;
             }
-            updateMessage(lastToolMsgId, { streamOut: next, streamTruncated: truncated });
+            updateMessage(lastToolMsgId, { [bufKey]: next, [truncKey]: truncated });
             break;
           }
         }
@@ -625,7 +631,9 @@ function handleFrame(f) {
           result: cappedResult.text,
           resultMeta: cappedResult.truncated ? { originalLen: cappedResult.originalLen } : null,
           streamOut: '',
-          streamTruncated: false,
+          streamErr: '',
+          streamOutTruncated: false,
+          streamErrTruncated: false,
         };
         if (toolStartedAt) patch.tookMs = Date.now() - toolStartedAt;
         updateMessage(lastToolMsgId, patch);

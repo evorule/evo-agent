@@ -76,27 +76,49 @@ describe('ToolOutputChunk 尾随消费', () => {
   it('chunk 追加到 running 卡流式段;超环帽截尾置标', () => {
     const ws = MockWebSocket.last;
     ws.deliver({ type: 'ToolCall', name: 'shell_exec', args: { command: 'ping' } });
-    ws.deliver({ type: 'ToolOutputChunk', tool_name: 'shell_exec', chunk: 'line1\n' });
-    ws.deliver({ type: 'ToolOutputChunk', tool_name: 'shell_exec', chunk: 'line2\n' });
+    ws.deliver({ type: 'ToolOutputChunk', tool_name: 'shell_exec', stream: 'out', chunk: 'line1\n' });
+    ws.deliver({ type: 'ToolOutputChunk', tool_name: 'shell_exec', stream: 'out', chunk: 'line2\n' });
     const m = lastTool();
     expect(m.running).toBe(true);
     expect(m.streamOut).toBe('line1\nline2\n');
-    expect(m.streamTruncated).toBe(false);
+    expect(m.streamOutTruncated).toBe(false);
     // 环形帽(16KB):一次超帽 chunk 触发截尾置标
     ws.deliver({
       type: 'ToolOutputChunk',
       tool_name: 'shell_exec',
+      stream: 'out',
       chunk: 'X'.repeat(20 * 1024),
     });
     const m2 = lastTool();
     expect(m2.streamOut.length).toBe(16 * 1024);
-    expect(m2.streamTruncated).toBe(true);
+    expect(m2.streamOutTruncated).toBe(true);
+  });
+
+  it('stderr 分色:err 帧入独立缓冲,与 stdout 不混', () => {
+    const ws = MockWebSocket.last;
+    ws.deliver({ type: 'ToolCall', name: 'shell_exec', args: { command: 'mixed' } });
+    ws.deliver({ type: 'ToolOutputChunk', tool_name: 'shell_exec', stream: 'out', chunk: 'std-out' });
+    ws.deliver({ type: 'ToolOutputChunk', tool_name: 'shell_exec', stream: 'err', chunk: 'std-err' });
+    ws.deliver({ type: 'ToolOutputChunk', tool_name: 'shell_exec', stream: 'err', chunk: ' more-err' });
+    const m = lastTool();
+    expect(m.streamOut).toBe('std-out');
+    expect(m.streamErr).toBe('std-err more-err');
+    expect(m.streamErrTruncated).toBe(false);
+  });
+
+  it('向后兼容:旧形态帧(无 stream 字段)落入 stdout 缓冲', () => {
+    const ws = MockWebSocket.last;
+    ws.deliver({ type: 'ToolCall', name: 'shell_exec', args: { command: 'legacy' } });
+    ws.deliver({ type: 'ToolOutputChunk', tool_name: 'shell_exec', chunk: 'legacy-out' });
+    const m = lastTool();
+    expect(m.streamOut).toBe('legacy-out');
+    expect(m.streamErr).toBe('');
   });
 
   it('ToolResult 到达:流式段清空,权威结果接管', async () => {
     const ws = MockWebSocket.last;
     ws.deliver({ type: 'ToolCall', name: 'shell_exec', args: { command: 'ping' } });
-    ws.deliver({ type: 'ToolOutputChunk', tool_name: 'shell_exec', chunk: 'partial' });
+    ws.deliver({ type: 'ToolOutputChunk', tool_name: 'shell_exec', stream: 'err', chunk: 'partial' });
     ws.deliver({
       type: 'ToolResult',
       name: 'shell_exec',
@@ -106,6 +128,7 @@ describe('ToolOutputChunk 尾随消费', () => {
     const m = lastTool();
     expect(m.running).toBe(false);
     expect(m.streamOut).toBe('');
+    expect(m.streamErr).toBe('');
     expect(m.result).toContain('full output');
   });
 
