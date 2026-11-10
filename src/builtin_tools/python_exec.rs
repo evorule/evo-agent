@@ -133,13 +133,13 @@ impl ToolFunction for PythonExecTool {
             let (stdout_buf, stderr_buf, status) = tokio::join!(
                 async {
                     match so.as_mut() {
-                        Some(s) => drain_tapped(s, pid).await.unwrap_or_default(),
+                        Some(s) => drain_tapped(s, pid, "out").await.unwrap_or_default(),
                         None => Vec::new(),
                     }
                 },
                 async {
                     match se.as_mut() {
-                        Some(s) => drain_tapped(s, pid).await.unwrap_or_default(),
+                        Some(s) => drain_tapped(s, pid, "err").await.unwrap_or_default(),
                         None => Vec::new(),
                     }
                 },
@@ -422,6 +422,7 @@ mod tests {
 async fn drain_tapped<S: tokio::io::AsyncRead + Unpin>(
     s: &mut S,
     pid: u32,
+    stream: &'static str,
 ) -> std::io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::new();
@@ -430,7 +431,7 @@ async fn drain_tapped<S: tokio::io::AsyncRead + Unpin>(
         match s.read(&mut seg).await {
             Ok(0) => break,
             Ok(n) => {
-                crate::builtin_tools::shell_exec::tap_send_pid(pid, &seg[..n]);
+                crate::builtin_tools::shell_exec::tap_send_pid(pid, stream, &seg[..n]);
                 buf.extend_from_slice(&seg[..n]);
             }
             Err(e) => return Err(e),

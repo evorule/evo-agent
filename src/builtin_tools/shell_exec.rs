@@ -694,11 +694,13 @@ pub struct TapBinding {
     pub tx: tokio::sync::mpsc::UnboundedSender<TapSeg>,
 }
 
-/// 尾随段消息:归属(工具名)+原始字节段
+/// 尾随段消息:归属(工具名)+流别+原始字节段
 #[derive(Debug, Clone)]
 pub struct TapSeg {
     /// 归属工具名
     pub tool_name: String,
+    /// 流别:"out"(stdout)/"err"(stderr)——分色显示数据源
+    pub stream: &'static str,
     /// 原始输出字节段
     pub seg: Vec<u8>,
 }
@@ -744,22 +746,30 @@ pub fn unbind_pid(pid: u32) {
     }
 }
 
-/// 观察段发送(drain/读循环调用):按 pid 查 ACTIVE,消息自带归属;
+/// 观察段发送(drain/读循环调用):按 pid 查 ACTIVE,消息自带归属与流别;
 /// 未绑定/通道关闭均静默。pub 供 python_exec 同型读循环共用。
-pub fn tap_send_pid(pid: u32, seg: &[u8]) {
+/// `stream`="out"(stdout)/"err"(stderr)——分色显示的数据源。
+pub fn tap_send_pid(pid: u32, stream: &'static str, seg: &[u8]) {
     let binding = TAP_ACTIVE.lock().ok().and_then(|m| m.get(&pid).cloned());
     if let Some(b) = binding {
         let _ = b.tx.send(TapSeg {
             tool_name: b.tool_name,
+            stream,
             seg: seg.to_vec(),
         });
     }
 }
 
 /// 排空管道到缓冲(与 `Command::output` 同语义;不排空会撑满管道死锁)。
-/// `stream_tap`=直跑/docker 后端开启尾随:分段读取逐段按 pid 归属发往
-/// tap(观察态,发送失败静默),累积结果与关闭态完全一致(字节等价)。
-fn drain_pipe<R: std::io::Read>(pipe: &mut Option<R>, stream_tap: bool, pid: u32) -> Vec<u8> {
+/// `stream_tap`=直跑/docker 后端开启尾随:分段读取逐段按 pid 归属+流别
+/// 发往 tap(观察态,发送失败静默),累积结果与关闭态完全一致(字节等价)。
+/// `stream`="out"(stdout 管道)/"err"(stderr 管道)——分色显示数据源。
+fn drain_pipe<R: std::io::Read>(
+    pipe: &mut Option<R>,
+    stream_tap: bool,
+    pid: u32,
+    stream: &'static str,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     if let Some(p) = pipe {
         if stream_tap {
@@ -768,7 +778,7 @@ fn drain_pipe<R: std::io::Read>(pipe: &mut Option<R>, stream_tap: bool, pid: u32
                 match std::io::Read::read(p, &mut seg) {
                     Ok(0) => break,
                     Ok(n) => {
-                        tap_send_pid(pid, &seg[..n]);
+                        tap_send_pid(pid, stream, &seg[..n]);
                         buf.extend_from_slice(&seg[..n]);
                     }
                     Err(_) => break,
@@ -1314,9 +1324,9 @@ impl ShellExecTool {
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
         let stdout_reader =
-            std::thread::spawn(move || drain_pipe(&mut stdout_pipe, stream_tap, pid));
+            std::thread::spawn(move || drain_pipe(&mut stdout_pipe, stream_tap, pid, "out"));
         let stderr_reader =
-            std::thread::spawn(move || drain_pipe(&mut stderr_pipe, stream_tap, pid));
+            std::thread::spawn(move || drain_pipe(&mut stderr_pipe, stream_tap, pid, "err"));
 
         // 有界等待轮询:到期即终止进程族
         let started = std::time::Instant::now();

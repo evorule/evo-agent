@@ -961,9 +961,11 @@ pub enum AgentEvent {
     ToolOutputChunk {
         /// 工具名称
         tool_name: String,
+        /// 流别:"out"(stdout)/"err"(stderr)——前端分色渲染
+        stream: String,
         /// 输出增量(UTF-8 lossy 文本段)
         chunk: String,
-        /// 本次会话该工具的尾随流是否已发生环形截尾(丢过最旧内容)
+        /// 该流别是否已发生环形截尾(丢过最旧内容)
         truncated: bool,
     },
     /// LLM 输出完成(本轮)
@@ -9817,8 +9819,11 @@ impl AgentRunner {
                                                            tokio::sync::mpsc::unbounded_channel::<crate::builtin_tools::shell_exec::TapSeg>();
                                                        crate::builtin_tools::shell_exec::push_pending_tap(&tc.name, tap_tx);
                                                        let mut tap_open = true;
-                                                       let mut tap_ring: Vec<u8> = Vec::new();
-                                                       let mut tap_truncated = false;
+                                                       // stdout/stderr 分色:双环各自截尾,帧带流别供前端分色渲染
+                                                       let mut tap_ring_out: Vec<u8> = Vec::new();
+                                                       let mut tap_ring_err: Vec<u8> = Vec::new();
+                                                       let mut tap_out_truncated = false;
+                                                       let mut tap_err_truncated = false;
                                                        let mut tap_flush_at = std::time::Instant::now();
                                                        const TAP_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
                                                        const TAP_RING: usize = 16 * 1024;
@@ -9833,20 +9838,26 @@ impl AgentRunner {
                                                                    seg = tap_rx.recv(), if tap_open => {
                                                                        match seg {
                                                                            Some(tapseg) => {
-                                                                               tap_ring.extend_from_slice(&tapseg.seg);
-                                                                               if tap_ring.len() > TAP_RING {
-                                                                                   let drop_n = tap_ring.len() - TAP_RING;
-                                                                                   tap_ring.drain(..drop_n);
-                                                                                   tap_truncated = true;
+                                                                               let (ring, truncated) = if tapseg.stream == "err" {
+                                                                                   (&mut tap_ring_err, &mut tap_err_truncated)
+                                                                               } else {
+                                                                                   (&mut tap_ring_out, &mut tap_out_truncated)
+                                                                               };
+                                                                               ring.extend_from_slice(&tapseg.seg);
+                                                                               if ring.len() > TAP_RING {
+                                                                                   let drop_n = ring.len() - TAP_RING;
+                                                                                   ring.drain(..drop_n);
+                                                                                   *truncated = true;
                                                                                }
-                                                                               if tap_flush_at.elapsed() >= TAP_WINDOW && !tap_ring.is_empty() {
-                                                                                   let text = String::from_utf8_lossy(&tap_ring).into_owned();
-                                                                                   tap_ring.clear();
+                                                                               if tap_flush_at.elapsed() >= TAP_WINDOW && !ring.is_empty() {
+                                                                                   let text = String::from_utf8_lossy(ring).into_owned();
+                                                                                   ring.clear();
                                                                                    tap_flush_at = std::time::Instant::now();
                                                                                    yield Ok(AgentEvent::ToolOutputChunk {
                                                                                        tool_name: tapseg.tool_name,
+                                                                                       stream: tapseg.stream.to_string(),
                                                                                        chunk: text,
-                                                                                       truncated: tap_truncated,
+                                                                                       truncated: *truncated,
                                                                                    });
                                                                                }
                                                                            }
@@ -9894,8 +9905,10 @@ impl AgentRunner {
                                                                    let mut resolve_fut = std::pin::pin!(
                                                                        runner.resolve_approval(&session_id, &tc.name, &tc.arguments, req, journal.as_deref())
                                                                    );
-                                                                   let mut resolve_ring: Vec<u8> = Vec::new();
-                                                                   let mut resolve_truncated = false;
+                                                                   let mut resolve_ring_out: Vec<u8> = Vec::new();
+                                                                   let mut resolve_ring_err: Vec<u8> = Vec::new();
+                                                                   let mut resolve_out_truncated = false;
+                                                                   let mut resolve_err_truncated = false;
                                                                    let mut resolve_flush_at = std::time::Instant::now();
                                                                    loop {
                                                                        tokio::select! {
@@ -9904,20 +9917,26 @@ impl AgentRunner {
                                                                            seg = tap_rx.recv(), if tap_open => {
                                                                                match seg {
                                                                                    Some(tapseg) => {
-                                                                                       resolve_ring.extend_from_slice(&tapseg.seg);
-                                                                                       if resolve_ring.len() > TAP_RING {
-                                                                                           let drop_n = resolve_ring.len() - TAP_RING;
-                                                                                           resolve_ring.drain(..drop_n);
-                                                                                           resolve_truncated = true;
+                                                                                       let (ring, truncated) = if tapseg.stream == "err" {
+                                                                                           (&mut resolve_ring_err, &mut resolve_err_truncated)
+                                                                                       } else {
+                                                                                           (&mut resolve_ring_out, &mut resolve_out_truncated)
+                                                                                       };
+                                                                                       ring.extend_from_slice(&tapseg.seg);
+                                                                                       if ring.len() > TAP_RING {
+                                                                                           let drop_n = ring.len() - TAP_RING;
+                                                                                           ring.drain(..drop_n);
+                                                                                           *truncated = true;
                                                                                        }
-                                                                                       if resolve_flush_at.elapsed() >= TAP_WINDOW && !resolve_ring.is_empty() {
-                                                                                           let text = String::from_utf8_lossy(&resolve_ring).into_owned();
-                                                                                           resolve_ring.clear();
+                                                                                       if resolve_flush_at.elapsed() >= TAP_WINDOW && !ring.is_empty() {
+                                                                                           let text = String::from_utf8_lossy(ring).into_owned();
+                                                                                           ring.clear();
                                                                                            resolve_flush_at = std::time::Instant::now();
                                                                                            yield Ok(AgentEvent::ToolOutputChunk {
                                                                                                tool_name: tapseg.tool_name,
+                                                                                               stream: tapseg.stream.to_string(),
                                                                                                chunk: text,
-                                                                                               truncated: resolve_truncated,
+                                                                                               truncated: *truncated,
                                                                                            });
                                                                                        }
                                                                                    }
@@ -10576,8 +10595,11 @@ impl AgentRunner {
                                                    tokio::sync::mpsc::unbounded_channel::<crate::builtin_tools::shell_exec::TapSeg>();
                                                crate::builtin_tools::shell_exec::push_pending_tap(&tool_name, tap_tx);
                                                let mut tap_open = true;
-                                               let mut tap_ring: Vec<u8> = Vec::new();
-                                               let mut tap_truncated = false;
+                                               // stdout/stderr 分色:双环各自截尾,帧带流别供前端分色渲染
+                                               let mut tap_ring_out: Vec<u8> = Vec::new();
+                                               let mut tap_ring_err: Vec<u8> = Vec::new();
+                                               let mut tap_out_truncated = false;
+                                               let mut tap_err_truncated = false;
                                                let mut tap_flush_at = std::time::Instant::now();
                                                const TAP_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
                                                const TAP_RING: usize = 16 * 1024;
@@ -10592,20 +10614,26 @@ impl AgentRunner {
                                                            seg = tap_rx.recv(), if tap_open => {
                                                                match seg {
                                                                    Some(tapseg) => {
-                                                                       tap_ring.extend_from_slice(&tapseg.seg);
-                                                                       if tap_ring.len() > TAP_RING {
-                                                                           let drop_n = tap_ring.len() - TAP_RING;
-                                                                           tap_ring.drain(..drop_n);
-                                                                           tap_truncated = true;
+                                                                       let (ring, truncated) = if tapseg.stream == "err" {
+                                                                           (&mut tap_ring_err, &mut tap_err_truncated)
+                                                                       } else {
+                                                                           (&mut tap_ring_out, &mut tap_out_truncated)
+                                                                       };
+                                                                       ring.extend_from_slice(&tapseg.seg);
+                                                                       if ring.len() > TAP_RING {
+                                                                           let drop_n = ring.len() - TAP_RING;
+                                                                           ring.drain(..drop_n);
+                                                                           *truncated = true;
                                                                        }
-                                                                       if tap_flush_at.elapsed() >= TAP_WINDOW && !tap_ring.is_empty() {
-                                                                           let text = String::from_utf8_lossy(&tap_ring).into_owned();
-                                                                           tap_ring.clear();
+                                                                       if tap_flush_at.elapsed() >= TAP_WINDOW && !ring.is_empty() {
+                                                                           let text = String::from_utf8_lossy(ring).into_owned();
+                                                                           ring.clear();
                                                                            tap_flush_at = std::time::Instant::now();
                                                                            yield Ok(AgentEvent::ToolOutputChunk {
                                                                                tool_name: tapseg.tool_name,
+                                                                               stream: tapseg.stream.to_string(),
                                                                                chunk: text,
-                                                                               truncated: tap_truncated,
+                                                                               truncated: *truncated,
                                                                            });
                                                                        }
                                                                    }
@@ -10643,8 +10671,10 @@ impl AgentRunner {
                                                            let mut resolve_fut = std::pin::pin!(
                                                                runner.resolve_approval(&session_id, &tool_name, &args, req, journal.as_deref())
                                                            );
-                                                           let mut resolve_ring: Vec<u8> = Vec::new();
-                                                           let mut resolve_truncated = false;
+                                                           let mut resolve_ring_out: Vec<u8> = Vec::new();
+                                                           let mut resolve_ring_err: Vec<u8> = Vec::new();
+                                                           let mut resolve_out_truncated = false;
+                                                           let mut resolve_err_truncated = false;
                                                            let mut resolve_flush_at = std::time::Instant::now();
                                                            loop {
                                                                tokio::select! {
@@ -10653,20 +10683,26 @@ impl AgentRunner {
                                                                    seg = tap_rx.recv(), if tap_open => {
                                                                        match seg {
                                                                            Some(tapseg) => {
-                                                                               resolve_ring.extend_from_slice(&tapseg.seg);
-                                                                               if resolve_ring.len() > TAP_RING {
-                                                                                   let drop_n = resolve_ring.len() - TAP_RING;
-                                                                                   resolve_ring.drain(..drop_n);
-                                                                                   resolve_truncated = true;
+                                                                               let (ring, truncated) = if tapseg.stream == "err" {
+                                                                                   (&mut resolve_ring_err, &mut resolve_err_truncated)
+                                                                               } else {
+                                                                                   (&mut resolve_ring_out, &mut resolve_out_truncated)
+                                                                               };
+                                                                               ring.extend_from_slice(&tapseg.seg);
+                                                                               if ring.len() > TAP_RING {
+                                                                                   let drop_n = ring.len() - TAP_RING;
+                                                                                   ring.drain(..drop_n);
+                                                                                   *truncated = true;
                                                                                }
-                                                                               if resolve_flush_at.elapsed() >= TAP_WINDOW && !resolve_ring.is_empty() {
-                                                                                   let text = String::from_utf8_lossy(&resolve_ring).into_owned();
-                                                                                   resolve_ring.clear();
+                                                                               if resolve_flush_at.elapsed() >= TAP_WINDOW && !ring.is_empty() {
+                                                                                   let text = String::from_utf8_lossy(ring).into_owned();
+                                                                                   ring.clear();
                                                                                    resolve_flush_at = std::time::Instant::now();
                                                                                    yield Ok(AgentEvent::ToolOutputChunk {
                                                                                        tool_name: tapseg.tool_name,
+                                                                                       stream: tapseg.stream.to_string(),
                                                                                        chunk: text,
-                                                                                       truncated: resolve_truncated,
+                                                                                       truncated: *truncated,
                                                                                    });
                                                                                }
                                                                            }
