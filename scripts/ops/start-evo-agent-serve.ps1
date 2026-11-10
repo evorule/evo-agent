@@ -1,4 +1,4 @@
-# 拉起 evo-agent serve(8081) - 幂等; 自动注入 .env 环境变量(LLM 密钥等,只打印键名不打印值)
+﻿# 拉起 evo-agent serve(8081) - 幂等; 自动注入 .env 环境变量(LLM 密钥等,只打印键名不打印值)
 $OpsDir = $PSScriptRoot
 . (Join-Path $OpsDir '_common.ps1')
 $cfg = Get-OpsConfig -OpsDir $OpsDir
