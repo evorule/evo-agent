@@ -9,11 +9,14 @@
 //!   参数摘要+当时批准者+档位+时间（会话内批准先例参照）的机制载体。
 //! - `shared`：读共享账本任意前缀（get_shared_facts prefix 透传）——含
 //!   /mcp 面事件轨道 `shared.mcp.events.EL-*` 的 agent 只读检索入口。
-//! - `session`：读当前/指定会话 Fact 列表（get_facts）；`fact_id` 给出时
-//!   回溯因果链（get_causal_chain_typed）；`verify=true` 时跑链完整性验证
-//!   （verify_audit_typed）。
-//! - `journal`：读本会话 B21 journal 事件流（JournalWriter::read_lines
-//!   只读句柄；type/since_seq/limit 过滤，输出口径与 query_journal 一致）。
+//! - `session`：读当前/指定会话 Fact 列表（get_facts）——limit（缺省 20、
+//!   上限 100）+ 字节预算收口，超限大 value 降级 `{truncated,bytes,digest}`
+//!   标注（全文按 fact_id 经因果链视图回账）；`fact_id` 给出时回溯因果链
+//!   （get_causal_chain_typed，同套 limit 保留链尾）；`verify=true` 时跑链
+//!   完整性验证（verify_audit_typed）。
+//! - `journal`：读本会话 journal 事件流（JournalWriter::read_lines
+//!   只读句柄；type/since_seq/limit 过滤，输出口径与 query_journal 一致——
+//!   含超限大字段降级与输出字节预算）。
 //!
 //! 注册形态（memory_recall 同构）：占位执行体启动期注册，runner 会话期
 //! 重绑（client/session_id/journal 在手）；开关 agentTools.audit_query 过滤
@@ -34,6 +37,27 @@ const GOV_PREFIX: &str = "shared.gov.";
 /// limit 缺省与上限（gov/session 面）
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
+
+/// session facts 单条 value 内联上限（字节）：超限大 value 降级标注（口径
+/// 对齐 journal 写入侧 checkpoint 内联阈值）
+const SESSION_FACTS_VALUE_INLINE_LIMIT: usize = 4096;
+
+/// session facts 输出总字节预算（字节）：value 为任意 JSON（含媒体 base64
+/// 可能单条巨大），条数 limit 之外再按字节收口
+const SESSION_FACTS_BUDGET_BYTES: usize = 128 * 1024;
+
+/// limit 参数解析（gov/shared/session 统一口径）：缺省 [`DEFAULT_LIMIT`]，
+/// 越界 fail-visible
+fn parse_limit(args: &Value) -> Result<usize, String> {
+    match args.get("limit") {
+        None => Ok(DEFAULT_LIMIT),
+        Some(v) => v
+            .as_u64()
+            .filter(|n| (1..=MAX_LIMIT as u64).contains(n))
+            .map(|n| n as usize)
+            .ok_or_else(|| format!("audit_query: limit must be an integer in 1..={MAX_LIMIT}")),
+    }
+}
 
 /// gov 事件 kind 路径段枚举（路径形态 `shared.gov.gov.{kind}.{ts}.{seq}`）
 const GOV_KINDS: &[&str] = &[
@@ -122,14 +146,7 @@ async fn gov_scope(client: &EvoruleApiClient, args: &Value) -> Result<Value, Str
         .get("precedent")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let limit = match args.get("limit") {
-        None => DEFAULT_LIMIT,
-        Some(v) => v
-            .as_u64()
-            .filter(|n| (1..=MAX_LIMIT as u64).contains(n))
-            .ok_or_else(|| format!("audit_query: limit must be an integer in 1..={MAX_LIMIT}"))?
-            as usize,
-    };
+    let limit = parse_limit(args)?;
     let facts = client
         .get_shared_facts(Some(GOV_PREFIX))
         .await
@@ -214,14 +231,7 @@ async fn shared_scope(client: &EvoruleApiClient, args: &Value) -> Result<Value, 
         .get("prefix")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
-    let limit = match args.get("limit") {
-        None => DEFAULT_LIMIT,
-        Some(v) => v
-            .as_u64()
-            .filter(|n| (1..=MAX_LIMIT as u64).contains(n))
-            .ok_or_else(|| format!("audit_query: limit must be an integer in 1..={MAX_LIMIT}"))?
-            as usize,
-    };
+    let limit = parse_limit(args)?;
     let facts = client
         .get_shared_facts(prefix)
         .await
@@ -267,16 +277,29 @@ async fn session_scope(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if let Some(fid) = args.get("fact_id").and_then(|v| v.as_u64()) {
+        let limit = parse_limit(args)?;
         let chain = client
             .get_causal_chain_typed(session_id, fid)
             .await
             .map_err(|e| format!("audit_query: causal chain query failed ({e})"))?;
+        // 链视图套条数 limit：保留链尾（离查询 fact 最近的 N 个），收口显式
+        let chain_total = chain.chain.len();
+        let chain_length = chain.chain_length;
+        let mut links = chain.chain;
+        let truncated = chain_total > limit;
+        if truncated {
+            links.drain(..chain_total - limit);
+        }
         return Ok(json!({
             "status": "ok",
             "scope": "session",
             "session_id": session_id,
             "view": "causal_chain",
-            "chain": chain,
+            "chain_total": chain_total,
+            "chain_length": chain_length,
+            "returned": links.len(),
+            "truncated": truncated,
+            "chain": links,
         }));
     }
     if verify {
@@ -292,29 +315,86 @@ async fn session_scope(
             "verdict": verdict,
         }));
     }
+    let limit = parse_limit(args)?;
     let facts = client
         .get_facts(session_id, None)
         .await
         .map_err(|e| format!("audit_query: session facts query failed ({e})"))?;
-    let items: Vec<Value> = facts
-        .iter()
-        .map(|f| {
-            json!({
+    let (rows, total, truncated, downgraded) = budgeted_fact_rows(&facts, limit);
+    let mut out = json!({
+        "status": if rows.is_empty() { "empty" } else { "ok" },
+        "scope": "session",
+        "session_id": session_id,
+        "view": "facts",
+        "total": total,
+        "returned": rows.len(),
+        "truncated": truncated,
+        "field_truncated": downgraded,
+        "facts": rows,
+    });
+    if downgraded {
+        out["note"] = json!(
+            "oversized fact values are downgraded to digest+length markers; full text stays on the audit ledger (fetch by fact_id via the causal-chain view)"
+        );
+    }
+    Ok(out)
+}
+
+/// session facts 视图装配：fact_id 降序（新在前）+ 条数 limit + 字节预算。
+/// 预算放不下的大 value 降级为 `{truncated,bytes,digest}` 标注（全文按
+/// fact_id 经 causal-chain 视图回账）；小 value 超预算即收口。
+/// 返回（行集、全量条数、收口标记、字段降级标记）。
+fn budgeted_fact_rows(
+    facts: &[crate::api::evorule_client::FactEntry],
+    limit: usize,
+) -> (Vec<Value>, usize, bool, bool) {
+    let total = facts.len();
+    let mut sorted: Vec<&crate::api::evorule_client::FactEntry> = facts.iter().collect();
+    sorted.sort_by_key(|f| std::cmp::Reverse(f.id));
+    let count_truncated = total > limit;
+    let mut rows = Vec::new();
+    let mut acc = 0usize;
+    let mut downgraded = false;
+    let mut budget_truncated = false;
+    for f in sorted.into_iter().take(limit) {
+        let serialized = serde_json::to_string(&f.value).unwrap_or_default();
+        let size = serialized.len();
+        if size > SESSION_FACTS_VALUE_INLINE_LIMIT {
+            // 大 value 一律降级（与 journal 查询同口径：单条内联阈值封顶，
+            // 全文按 fact_id 经 causal-chain 视图回账）
+            let marker = json!({
+                "truncated": true,
+                "bytes": size,
+                "digest": crate::agent::journal::evorule_digest(&serialized),
+            });
+            let marker_size = serde_json::to_string(&marker).map(|s| s.len()).unwrap_or(0);
+            if acc + marker_size > SESSION_FACTS_BUDGET_BYTES {
+                budget_truncated = true;
+                break;
+            }
+            acc += marker_size;
+            downgraded = true;
+            rows.push(json!({
+                "fact_id": f.id,
+                "path": f.path,
+                "value": marker,
+                "version": f.version,
+            }));
+        } else if acc + size <= SESSION_FACTS_BUDGET_BYTES {
+            acc += size;
+            rows.push(json!({
                 "fact_id": f.id,
                 "path": f.path,
                 "value": f.value,
                 "version": f.version,
-            })
-        })
-        .collect();
-    Ok(json!({
-        "status": if items.is_empty() { "empty" } else { "ok" },
-        "scope": "session",
-        "session_id": session_id,
-        "view": "facts",
-        "total": items.len(),
-        "facts": items,
-    }))
+            }));
+        } else {
+            // 小 value 放不下：预算已收口
+            budget_truncated = true;
+            break;
+        }
+    }
+    (rows, total, count_truncated || budget_truncated, downgraded)
 }
 
 /// scope=journal：本会话 journal 事件流（type/since_seq/limit 过滤；
@@ -365,18 +445,21 @@ fn journal_scope(journal: Option<&JournalWriter>, args: &Value) -> Result<Value,
         matched.push(row);
     }
     let matched_total = matched.len();
-    let truncated = matched_total > limit;
-    if truncated {
-        matched.drain(..matched_total - limit);
-    }
-    Ok(json!({
-        "status": if matched.is_empty() { "empty" } else { "ok" },
+    let (events, truncated, field_truncated) =
+        crate::builtin_tools::accounting::budget_journal_output(matched, limit);
+    let mut out = json!({
+        "status": if events.is_empty() { "empty" } else { "ok" },
         "scope": "journal",
         "total_lines": total_lines,
         "matched": matched_total,
         "truncated": truncated,
-        "events": matched,
-    }))
+        "field_truncated": field_truncated,
+        "events": events,
+    });
+    if field_truncated {
+        out["note"] = json!(crate::builtin_tools::accounting::journal_budget_note());
+    }
+    Ok(out)
 }
 
 /// `audit_query` 执行器（占位/接线双态）
@@ -537,5 +620,150 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("shared facts query failed"), "{err}");
+    }
+
+    // ---- session facts / causal_chain 视图：limit + 字节预算（mock server 直测）----
+
+    fn fact_json(i: u64, value: Value) -> Value {
+        json!({"fact_id": i, "path": format!("audit.f{i}"), "value": value, "version": i})
+    }
+
+    #[tokio::test]
+    async fn session_facts_view_applies_default_limit_and_truncation() {
+        let mut server = mockito::Server::new_async().await;
+        let facts: Vec<Value> = (1u64..=150)
+            .map(|i| fact_json(i, json!(format!("v{i}"))))
+            .collect();
+        let _m = server
+            .mock("GET", "/api/sessions/s-test/facts")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&facts).unwrap())
+            .create_async()
+            .await;
+        let client = crate::api::evorule_client::EvoruleApiClient::new(&server.url());
+        let out = audit_query_exec("s-test", &client, None, &json!({"scope": "session"}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 150, "total must report the full fact count");
+        assert_eq!(out["returned"], 20, "default limit must cap the facts view");
+        assert_eq!(out["truncated"], true);
+        let rows = out["facts"].as_array().unwrap();
+        assert_eq!(rows.len(), 20);
+        assert_eq!(rows[0]["fact_id"], 150, "newest fact first");
+    }
+
+    #[tokio::test]
+    async fn session_facts_view_downgrades_oversized_value_to_digest() {
+        let mut server = mockito::Server::new_async().await;
+        let big = "x".repeat(100 * 1024);
+        let facts = json!([fact_json(1, json!(big)), fact_json(2, json!("small"))]);
+        let _m = server
+            .mock("GET", "/api/sessions/s-test/facts")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(facts.to_string())
+            .create_async()
+            .await;
+        let client = crate::api::evorule_client::EvoruleApiClient::new(&server.url());
+        let out = audit_query_exec(
+            "s-test",
+            &client,
+            None,
+            &json!({"scope": "session", "limit": 50}),
+        )
+        .await
+        .unwrap();
+        let rows = out["facts"].as_array().unwrap();
+        let big_row = rows.iter().find(|r| r["fact_id"] == 1).unwrap();
+        assert_eq!(big_row["value"]["truncated"], true);
+        assert!(
+            big_row["value"]["bytes"].as_u64().unwrap() >= 100_000,
+            "bytes must reflect the serialized value size"
+        );
+        let digest = big_row["value"]["digest"].as_str().unwrap();
+        assert!(digest.starts_with("blake3:"), "digest口径 = blake3 前缀");
+        assert_eq!(big_row["path"], "audit.f1", "fact_id/path 保留供全文回账");
+        // 小 value 原样内联
+        let small_row = rows.iter().find(|r| r["fact_id"] == 2).unwrap();
+        assert_eq!(small_row["value"], "small");
+        assert_eq!(out["field_truncated"], true);
+        let note = out["note"].as_str().unwrap();
+        assert!(note.contains("digest"), "downgrade must be visible: {note}");
+    }
+
+    #[tokio::test]
+    async fn session_facts_view_budget_stops_before_count_limit() {
+        let mut server = mockito::Server::new_async().await;
+        // 150 条 × ~3KB value（< 内联阈值 4096，不触发降级路径）：limit=50
+        // 挡不住全部，字节预算更先收口
+        let facts: Vec<Value> = (1u64..=150)
+            .map(|i| fact_json(i, json!("p".repeat(3 * 1024))))
+            .collect();
+        let _m = server
+            .mock("GET", "/api/sessions/s-test/facts")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&facts).unwrap())
+            .create_async()
+            .await;
+        let client = crate::api::evorule_client::EvoruleApiClient::new(&server.url());
+        let out = audit_query_exec(
+            "s-test",
+            &client,
+            None,
+            &json!({"scope": "session", "limit": 50}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["total"], 150);
+        assert!(
+            out["returned"].as_u64().unwrap() < 50,
+            "byte budget must stop loading before the count limit"
+        );
+        assert_eq!(out["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn causal_chain_view_applies_limit_and_keeps_tail() {
+        let mut server = mockito::Server::new_async().await;
+        let links: Vec<Value> = (0u64..50)
+            .map(|i| {
+                json!({
+                    "fact_id": i,
+                    "fact_type": "tool_result",
+                    "logical_time": i,
+                    "content_hash": format!("blake3:{i:064x}"),
+                    "prev_hash": format!("blake3:{:064x}", i.saturating_sub(1)),
+                    "cause": if i == 0 { Value::Null } else { json!(i - 1) },
+                })
+            })
+            .collect();
+        let body = json!({"session_id": 1, "fact_id": 49, "chain_length": 50, "chain": links});
+        let _m = server
+            .mock("GET", "/api/sessions/s-test/audit/causal/49")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+        let client = crate::api::evorule_client::EvoruleApiClient::new(&server.url());
+        let out = audit_query_exec(
+            "s-test",
+            &client,
+            None,
+            &json!({"scope": "session", "fact_id": 49}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["chain_total"], 50);
+        assert_eq!(out["returned"], 20, "default limit must cap the chain view");
+        assert_eq!(out["truncated"], true);
+        let chain = out["chain"].as_array().unwrap();
+        assert_eq!(chain.len(), 20);
+        assert_eq!(
+            chain[0]["fact_id"], 30,
+            "chain tail (nearest to query) kept"
+        );
     }
 }

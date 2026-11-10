@@ -6,7 +6,9 @@
 //! 四个只读工具，全部走唯一管道（Standard：免裁决但落账；AutoPolicy：
 //! 免审批）——查账自身入账，查账行为可审计（设计档 §11.1）：
 //!
-//! - `query_journal`：会话 journal 事件流查询（时间窗/回合/类型过滤）
+//! - `query_journal`：会话 journal 事件流查询（时间窗/回合/类型过滤；
+//!   超限大字段降级 digest+bytes 标注，输出套字节预算——与 audit_query
+//!   scope=journal 共用口径）
 //! - `query_trace`：工具调用轨迹查询（工具名/状态/调用序过滤）
 //! - `read_back`：文件现势内容 + staleness 判定（会话内纯轨迹推算——
 //!   只对「会话内已知的写」负责，外部进程改动不在射程，边界随 spec 落）
@@ -145,6 +147,81 @@ const READ_TOOLS: &[&str] = &["file_read"];
 const WRITE_TOOLS: &[&str] = &["file_write", "file_create", "file_move", "file_delete"];
 
 // =============================================================================
+// journal 查询输出预算（query_journal 与 audit_query scope=journal 共用口径）
+// =============================================================================
+
+/// journal 查询输出单字段内联上限（字节）：超过即降级 digest+bytes+truncated
+/// 标注——口径对齐 journal 写入侧的 checkpoint 内联阈值（4096）。
+pub(crate) const JOURNAL_FIELD_INLINE_LIMIT: usize = 4096;
+
+/// journal 查询输出总字节预算（字节）：预算收口即停止装填并置 truncated。
+const JOURNAL_OUTPUT_BUDGET_BYTES: usize = 256 * 1024;
+
+/// 单行超限大字段降级：seq/ts/type 三个账面定位键永不降级；其余字段序列化
+/// 后超过 [`JOURNAL_FIELD_INLINE_LIMIT`] 的替换为 `{truncated,bytes,digest}`
+/// 标注对象（digest 口径与 journal 写入侧一致，全文按 call_id/fact_id 回账）。
+/// 返回本行是否有字段被降级。
+fn downgrade_oversized_fields(row: &mut Value) -> bool {
+    let mut any = false;
+    if let Some(obj) = row.as_object_mut() {
+        let keys: Vec<String> = obj.keys().cloned().collect();
+        for k in keys {
+            if k == "seq" || k == "ts" || k == "type" {
+                continue;
+            }
+            let serialized = serde_json::to_string(&obj[&k]).unwrap_or_default();
+            if serialized.len() > JOURNAL_FIELD_INLINE_LIMIT {
+                let marker = json!({
+                    "truncated": true,
+                    "bytes": serialized.len(),
+                    "digest": crate::agent::journal::evorule_digest(&serialized),
+                });
+                obj.insert(k, marker);
+                any = true;
+            }
+        }
+    }
+    any
+}
+
+/// journal 查询输出装配（两查询点共用口径）：超限大字段降级 + 条数尾部截取
+/// （最新 N 条）+ 输出总预算兜底（从最新端累计，超预算的头段收口）。
+/// 返回（预算后事件、收口标记、字段降级标记）。
+pub(crate) fn budget_journal_output(
+    mut events: Vec<Value>,
+    limit: usize,
+) -> (Vec<Value>, bool, bool) {
+    let mut field_truncated = false;
+    for row in events.iter_mut() {
+        field_truncated |= downgrade_oversized_fields(row);
+    }
+    let matched_total = events.len();
+    let mut truncated = matched_total > limit;
+    if truncated {
+        events.drain(..matched_total - limit);
+    }
+    let mut acc = 0usize;
+    let mut keep_from = 0usize;
+    for (idx, row) in events.iter().enumerate().rev() {
+        acc += serde_json::to_string(row).map(|s| s.len()).unwrap_or(0);
+        if acc > JOURNAL_OUTPUT_BUDGET_BYTES {
+            keep_from = idx + 1;
+            break;
+        }
+    }
+    if keep_from > 0 {
+        events.drain(..keep_from);
+        truncated = true;
+    }
+    (events, truncated, field_truncated)
+}
+
+/// 降级可见面说明（输出 note 字段文案，两查询点共用）。
+pub(crate) fn journal_budget_note() -> &'static str {
+    "oversized payload fields are downgraded to digest+length markers; full text remains in the session journal (join back by call_id / fact_id)"
+}
+
+// =============================================================================
 // query_journal —— 会话 journal 事件流查询
 // =============================================================================
 
@@ -237,20 +314,21 @@ impl ToolFunction for QueryJournalTool {
             matched.push(row);
         }
 
-        // limit：尾部截取（最新 N 条），truncated 显式标注
+        // 超限大字段降级 + 条数尾部截取 + 输出总预算兜底（truncated 显式标注）
         let matched_total = matched.len();
-        let truncated = matched_total > limit;
-        if truncated {
-            matched.drain(..matched_total - limit);
-        }
-
-        Ok(json!({
+        let (events, truncated, field_truncated) = budget_journal_output(matched, limit);
+        let mut out = json!({
             "session": ctx.session_id,
             "total_lines": total_lines,
             "matched": matched_total,
             "truncated": truncated,
-            "events": matched,
-        }))
+            "field_truncated": field_truncated,
+            "events": events,
+        });
+        if field_truncated {
+            out["note"] = json!(journal_budget_note());
+        }
+        Ok(out)
     }
 }
 
@@ -813,6 +891,55 @@ mod tests {
             out["note"].as_str().unwrap().contains("not found"),
             "empty ledger must be explicit, not silent"
         );
+    }
+
+    #[tokio::test]
+    async fn query_journal_downgrades_oversized_payload_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        let big = "y".repeat(20_000);
+        write_journal_file(
+            &dir,
+            "s-test",
+            &[
+                // 锚行：call_id/content_digest 类小字段须原样保留
+                json!({"seq":1,"ts":1000,"type":"tool_result","payload":{"call_id":"t2","status":"ok","size_bytes":5,"content_digest":"blake3:bb"}})
+                    .to_string(),
+                // 大字段行：wire_rendered.full_text 超内联阈值 → 降级标注
+                json!({"seq":2,"ts":2000,"type":"wire_rendered","payload":{"round":1,"wire_len":20_000,"content_hash":"blake3:cc","full_text": big}})
+                    .to_string(),
+            ],
+        );
+        let tool = QueryJournalTool::new(wired_deps(
+            tmp.path(),
+            Arc::new(Mutex::new(ToolTraceCollector::default())),
+        ));
+        let out = tool.call(&json!({"limit": 10})).await.unwrap();
+        assert_eq!(out["matched"], 2);
+        let row = &out["events"][1];
+        // 账面定位键永不降级
+        assert_eq!(row["seq"], 2);
+        assert_eq!(row["type"], "wire_rendered");
+        // 小字段（锚/摘要类）原样保留
+        assert_eq!(row["round"], 1);
+        assert_eq!(row["content_hash"], "blake3:cc");
+        // 超限大字段降级为 digest+bytes+truncated 标注
+        assert_eq!(row["full_text"]["truncated"], true);
+        assert_eq!(row["full_text"]["bytes"].as_u64().unwrap(), 20_002);
+        let digest = row["full_text"]["digest"].as_str().unwrap();
+        assert!(digest.starts_with("blake3:"));
+        // digest 与 journal 写入侧口径一致（序列化形态含引号）
+        assert_eq!(
+            digest,
+            crate::agent::journal::evorule_digest(&format!("\"{}\"", "y".repeat(20_000)))
+        );
+        // 锚行不受影响
+        let anchor = &out["events"][0];
+        assert_eq!(anchor["call_id"], "t2");
+        assert_eq!(anchor["content_digest"], "blake3:bb");
+        assert_eq!(out["field_truncated"], true);
+        let note = out["note"].as_str().unwrap();
+        assert!(note.contains("digest"), "downgrade must be visible: {note}");
     }
 
     #[tokio::test]
