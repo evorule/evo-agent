@@ -1261,6 +1261,15 @@ async fn construct_runner(
                 &merged_settings,
             ),
         );
+        // 服务端共享账压实调度档接线（与保留期策略同款装配口径）。缺省 off=
+        // 零动作零 HTTP；显式 archive/discard 后，非缺省清扫轮尾部调度服务端
+        // 压实 marker（共享事实物理释放经服务端版本化账路径，agent 本地
+        // 覆写不产生磁盘回收；调度需 evorule 连接管理员凭据，fail-soft）。
+        mem = mem.with_shared_server_compaction(
+            crate::agent::storage_retention::SharedServerCompaction::from_settings(
+                &merged_settings,
+            ),
+        );
         // F-618 阶段1:LexStore 检索缓存注入(与 runner 构造路径同款;缺省
         // 未声明=None=全量拉取路径零影响)。缺此注入时 serve 流即使定义
         // 声明 lex_store 也不生效(缓存与 lex_cache_stats 观测同源失活)

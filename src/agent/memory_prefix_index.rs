@@ -20,6 +20,16 @@
 //!   会话 payload 无版本号原语，且存在管理器外写者（事件库等），正索引
 //!   无法保证不漏新键；共享分区存在账本版本号原语，任何旁路写者（工具
 //!   面/API 面）都会 bump 版本触发重建，不漏键可被机器保证。
+//! - epoch 边界（服务端共享账压实，version 数值跨 epoch 不连续）：服务端
+//!   压实重编号后账本版本回落（如 5000→7），守卫锚 `shared_version` 与现值
+//!   必然不等 → 判漂移 → 全量重建，回落天然被感知。守卫必须是 **equality
+//!   比较**，禁改单调比较——压实后版本重新爬回旧值时，单调守卫（current ≥
+//!   stored）会把旧 epoch 的 stale 键集误判新鲜（假阳性方向）。残余理论
+//!   窗口（压实后长期只写不读，维护读-改-写保留原守卫值，版本爬回同值）
+//!   受双兜底：①命中键数据永远来自服务端权威读取，已删键读空即不返回，
+//!   结果面不受索引内容污染；②索引声称在场但账面零事实 → 一致性失效 →
+//!   重建。守卫锚刷新是 rebuild 路径专属职责，维护读-改-写不得凭空刷新。
+//!   回归钉死：memory.rs 测试区 epoch_* 四件。
 
 /// 索引记录的 kind 标识（sanity 校验用；外来数据占据索引路径时判定损坏）
 pub(crate) const PREFIX_INDEX_KIND: &str = "memory_prefix_index";
@@ -127,6 +137,7 @@ pub(crate) fn range_worth_indexing(range_len: usize) -> bool {
 }
 
 /// 前缀索引快路径的探测结果（fail-soft 语义的三态出口）
+#[derive(Debug)]
 pub(crate) enum PrefixIndexProbe {
     /// 索引可用且一致：区间定向读取的权威结果
     Hit(Vec<crate::agent::memory::MemoryRecord>),

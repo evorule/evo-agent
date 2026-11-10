@@ -287,6 +287,23 @@ mod tests {
         assert!(!serialized.contains("fact_id"));
     }
 
+    /// epoch 契约：归档卡身份锚=fact_id（跨压实稳定键），卡内零 version
+    /// 游标在驻（压实重编号后 version 数值跨 epoch 不连续，锚错位即静默漏数据）
+    #[test]
+    fn decay_card_anchor_is_fact_id_with_no_version_cursors() {
+        let mut record = MemoryRecord::new("topic", "some-value", 1_700_000_000);
+        record.fact_id = Some(52);
+        let card = build_archived_card(&record, "shared.ns.topic", Some(1_700_001_000));
+        let j = serde_json::to_value(&card).unwrap();
+        assert_eq!(j["anchors"]["fact_id"], 52, "锚=fact_id");
+        let s = j.to_string();
+        assert!(
+            !s.contains("version"),
+            "归档卡不得携带任何 version 游标字段: {s}"
+        );
+        assert!(s.contains("\"digest\":\"blake3:"));
+    }
+
     // ---- 访问戳载荷与路径 ----
 
     #[test]

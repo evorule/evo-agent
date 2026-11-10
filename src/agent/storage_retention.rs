@@ -948,6 +948,88 @@ impl SweepTrigger {
     }
 }
 
+/// 服务端共享账压实调度档（封闭枚举；缺省 [`SharedServerCompaction::Off`]=零动作）。
+///
+/// 服务端共享事实是版本化账（agent 侧覆写不产生本地磁盘回收，见 §清扫边界），
+/// 物理释放经服务端压实路径调度：`archive`=归档落盘 server 侧 wal_dir，
+/// `discard`=仅摘要存根。独立于 agent 本地 action 派生——归档落点在 server 侧，
+/// 语义不同机，显式选档不隐式耦合。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SharedServerCompaction {
+    /// 缺省：零动作（零 HTTP，缺省不变式）
+    #[default]
+    Off,
+    /// 归档后压实（服务端归档件落 wal_dir）
+    Archive,
+    /// 直接压实（仅保留最新版本+摘要存根）
+    Discard,
+}
+
+impl SharedServerCompaction {
+    /// 从 settings 解析（封闭枚举白名单：非白名单值不 clamp 只回缺省）
+    pub fn from_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Self {
+        match settings
+            .get("storage.retention.sharedServer")
+            .and_then(|v| v.as_str())
+        {
+            Some("archive") => Self::Archive,
+            Some("discard") => Self::Discard,
+            _ => Self::Off,
+        }
+    }
+
+    fn mode_str(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::Archive => Some("archive"),
+            Self::Discard => Some("discard"),
+        }
+    }
+}
+
+/// 进程内调度去重（同实例只 POST 一次；marker 本身幂等，去重只省流量；
+/// 重启实例后可再调度）。测试独占说明见 `maybe_schedule_server_compaction`。
+static SHARED_COMPACTION_SCHEDULED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 服务端共享账压实调度（fail-soft：成功 info 留痕；403/网络失败 warn 留痕
+/// 零重试零阻断——清扫面绝不因调度失败放弃本地释放）。
+///
+/// `scheduled` 注入式去重标志：生产接线传 `&SHARED_COMPACTION_SCHEDULED`；
+/// 测试传本地标志防进程级共享态跨测试先到先得。返回本轮是否实际执行了调度。
+pub async fn maybe_schedule_server_compaction(
+    mode: SharedServerCompaction,
+    client: &crate::api::evorule_client::EvoruleApiClient,
+    scheduled: &std::sync::atomic::AtomicBool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let Some(m) = mode.mode_str() else {
+        return false;
+    };
+    if scheduled.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    match client.schedule_shared_compaction(m).await {
+        Ok(resp) => {
+            tracing::info!(
+                mode = m,
+                response = %resp,
+                "retention: server shared-facts compaction scheduled (effective next server restart)"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                mode = m,
+                error = %e,
+                "retention: server shared-facts compaction schedule failed \
+                 (fail-soft, no retry; evorule connection needs administrator credential)"
+            );
+            false
+        }
+    }
+}
+
 /// 清扫上下文（调用方装配；缺省策略应在装配侧短路不构造本上下文）
 pub struct RetentionSweepCtx {
     /// 保留期与配额策略
@@ -962,6 +1044,8 @@ pub struct RetentionSweepCtx {
     pub session_id: String,
     /// 归档落点显式覆盖（None=按 env/用户目录/兜底链解析）
     pub archive_dir_override: Option<PathBuf>,
+    /// 服务端共享账压实调度档（off=零动作；见 [`SharedServerCompaction`]）
+    pub shared_server: SharedServerCompaction,
 }
 
 /// 清扫报告（留痕面；事件与日志之外的进程内对账）
@@ -1233,6 +1317,16 @@ pub async fn run_retention_sweep(ctx: RetentionSweepCtx, now_ms: u64) -> SweepRe
         }
     }
     report.exempt_skipped = exempt_skipped;
+    // —— 阶段 5：服务端共享账压实调度（off=零动作；调度失败不影响本地释放
+    // 结果，fail-soft；共享事实物理释放经服务端压实路径，本地面不产生回收）——
+    if ctx.shared_server != SharedServerCompaction::Off {
+        maybe_schedule_server_compaction(
+            ctx.shared_server,
+            &ctx.client,
+            &SHARED_COMPACTION_SCHEDULED,
+        )
+        .await;
+    }
     report.no_op = report.files_modified == 0 && report.payload_released == 0;
     report
 }
@@ -1451,7 +1545,7 @@ mod tests {
         assert_eq!(cands[0].bytes, cands[0].bytes, "字节计数口径在场");
         assert!(cands[0].reclaim_bytes > 0);
         // 派生投影路径定位与原文回读一致
-        let rec = payload_record_from_state(&state, "ns", "s1", &paths[0]).unwrap();
+        let rec = payload_record_from_state(&state, "ns", "s1", paths[0]).unwrap();
         assert_eq!(rec["content"], json!("全文内容"));
         assert!(
             payload_record_from_state(&state, "ns", "s1", "__memory__.ns.session_s1.absent")
@@ -1857,6 +1951,7 @@ mod tests {
             namespace: "ns".into(),
             session_id: "s-rt".into(),
             archive_dir_override: None,
+            shared_server: SharedServerCompaction::Off,
         };
         let report = tokio_test::block_on(run_retention_sweep(ctx, now_ms));
         assert_eq!(report.files_modified, 1, "一个文件被压缩");
@@ -1951,6 +2046,7 @@ mod tests {
             namespace: "ns".into(),
             session_id: "s-exp".into(),
             archive_dir_override: Some(archive_dir.clone()),
+            shared_server: SharedServerCompaction::Off,
         };
         let report = tokio_test::block_on(run_retention_sweep(ctx, now_ms));
         assert_eq!(report.files_modified, 1);
@@ -1999,6 +2095,7 @@ mod tests {
             namespace: "ns".into(),
             session_id: "s-abort".into(),
             archive_dir_override: Some(bogus_dir),
+            shared_server: SharedServerCompaction::Off,
         };
         let report = tokio_test::block_on(run_retention_sweep(ctx, now_ms));
         // 宁不删不丢失：文件逐字节不变、零事件、放弃登记
@@ -2025,6 +2122,7 @@ mod tests {
             namespace: "ns".into(),
             session_id: "s-zero".into(),
             archive_dir_override: None,
+            shared_server: SharedServerCompaction::Off,
         };
         let report = tokio_test::block_on(run_retention_sweep(ctx, now_ms));
         assert!(report.no_op, "缺省策略整体短路");
@@ -2046,5 +2144,172 @@ mod tests {
         assert_eq!(o, PathBuf::from("/explicit"));
         // 兜底链必然可解析（journal 目录兜底永在）
         assert!(resolve_archive_dir(None, journal_dir).is_some());
+    }
+
+    // ---------- 服务端共享账压实调度（epoch 契约接线面）----------
+
+    fn shared_server_settings(v: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "storage.retention.sharedServer".to_string(),
+            serde_json::Value::String(v.to_string()),
+        );
+        m
+    }
+
+    #[test]
+    fn shared_server_mode_from_settings_closed_enum() {
+        // 缺省（无键）= off = 零动作
+        assert_eq!(
+            SharedServerCompaction::from_settings(&serde_json::Map::new()),
+            SharedServerCompaction::Off
+        );
+        // 白名单值
+        assert_eq!(
+            SharedServerCompaction::from_settings(&shared_server_settings("archive")),
+            SharedServerCompaction::Archive
+        );
+        assert_eq!(
+            SharedServerCompaction::from_settings(&shared_server_settings("discard")),
+            SharedServerCompaction::Discard
+        );
+        // 非白名单值不 clamp 只回缺省（封闭枚举口径与既有三键一致）
+        assert_eq!(
+            SharedServerCompaction::from_settings(&shared_server_settings("nuke")),
+            SharedServerCompaction::Off
+        );
+        // 类型不符回缺省
+        let mut wrong_type = serde_json::Map::new();
+        wrong_type.insert(
+            "storage.retention.sharedServer".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        assert_eq!(
+            SharedServerCompaction::from_settings(&wrong_type),
+            SharedServerCompaction::Off
+        );
+    }
+
+    /// 去重调度 mock：POST 命中计数（mockito 1.x 无 hit 计数 API，闭包自计）
+    async fn counting_compaction_mock(
+        server: &mut mockito::Server,
+        mode: &'static str,
+        status: usize,
+    ) -> (
+        mockito::Mock,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_body = hits.clone();
+        let body = move |w: &mut dyn std::io::Write| {
+            use std::sync::atomic::Ordering;
+            hits_for_body.fetch_add(1, Ordering::SeqCst);
+            let payload = format!(r#"{{"scheduled":true,"echo_mode":"{mode}","status":{status}}}"#);
+            w.write_all(payload.as_bytes())?;
+            Ok::<(), std::io::Error>(())
+        };
+        let mock = server
+            .mock("POST", "/api/admin/shared/compaction")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "mode": mode
+            })))
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_chunked_body(body)
+            .create_async()
+            .await;
+        (mock, hits)
+    }
+
+    /// off=零动作：零 HTTP（计数 mock 恒 0）
+    #[tokio::test]
+    async fn maybe_schedule_off_is_zero_http() {
+        let mut server = mockito::Server::new_async().await;
+        let (_mock, hits) = counting_compaction_mock(&mut server, "archive", 200).await;
+        let client = crate::api::evorule_client::EvoruleApiClient::new(&server.url());
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let scheduled =
+            maybe_schedule_server_compaction(SharedServerCompaction::Off, &client, &flag).await;
+        assert!(!scheduled);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "off 档必须零 HTTP"
+        );
+    }
+
+    /// archive 档：mode 直传；去重标志注入=同标志第二次调用不再 POST
+    #[tokio::test]
+    async fn maybe_schedule_posts_once_then_dedupes() {
+        let mut server = mockito::Server::new_async().await;
+        let (_mock, hits) = counting_compaction_mock(&mut server, "archive", 200).await;
+        let client = crate::api::evorule_client::EvoruleApiClient::new(&server.url());
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let first =
+            maybe_schedule_server_compaction(SharedServerCompaction::Archive, &client, &flag).await;
+        assert!(first, "首次调用应执行调度");
+        let second =
+            maybe_schedule_server_compaction(SharedServerCompaction::Archive, &client, &flag).await;
+        assert!(!second, "去重标志已置位：第二次调用不再 POST");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "恰好一次 HTTP"
+        );
+    }
+
+    /// 403 失败面：fail-soft 不 panic 不重试（返回 false，错误只留痕）
+    #[tokio::test]
+    async fn maybe_schedule_auth_failure_is_fail_soft() {
+        let mut server = mockito::Server::new_async().await;
+        let (_mock, hits) = counting_compaction_mock(&mut server, "discard", 403).await;
+        let client = crate::api::evorule_client::EvoruleApiClient::new(&server.url());
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let scheduled =
+            maybe_schedule_server_compaction(SharedServerCompaction::Discard, &client, &flag).await;
+        assert!(!scheduled, "403=调度未成功");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "零重试");
+    }
+
+    /// 清扫尾部接线：非缺省清扫轮执行调度（discard 直传）；缺省档位零 HTTP。
+    /// 空 journal 目录 + 空 session_id = 最小 no-op 清扫形态（payload 面跳过）。
+    /// 本测试独占进程级去重静态（其余调度测试用本地标志，互不污染）。
+    #[tokio::test]
+    async fn sweep_tail_schedules_server_compaction() {
+        use std::sync::atomic::Ordering;
+        SHARED_COMPACTION_SCHEDULED.store(false, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        // —— 调度档：清扫轮尾部调度一次 ——
+        let mut server = mockito::Server::new_async().await;
+        let (_mock, hits) = counting_compaction_mock(&mut server, "discard", 200).await;
+        let ctx = RetentionSweepCtx {
+            policy: policy_with(RetentionPeriod::NinetyDays, RetentionAction::Compact, None),
+            journal_dir: dir.path().to_path_buf(),
+            client: crate::api::evorule_client::EvoruleApiClient::new(&server.url()),
+            namespace: String::new(),
+            session_id: String::new(),
+            archive_dir_override: None,
+            shared_server: SharedServerCompaction::Discard,
+        };
+        let report = run_retention_sweep(ctx, 1_700_000_000_000).await;
+        assert!(report.no_op);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "清扫轮尾部应调度服务端压实");
+        // —— 缺省档：零 HTTP ——
+        let mut server2 = mockito::Server::new_async().await;
+        let (_mock2, hits2) = counting_compaction_mock(&mut server2, "archive", 200).await;
+        let ctx2 = RetentionSweepCtx {
+            policy: policy_with(RetentionPeriod::NinetyDays, RetentionAction::Compact, None),
+            journal_dir: dir.path().to_path_buf(),
+            client: crate::api::evorule_client::EvoruleApiClient::new(&server2.url()),
+            namespace: String::new(),
+            session_id: String::new(),
+            archive_dir_override: None,
+            shared_server: SharedServerCompaction::Off,
+        };
+        let report2 = run_retention_sweep(ctx2, 1_700_000_000_000).await;
+        assert!(report2.no_op);
+        assert_eq!(hits2.load(Ordering::SeqCst), 0, "off 档清扫轮零调度 HTTP");
     }
 }

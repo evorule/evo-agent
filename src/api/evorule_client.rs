@@ -437,6 +437,38 @@ impl EvoruleApiClient {
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
+    /// POST /api/admin/shared/compaction —— 服务端共享事实账压实调度（marker 面）
+    ///
+    /// `mode`: `"archive"`(归档落盘 server 侧 wal_dir) | `"discard"`(仅摘要存根)。
+    /// 调度即写 marker，压实于服务端**次启动**生效（stop-world 窗口执行位）；
+    /// 需 administrator 凭据（对齐 wal/checkpoint 面），非 2xx fail-fast 上浮，
+    /// 成败裁决归调用方（保留期清扫 fail-soft / admin 透传直报）。
+    pub async fn schedule_shared_compaction(&self, mode: &str) -> Result<Value, ApiError> {
+        let url = self.core.url("/api/admin/shared/compaction");
+        let body = serde_json::json!({ "mode": mode });
+        let resp = self
+            .core
+            .auth_header(self.core.client().post(&url))
+            .json(&body)
+            .send()
+            .await?;
+        let resp = self.core.check_response_full(resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// GET /api/admin/shared/compaction —— 服务端共享账压实状态透传
+    /// （上次报告 + marker 在场性等，形态归服务端所有，客户端不做投影）。
+    pub async fn get_shared_compaction_status(&self) -> Result<Value, ApiError> {
+        let url = self.core.url("/api/admin/shared/compaction");
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        let resp = self.core.check_response_full(resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
     /// 提议知识条目入账 Draft（治理语义封装，非裸 passthrough）
     ///
     /// 经服务编排层服务注册桥（`knowledge-propose`）→ 规则引擎服务端闸：
@@ -2899,6 +2931,75 @@ mod tests {
         let resp = client.get_shared_facts_version().await.unwrap();
         assert_eq!(resp["version"], 7);
         assert_eq!(resp["history_len"], 42);
+        mock.assert_async().await;
+    }
+
+    /// `POST /api/admin/shared/compaction` —— 压实调度透传：mode 直传请求体，
+    /// 服务端响应体原样返回（scheduled/effective 语义归服务端所有）。
+    #[tokio::test]
+    async fn test_schedule_shared_compaction_posts_mode() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/admin/shared/compaction")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "mode": "discard"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"scheduled":true,"effective":"next_restart"}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let resp = client.schedule_shared_compaction("discard").await.unwrap();
+        assert_eq!(resp["scheduled"], true);
+        assert_eq!(resp["effective"], "next_restart");
+        mock.assert_async().await;
+    }
+
+    /// 调度失败面：非 2xx 上浮为 `ApiError::ApiError`（message 透传服务端诊断），
+    /// 不吞错不降级——调度成败由调用方（fail-soft 清扫/透传端点）各自裁决。
+    #[tokio::test]
+    async fn test_schedule_shared_compaction_error_surfaces() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/admin/shared/compaction")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"administrator required"}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let err = client
+            .schedule_shared_compaction("archive")
+            .await
+            .unwrap_err();
+        match err {
+            ApiError::ApiError { status, message } => {
+                assert_eq!(status, 403);
+                assert_eq!(message, "administrator required");
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    /// `GET /api/admin/shared/compaction` —— 压实状态报告透传（上次报告 +
+    /// marker 在场性等，形态归服务端所有，客户端只做透传投影）。
+    #[tokio::test]
+    async fn test_get_shared_compaction_status_passthrough() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/admin/shared/compaction")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"marker_present":false,"last_report":null}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let resp = client.get_shared_compaction_status().await.unwrap();
+        assert_eq!(resp["marker_present"], false);
         mock.assert_async().await;
     }
 }

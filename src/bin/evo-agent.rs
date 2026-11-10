@@ -3999,13 +3999,20 @@ fn cmd_serve(
     // 不装配 payload 面——空 session_id 即跳过，边界见 storage_retention 模块
     // 头）。fail-soft：错误只登记不重试，绝不阻断启动主流程。
     {
-        let policy = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
-            .map(|s| {
-                evo_agent::agent::storage_retention::StorageRetentionPolicy::from_settings(
-                    &s.merged().0,
-                )
-            })
-            .unwrap_or_default();
+        let (policy, shared_server) =
+            evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+                .map(|s| {
+                    let merged = s.merged().0;
+                    (
+                        evo_agent::agent::storage_retention::StorageRetentionPolicy::from_settings(
+                            &merged,
+                        ),
+                        evo_agent::agent::storage_retention::SharedServerCompaction::from_settings(
+                            &merged,
+                        ),
+                    )
+                })
+                .unwrap_or_default();
         if !policy.is_default() {
             let journal_dir = workdir.join("data").join("sessions");
             let client = retention_patrol_client;
@@ -4021,6 +4028,7 @@ fn cmd_serve(
                     namespace: String::new(),
                     session_id: String::new(),
                     archive_dir_override: None,
+                    shared_server,
                 };
                 let report =
                     evo_agent::agent::storage_retention::run_retention_sweep(ctx, now_ms).await;

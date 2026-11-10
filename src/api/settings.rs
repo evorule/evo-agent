@@ -737,6 +737,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "window",
         },
         SettingEntry {
+            key: "storage.retention.sharedServer",
+            kind: SettingType::Enum,
+            default: json!("off"),
+            enum_values: Some(vec!["off", "archive", "discard"]),
+            range: None,
+            category: "存储",
+            description: "服务端共享记忆账压实调度：共享事实为服务端版本化账，agent 本地覆写不产生磁盘回收；显式开启后，保留期清扫轮（收口/启动巡检）向服务端调度压实（marker，服务端次启动生效，需管理员凭据）。off=零动作（默认，现行为零变化）；archive=归档落盘服务端数据目录后压实；discard=仅保留最新版本与摘要存根。仅保留期策略（storage.retention.period）非默认时随清扫轮生效",
+            scope: "window",
+        },
+        SettingEntry {
             key: "mentions.maxFileLines",
             kind: SettingType::Number,
             default: json!(600),
@@ -1099,7 +1109,9 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 68); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键;审计摘要卡 audit_summary 开关键;存储保留期与硬配额三键:封闭枚举+缺省=现行为(永久/压缩/不限,零回归))
+        // 计数锁=单源纪律执法面：新增 SettingEntry 时同步此数（当前含
+        // storage.retention.sharedServer）
+        assert_eq!(settings.len(), 69); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键;审计摘要卡 audit_summary 开关键;存储保留期与硬配额三键:封闭枚举+缺省=现行为(永久/压缩/不限,零回归)+服务端共享账压实调度档)
         assert_eq!(settings["storage.retention.period"], json!("forever"));
         assert_eq!(settings["storage.retention.action"], json!("compact"));
         assert_eq!(settings["storage.quota.maxBytes"], json!("unlimited"));
