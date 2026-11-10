@@ -1317,17 +1317,21 @@ mod tests {
         let content = std::fs::read_to_string(&jp).unwrap();
         let mut lines: Vec<String> = content.lines().map(String::from).collect();
         assert!(lines.len() >= 2);
-        let mut rec: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
-        rec["name"] = serde_json::json!("forged");
-        lines[1] = serde_json::to_string(&rec).unwrap();
-        std::fs::write(
-            &jp,
-            lines.join(
-                "
-",
-            ),
-        )
-        .unwrap();
+        // 篡改定位按动作形态锚定 revoke 行——期刊布局随签名模式而异（同进程
+        // 测试共享 OnceLock 引导密钥，先到先得）：有锚时 revoke 前多一条
+        // session_start，行序定位会错按到 approve 行，顶层 name 键对 approve
+        // 记录既无语义也不进哈希 ⇒ 篡改成无操作、load 照常 Ok（假绿）。
+        let mut forged = false;
+        for line in lines.iter_mut() {
+            let mut rec: serde_json::Value = serde_json::from_str(line).unwrap();
+            if rec["action"] == "revoke" {
+                rec["name"] = serde_json::json!("forged");
+                *line = serde_json::to_string(&rec).unwrap();
+                forged = true;
+            }
+        }
+        assert!(forged, "journal must carry a revoke record to tamper");
+        std::fs::write(&jp, lines.join("\n")).unwrap();
 
         let err = SkillRegistry::load(&reg_path).unwrap_err();
         assert!(
