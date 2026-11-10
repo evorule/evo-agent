@@ -1732,6 +1732,20 @@
           {:else}
             <pre class="ap-cmd mono">{m.command}</pre>
           {/if}
+          {#if m.preview}
+            <!-- 内容级预览(观察态,引擎侧组装的统一 diff):真知情决策 -->
+            <div class="ap-preview-label">变更预览{#if m.preview.truncated}(已截断){/if}</div>
+            <div class="diff-box mono">
+              {#each m.preview.diff.split('\n') as dl, di (di)}
+                {@const sign = dl.startsWith('+') ? 'add' : dl.startsWith('-') && !dl.startsWith('---') ? 'del' : 'ctx'}
+                {#if dl.startsWith('---') || dl.startsWith('+++')}
+                  <div class="diff-row ctx"><span class="diff-sign"> </span><span class="diff-text">{dl}</span></div>
+                {:else}
+                  <div class="diff-row {sign}"><span class="diff-sign">{sign === 'add' ? '+' : sign === 'del' ? '-' : ' '}</span><span class="diff-text">{dl.replace(/^[+-] /, '')}</span></div>
+                {/if}
+              {/each}
+            </div>
+          {/if}
           {#if m.alternative}
             <div class="ap-alt">替代方案:{m.alternative}</div>
           {/if}
@@ -2998,6 +3012,30 @@
   }
   /* 审批卡文件族预览行:操作动词+目标路径+查看现状(审批帧不带内容载荷,
      内容级 diff 不可达——编辑器打开即看现状) */
+  /* 内容级 diff 预览块(观察态):引擎组装的统一 diff,+绿/−红行 */
+  .approval-card .ap-preview-label {
+    margin: var(--sp-xs) 0 2px;
+    font-size: var(--fs-2xs);
+    color: var(--text-muted);
+  }
+  .approval-card .diff-box {
+    max-height: 16em;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    background: var(--bg-page);
+    font-size: var(--fs-2xs);
+    padding: 4px 6px;
+  }
+  .approval-card .diff-row.add .diff-text {
+    color: var(--success);
+  }
+  .approval-card .diff-row.del .diff-text {
+    color: var(--danger);
+  }
+  .approval-card .diff-row.ctx .diff-text {
+    color: var(--text-muted);
+  }
   .approval-card .ap-file {
     display: flex;
     align-items: center;

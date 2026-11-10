@@ -197,6 +197,21 @@ describe('approver=workspace-allowlist 回执映射(后端 T0 静默批准)', ()
     expect(infos).toHaveLength(0);
   });
 
+  it('帧携带 preview:待批消息留存内容级 diff 供知情决策', async () => {
+    // 消息级断言(纯逻辑测试无组件挂载;diff 块渲染归真机冒烟)
+    MockWebSocket.last.deliver({
+      type: 'ApprovalRequired',
+      tool_name: 'search_replace',
+      command: 'src/a.rs',
+      risk: 'medium',
+      proposal_id: 'p-preview',
+      preview: { path: 'src/a.rs', diff: '- old' + String.fromCharCode(92) + 'n+ new', truncated: false },
+    });
+    await flush();
+    const msg = get(messages).find((m) => m.kind === 'approval');
+    expect(msg?.preview).toEqual({ path: 'src/a.rs', diff: '- old\\n+ new', truncated: false });
+  });
+
   it('人工批准路径:回执在场(本窗口已决策)不重复信息条', async () => {
     const { markApprovalReceipt } = await import('../src/lib/approvalMemory.js');
     // 模拟人工决策:待批卡在位且已原位转回执(decideApproval 同面打点)

@@ -1838,6 +1838,7 @@ fn test_agent_event_approval_required_debug() {
         risk: "high".to_string(),
         alternative: "use trash".to_string(),
         proposal_id: "ap-123".to_string(),
+        preview: None,
     };
     let s = format!("{:?}", ev);
     assert!(s.contains("ApprovalRequired"));

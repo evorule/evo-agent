@@ -1001,6 +1001,9 @@ pub enum AgentEvent {
         alternative: String,
         /// 提案 ID(审批留痕主键,/approve 回传校验用)
         proposal_id: String,
+        /// 内容级预览(观察态,文件写族统一 diff 文本;不落 journal 不进账,
+        /// 审批语义/留痕/守卫零变化)——使人审成为真知情决策
+        preview: Option<crate::agent::approval::ApprovalPreview>,
     },
     /// G8:审批结果
     ApprovalResult {
@@ -9888,6 +9891,7 @@ impl AgentRunner {
                                                                    risk: req.risk.clone(),
                                                                    alternative: req.alternative.clone(),
                                                                    proposal_id: req.proposal_id.clone(),
+                                                                   preview: crate::agent::approval::build_preview(&tc.name, &tc.arguments),
                                                                });
                                                                // B21:approval_requested(60s 审批窗开启)
                                                                if let Some(j) = &journal {
@@ -10659,6 +10663,7 @@ impl AgentRunner {
                                                            risk: req.risk.clone(),
                                                            alternative: req.alternative.clone(),
                                                            proposal_id: req.proposal_id.clone(),
+                                                           preview: crate::agent::approval::build_preview(&tool_name, &args),
                                                        });
                                                        // B21:approval_requested(60s 审批窗开启)
                                                        if let Some(j) = &journal {
