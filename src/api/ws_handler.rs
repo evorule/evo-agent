@@ -1242,6 +1242,14 @@ async fn construct_runner(
         if let Some(ttl) = def.memory.ttl_secs {
             mem = mem.with_ttl_secs(ttl);
         }
+        // 共享记忆读取时衰减策略接线(设置键消费面,与 CompactionPolicy::
+        // from_settings 同款装配口径)。缺省关闭=读路径整体短路、现行为零
+        // 变化(缺省不变式);设置面板显式开启后共享分区读面降级为归档引用
+        // 卡(零原文留存、零物理处理,判定与存储边界见 memory_decay 模块头)。
+        // 只接 serve 主会话读面——子代理/HTTP 观测面维持缺省,策略口径单一源。
+        mem = mem.with_decay_policy(crate::agent::memory_decay::DecayPolicy::from_settings(
+            &merged_settings,
+        ));
         // F-618 阶段1:LexStore 检索缓存注入(与 runner 构造路径同款;缺省
         // 未声明=None=全量拉取路径零影响)。缺此注入时 serve 流即使定义
         // 声明 lex_store 也不生效(缓存与 lex_cache_stats 观测同源失活)
