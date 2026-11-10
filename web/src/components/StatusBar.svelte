@@ -31,6 +31,14 @@
   } from '../lib/approval.js';
   import { workspaceLabel } from '../lib/workspace.js';
   import { detectShellVersion } from '../lib/shellVersion.js';
+  import {
+    equilibrium,
+    startEquilibriumPolling,
+    stopEquilibriumPolling,
+    phaseColor,
+    layerRows,
+    attributionRows,
+  } from '../lib/equilibrium.js';
   import { version } from '../../package.json';
 
   // 版本面:桌面形态优先壳版本(=安装版本,tauri.conf.json 同源),构建期
@@ -100,9 +108,12 @@
   }
 
   function onDocClick(e) {
-    if (!panelOpen) return;
-    if (bellEl?.contains(e.target) || panelEl?.contains(e.target)) return;
-    panelOpen = false;
+    if (panelOpen && !bellEl?.contains(e.target) && !panelEl?.contains(e.target)) {
+      panelOpen = false;
+    }
+    if (eqOpen && !eqEl?.contains(e.target) && !eqPanelEl?.contains(e.target)) {
+      eqOpen = false;
+    }
   }
 
   function togglePanel() {
@@ -110,11 +121,27 @@
     if (panelOpen) markAllRead(); // 展开即读(角标归零,条目保留)
   }
 
+  // ---- 均衡观测段(纯读态;数据源 /api/equilibrium/status 代理) ----
+  let eqOpen = false;
+  let eqEl = null;
+  let eqPanelEl = null;
+  function toggleEqPanel() {
+    eqOpen = !eqOpen;
+  }
+  $: eqColor = $equilibrium.available ? phaseColor($equilibrium.data?.system_phase) : 'unknown';
+  $: eqTitle = $equilibrium.available
+    ? `系统均衡:${$equilibrium.data?.system_phase || '未知'}(点击看三层相位与位势分账)`
+    : '均衡观测不可用(evorule-server 未连接或版本过旧)';
+  $: eqLayerRows = layerRows($equilibrium.data);
+  $: eqAttRows = attributionRows($equilibrium.data);
+
   onMount(() => {
     syncWs(); // 批 I:工作区显性化初值(此后随切换事件同步)
+    startEquilibriumPolling(); // 均衡观测 10s 慢轮询(纯读,幂等启动)
     window.addEventListener('evo:workspace-changed', syncWs);
     document.addEventListener('click', onDocClick);
     return () => {
+      stopEquilibriumPolling();
       window.removeEventListener('evo:workspace-changed', syncWs);
       document.removeEventListener('click', onDocClick);
     };
@@ -147,6 +174,17 @@
       <span class="dot {$turnActive ? 'run' : 'idle'}" />
       {$turnActive ? '代理运行中' : '代理空闲'}
     </span>
+    <!-- 均衡观测段(纯读态):相位点着色+popover 三层相位/位势/分账;观测不可用=灰空心点(防假绿) -->
+    <button
+      class="sb-item eq"
+      bind:this={eqEl}
+      onclick={toggleEqPanel}
+      title={eqTitle}
+      aria-expanded={eqOpen}
+    >
+      <span class="eq-dot {eqColor} {!$equilibrium.available ? 'down' : ''}" />
+      <span class="eq-label">均衡</span>
+    </button>
   </div>
 
   <div class="sb-right">
@@ -169,6 +207,56 @@
     </button>
     <span class="sb-item ver" title="工作台版本">v{displayVersion}</span>
   </div>
+
+  {#if eqOpen}
+    <div class="eq-panel" bind:this={eqPanelEl} role="dialog" aria-label="均衡观测面板">
+      {#if !$equilibrium.available}
+        <div class="eq-down">
+          <div class="eq-panel-title">均衡观测不可用</div>
+          <div class="eq-down-detail">{$equilibrium.detail || 'evorule-server 未连接'}</div>
+        </div>
+      {:else}
+        <div class="eq-panel-title">
+          系统相位:{$equilibrium.data?.system_phase || '未知'}
+          {#if $equilibrium.data?.system_balanced}<span class="eq-balanced" title="三层全吸收且零位势">已平衡 ✓</span>{/if}
+        </div>
+        <div class="eq-section">
+          <div class="eq-row">
+            <span class="eq-key">全局</span>
+            <span class="eq-phase {phaseColor($equilibrium.data?.system_phase)}">
+              {$equilibrium.data?.system_phase || '未知'}
+            </span>
+          </div>
+          {#each eqLayerRows as row (row.layer)}
+            <div class="eq-row">
+              <span class="eq-key">{row.layer}</span>
+              <span class="eq-phase {phaseColor(row.phase)}">{row.phase}</span>
+            </div>
+          {/each}
+        </div>
+        <div class="eq-section">
+          <div class="eq-row">
+            <span class="eq-key">Φ 位势</span>
+            <span class="eq-val">{$equilibrium.data?.phi_total ?? '—'}</span>
+          </div>
+          {#if eqAttRows.length > 0}
+            <div class="eq-row">
+              <span class="eq-key">警量分账</span>
+              <span class="eq-val">
+                {eqAttRows.map((r) => `${r.label}=${r.value}`).join(' · ')}
+              </span>
+            </div>
+          {/if}
+          {#if $equilibrium.data?.last_cause}
+            <div class="eq-row">
+              <span class="eq-key">最近因由</span>
+              <span class="eq-val eq-cause">{$equilibrium.data.last_cause}</span>
+            </div>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {/if}
 
   {#if panelOpen}
     <div class="notif-panel" bind:this={panelEl} role="dialog" aria-label="通知面板">
@@ -308,6 +396,100 @@
   }
   .ver {
     opacity: 0.85;
+  }
+  /* ---- 均衡观测段(纯读态):相位点+popover ---- */
+  .eq-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+  }
+  .eq-dot.unknown,
+  .eq-dot.down {
+    background: transparent;
+    border: 1.5px solid rgba(255, 255, 255, 0.55);
+  }
+  .eq-dot.balanced {
+    background: #7ee787;
+  }
+  .eq-dot.relaxing {
+    background: #ffe9a8;
+  }
+  .eq-dot.crisis {
+    background: #ff7b72;
+    box-shadow: 0 0 4px #ff7b72;
+  }
+  .eq-label {
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .eq-panel {
+    position: absolute;
+    left: 8px;
+    bottom: 26px;
+    width: 300px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    padding: var(--sp-xs) var(--sp-sm);
+    color: var(--text-primary);
+  }
+  .eq-panel-title {
+    font-size: var(--fs-sm);
+    font-weight: var(--fw-sb);
+    margin-bottom: var(--sp-xs);
+  }
+  .eq-balanced {
+    color: var(--ok, #2da44e);
+    font-weight: var(--fw-sb);
+    margin-left: var(--sp-xs);
+  }
+  .eq-section {
+    padding: var(--sp-xs) 0;
+    border-top: 1px solid var(--border);
+  }
+  .eq-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-sm);
+    padding: 1px 0;
+    font-size: var(--fs-xs);
+  }
+  .eq-key {
+    color: var(--text-secondary);
+    min-width: 56px;
+    flex-shrink: 0;
+  }
+  .eq-phase {
+    font-weight: var(--fw-sb);
+  }
+  .eq-phase.balanced {
+    color: var(--ok, #2da44e);
+  }
+  .eq-phase.relaxing {
+    color: var(--warn, #9a6700);
+  }
+  .eq-phase.crisis {
+    color: var(--danger, #cf222e);
+  }
+  .eq-phase.unknown {
+    color: var(--text-muted);
+  }
+  .eq-val {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .eq-cause {
+    white-space: normal;
+  }
+  .eq-down-detail {
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
   }
   .notif-panel {
     position: absolute;

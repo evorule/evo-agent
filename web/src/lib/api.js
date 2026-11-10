@@ -606,6 +606,24 @@ export function mcpStatus() {
   return fetch('/api/mcp/status', { headers: headers() }).then(unwrap);
 }
 
+// ===== 均衡观测面(对应 serve equilibrium_api.rs;上游不可达/旧版 503) =====
+
+/**
+ * 均衡观测只读透传(纯读态,零写零扰动)。
+ * 200 → {ok:true, observed_at, equilibrium}(equilibrium 块:窗快照/三层相位/
+ * phi_total/alert_attribution/system_phase 等,随 server 只加不改演进);
+ * 503/网络失败 → {ok:false, detail}——不 throw,轮询消费方按灰置处理
+ * (观测不可用≠平衡,灰空心点防假绿)。
+ */
+export async function fetchEquilibrium() {
+  try {
+    const body = await fetch('/api/equilibrium/status', { headers: headers() }).then(unwrap);
+    return { ok: true, observed_at: body.observed_at, equilibrium: body.equilibrium };
+  } catch (e) {
+    return { ok: false, detail: e?.message || String(e) };
+  }
+}
+
 /**
  * 审批策略条件文件状态(批次一 PR-4)。
  * {exists, parse_error, groups, limits, override}——exists=false 是合法态
