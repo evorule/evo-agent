@@ -1003,6 +1003,68 @@ pub fn hash_skill_file_prefixed(path: &Path) -> Result<String, String> {
     Ok(evorule_hash::prefixed(&hash_skill_file(path)?))
 }
 
+// =============================================================================
+// 批准内容快照（diff 审批视图数据面）：content-addressed 存储
+// =============================================================================
+//
+// approve 时把 SKILL.md 原文按内容哈希落盘（写一次不再改），待审视图据
+// registry 的 content_hash 取回旧版与盘上新内容算 diff——更新审批从「全文
+// 重读」升级为「看到改了什么」。快照完整性由哈希自证（读取时重算比对，
+// 失配/缺失一律按无旧版处理，不给未验证数据进审批面的口子）。
+
+/// 快照落点：`<workdir>/data/skill-snapshots/<level>/<name>/<hash-hex>.md`
+/// （置于扫描目录之外——`data/skills` 与 `.evo/skills` 是技能扫描根，
+/// 混入非技能子目录会污染候选发现面）
+pub fn snapshot_path(workdir: &Path, level: &str, name: &str, content_hash: &str) -> PathBuf {
+    let hex = content_hash.strip_prefix("blake3:").unwrap_or(content_hash);
+    workdir
+        .join("data")
+        .join("skill-snapshots")
+        .join(level)
+        .join(name)
+        .join(format!("{hex}.md"))
+}
+
+/// 批准成功后落快照（write-if-absent；失败不阻断审批——快照是便利数据，
+/// 完整性由盘上 SKILL.md 与账本哈希承担，此处只影响 diff 视图可用性）
+pub fn write_snapshot(
+    workdir: &Path,
+    level: &str,
+    name: &str,
+    content_hash: &str,
+    content: &str,
+) -> Result<(), String> {
+    let actual = evorule_hash::prefixed(&evorule_hash::digest(content.as_bytes()));
+    if actual != content_hash {
+        return Err(format!(
+            "snapshot content hash mismatch (expected {content_hash}, got {actual})"
+        ));
+    }
+    let path = snapshot_path(workdir, level, name, content_hash);
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("snapshot dir '{}' create failed: {e}", dir.display()))?;
+    }
+    std::fs::write(&path, content)
+        .map_err(|e| format!("snapshot '{}' write failed: {e}", path.display()))
+}
+
+/// 取回已批准版本原文（哈希重算比对；缺失/失配/损坏 → None = 视图按无旧版处理）
+pub fn load_snapshot(
+    workdir: &Path,
+    level: &str,
+    name: &str,
+    content_hash: &str,
+) -> Option<String> {
+    let path = snapshot_path(workdir, level, name, content_hash);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let actual = evorule_hash::prefixed(&evorule_hash::digest(content.as_bytes()));
+    (actual == content_hash).then_some(content)
+}
+
 /// frontmatter 解析（泄露检查与正文预览共用；Err = frontmatter 不可解析）
 pub fn parse_skill_body(path: &Path) -> Result<(Option<String>, String), String> {
     let content = std::fs::read_to_string(path)

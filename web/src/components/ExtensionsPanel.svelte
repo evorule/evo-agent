@@ -25,6 +25,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
   let err = $state('');
   let busyName = $state('');
   let detailName = $state(null); // 展开的待审批项(正文必读)
+  let diffKey = $state(null); // 展开的失配项 diff(更新重批复核面)
   let importPath = $state('');
   let importMsg = $state('');
   let importing = $state(false);
@@ -158,6 +159,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
       </div>
     {/each}
     {#each skills.filter((s) => s.status !== 'discovered') as s (s.name + s.level)}
+      {@const diffId = s.name + ':' + s.level}
       <div class="ext-item">
         <div class="ext-item-head">
           <span class="ext-name">{s.name}</span>
@@ -166,6 +168,9 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
           </span>
         </div>
         <div class="ext-desc">{s.description || '(无描述)'}</div>
+        {#if s.content_matches === false}
+          <div class="ext-desc ext-mismatch">盘上内容与已批准版本不一致</div>
+        {/if}
         <div class="ext-actions">
           {#if s.status === 'active'}
             <button
@@ -176,8 +181,33 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
               撤销
             </button>
           {/if}
+          {#if s.diff}
+            <button class="ext-btn" onclick={() => (diffKey = diffKey === diffId ? null : diffId)}>
+              {diffKey === diffId ? '收起改动' : '查看改动'}
+            </button>
+            <button
+              class="ext-btn primary"
+              disabled={busyName === s.name}
+              onclick={() => act('approve', s.name, s.level)}
+            >
+              重新批准
+            </button>
+          {/if}
           <button class="ext-btn" onclick={() => openFile(s.path)}>查看 SKILL.md</button>
         </div>
+        {#if diffKey === diffId && s.diff}
+          <div class="ext-diff mono">
+            {#each s.diff.split('\n') as line}
+              <div
+                class="diff-line"
+                class:dl-add={line.startsWith('+') && !line.startsWith('+++')}
+                class:dl-del={line.startsWith('-') && !line.startsWith('---')}
+                class:dl-hunk={line.startsWith('@@')}
+                class:dl-head={line.startsWith('---') || line.startsWith('+++')}
+              >{line}</div>
+            {/each}
+          </div>
+        {/if}
       </div>
     {/each}
     {#if skills.length === 0 && pending.length === 0}
@@ -367,5 +397,32 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
     color: var(--text-primary);
     margin: 6px 0 0;
     white-space: pre-wrap;
+  }
+  .ext-mismatch {
+    color: var(--warn, #e3b341);
+  }
+  .ext-diff {
+    max-height: 260px;
+    overflow: auto;
+    background: var(--bg-active);
+    padding: 8px;
+    font-size: var(--fs-2xs);
+    margin: 6px 0 0;
+  }
+  .diff-line {
+    white-space: pre-wrap;
+    color: var(--text-secondary, #8b949e);
+  }
+  .diff-line.dl-add {
+    color: #3fb950;
+  }
+  .diff-line.dl-del {
+    color: #f85149;
+  }
+  .diff-line.dl-hunk {
+    color: #58a6ff;
+  }
+  .diff-line.dl-head {
+    opacity: 0.6;
   }
 </style>

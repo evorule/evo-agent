@@ -31,6 +31,7 @@ pub mod serve_tools;
 pub mod session_index;
 pub mod settings;
 pub mod skill_api;
+pub mod skill_diff;
 pub mod snapshots;
 pub mod task_api;
 pub mod workspace_client;
