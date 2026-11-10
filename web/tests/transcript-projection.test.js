@@ -28,7 +28,7 @@ vi.mock('../src/lib/audit.js', () => ({
   initAuditWatcher: vi.fn(),
 }));
 
-const { recordToMessage, loadTranscriptInto, messages } = await import(
+const { recordToMessage, loadTranscriptInto, pushMessage, messages } = await import(
   '../src/lib/stores.js'
 );
 const { toolDiffPayload } = await import('../src/lib/chat-diff.js');
@@ -201,5 +201,63 @@ describe('cappedJson wire 截断元数据', () => {
     expect(t.originalLen).toBe(5010);
     expect(t.text.length).toBe(101);
     expect(t.text.endsWith('…')).toBe(true);
+  });
+});
+
+describe('时间戳透传与审批回执旁路插入', () => {
+  it('recordToMessage 透传持久化 timestamp(秒)', () => {
+    const m = recordToMessage({ role: 'user', content: 'hi', timestamp: 1794300000 });
+    expect(m.ts).toBe(1794300000);
+    const a = recordToMessage({ role: 'assistant', content: '答', timestamp: 1794300010 });
+    expect(a.ts).toBe(1794300010);
+    const noTs = recordToMessage({ role: 'user', content: '旧记录' });
+    expect(noTs.ts).toBeUndefined();
+  });
+
+  it('pushMessage 统一注入 ts(unix 秒)', () => {
+    const id = pushMessage({ kind: 'info', text: 'x' });
+    const arr = get(messages);
+    const m = arr.find((x) => x.id === id);
+    expect(typeof m.ts).toBe('number');
+    expect(String(Math.floor(m.ts)).length).toBeLessThanOrEqual(10);
+  });
+
+  it('approvals 旁路:回执按决策时刻邻近插入,形态与实时一致', () => {
+    const l = loadTranscriptInto;
+    l(
+      [
+        { idx: 1, role: 'user', content: 'q1', timestamp: 1000 },
+        { idx: 2, role: 'assistant', content: '', tool_calls: [{ name: 'shell_exec', arguments: '{}' }], timestamp: 1010 },
+        { idx: 3, role: 'assistant', content: '答', timestamp: 1030 },
+        { idx: 4, role: 'user', content: 'q2', timestamp: 1100 },
+      ],
+      [
+        { ts: 1015000, tool: 'shell_exec', command: 'find src', decision: 'approved' },
+        { ts: 1080000, tool: 'python_exec', command: 'print(1)', decision: 'rejected' },
+      ],
+    );
+    const arr = get(messages);
+    const receipts = arr.filter((m) => m.kind === 'approval_receipt');
+    expect(receipts).toHaveLength(2);
+    // 第一条插在 ts=1010 的卡后、ts=1030 的答案前;回执消息 ts 为秒
+    expect(receipts[0].ts).toBe(1015);
+    expect(receipts[0].toolName).toBe('shell_exec');
+    expect(receipts[0].sentApproved).toBe(true);
+    expect(receipts[0].decision).toBe('sent');
+    // 拒绝回执:✗ 形态
+    expect(receipts[1].sentApproved).toBe(false);
+    const idxAnswer = arr.findIndex((m) => m.kind === 'assistant' && m.text === '答');
+    const idxReceipt0 = arr.findIndex((m) => m.id === receipts[0].id);
+    const idxUser2 = arr.findIndex((m) => m.kind === 'user' && m.text === 'q2');
+    expect(idxReceipt0).toBeLessThan(idxAnswer);
+    expect(receipts[1].ts).toBe(1080);
+    expect(idxUser2).toBeGreaterThan(arr.findIndex((m) => m.id === receipts[1].id));
+  });
+
+  it('approvals 缺省空:零回执插入,行为不变', () => {
+    const l = loadTranscriptInto;
+    l([{ idx: 1, role: 'user', content: 'q', timestamp: 1000 }]);
+    expect(get(messages)).toHaveLength(1);
+    expect(get(messages).some((m) => m.kind === 'approval_receipt')).toBe(false);
   });
 });

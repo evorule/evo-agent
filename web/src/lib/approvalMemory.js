@@ -14,6 +14,7 @@
 
 import { writable, get } from 'svelte/store';
 import { readFile, writeFile } from './api.js';
+import { t } from './i18n.js';
 
 /** 工作区放行清单路径(相对 workdir;与 .evo/approval-policy.toml 同域) */
 export const ALLOWLIST_PATH = '.evo/approval-allowlist.json';
@@ -195,31 +196,36 @@ export function evaluateAutoApproval(tool, command) {
 
 // ---- 回执与聚合文案(纯函数,vitest 锁) ----
 
-/** 审批决策回执行文案(决策即离场:原位一行,不可展开成卡) */
+/** 审批决策回执行文案(决策即离场:原位一行,不可展开成卡;文案走 i18n 注册表) */
 export function approvalReceiptText(m) {
   const tool = m?.toolName || 'tool';
   const cmd = String(m?.command ?? '').trim();
   const cmdShow = cmd.length > 60 ? `${cmd.slice(0, 57)}…` : cmd;
-  if (m?.decision === 'sending') return `${tool} · ${cmdShow} · 提交中…`;
-  if (m?.decision === 'error') return `${tool} · ${cmdShow} · ${m.errText || '提交失败'}`;
-  if (m?.decision === 'timeout') return `${tool} · ${cmdShow} · 已超时自动拒绝`;
-  if (m?.decision === 'expired') return `${tool} · ${cmdShow} · 已随轮次结束失效`;
-  if (m?.sentApproved === false) return `${tool} · ${cmdShow} · 已拒绝`;
+  if (m?.decision === 'sending') return t('{tool} · {cmd} · 提交中…', { tool, cmd: cmdShow });
+  if (m?.decision === 'error') {
+    return t('{tool} · {cmd} · 提交失败', { tool, cmd: cmdShow }).replace(
+      '提交失败',
+      m.errText || '提交失败',
+    );
+  }
+  if (m?.decision === 'timeout') return t('{tool} · {cmd} · 已超时自动拒绝', { tool, cmd: cmdShow });
+  if (m?.decision === 'expired') return t('{tool} · {cmd} · 已随轮次结束失效', { tool, cmd: cmdShow });
+  if (m?.sentApproved === false) return t('{tool} · {cmd} · 已拒绝', { tool, cmd: cmdShow });
   const tail =
     m?.scope === 'auto-session'
-      ? '已自动批准(本会话内允许)'
+      ? t('{tool} · {cmd} · 已自动批准(本会话内允许)', { tool, cmd: cmdShow })
       : m?.scope === 'auto-workspace'
-        ? '已自动批准(本工作区始终允许)'
+        ? t('{tool} · {cmd} · 已自动批准(本工作区始终允许)', { tool, cmd: cmdShow })
         : m?.scope === 'session'
-          ? '已批准(本会话内允许)'
+          ? t('{tool} · {cmd} · 已批准(本会话内允许)', { tool, cmd: cmdShow })
           : m?.scope === 'workspace'
-            ? '已批准(本工作区始终允许)'
+            ? t('{tool} · {cmd} · 已批准(本工作区始终允许)', { tool, cmd: cmdShow })
             : m?.scope === 'workspace-allowlist'
-              ? '已批准(工作区清单)'
+              ? t('{tool} · {cmd} · 已批准(工作区清单)', { tool, cmd: cmdShow })
               : m?.scope === 'in-workspace'
-                ? '已批准(工作区内)'
-                : '已批准';
-  return `${tool} · ${cmdShow} · ${tail}`;
+                ? t('{tool} · {cmd} · 已批准(工作区内)', { tool, cmd: cmdShow })
+                : t('{tool} · {cmd} · 已批准', { tool, cmd: cmdShow });
+  return tail;
 }
 
 /** 汇总卡摘要(按工具名计数,如「4×python_exec shell_exec」) */

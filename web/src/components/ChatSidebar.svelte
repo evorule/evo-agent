@@ -49,6 +49,7 @@
   } from '../lib/approvalMemory.js';
   import { buildTurnLayout } from '../lib/chat-layout.js';
   import { toolCallSummary, approvalPreview } from '../lib/tool-call-text.js';
+  import { t } from '../lib/i18n.js';
   import { switchWorkspace } from '../lib/workspace.js';
   import DirectoryBrowser from './DirectoryBrowser.svelte';
   import { chatWidth } from '../lib/layout.js';
@@ -669,6 +670,16 @@
       ? formatTook(Math.max(0, nowTick - runningTool.startedAt))
       : null,
   );
+  // 时间戳显示开关(设置键注册于 serve 设置注册表,默认关)
+  const showTimestamps = $derived($settingsState.settings['workbench.showTimestamps'] === true);
+  /** 消息时间戳(unix 秒) → 时:分 */
+  function formatClock(ts) {
+    if (typeof ts !== 'number') return '';
+    const d = new Date(ts * 1000);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  }
   async function onLoadOlder() {
     if (loadingOlder) return;
     loadingOlder = true;
@@ -1357,7 +1368,7 @@
       {#if m.kind === 'user'}
         <div class="row user">
           <div class="user-col">
-            <div class="bubble user-bubble">{m.text}</div>
+            <div class="bubble user-bubble">{m.text}{#if showTimestamps && m.ts}<span class="msg-ts mono">{formatClock(m.ts)}</span>{/if}</div>
             {#if (m.mentions && m.mentions.length > 0) || (m.dropped && m.dropped.length > 0)}
               <div class="used-refs">
                 <span class="ur-label">引用</span>
@@ -1441,6 +1452,9 @@
                   <div class="msg-meta mono">
                     {meta.steps} 步{meta.tookMs ? ` · ${formatTook(meta.tookMs)}` : ''}
                   </div>
+                {/if}
+                {#if showTimestamps && m.ts}
+                  <div class="msg-ts mono">{formatClock(m.ts)}</div>
                 {/if}
               </div>
             {/if}
@@ -1769,8 +1783,8 @@
         <div class="process-box" class:live={!g.closed}>
           <button type="button" class="process-head" onclick={() => toggleGroup(g.key)}>
             <span class="tool-chev" class:rot={open}>▸</span>
-            <span>过程（{g.steps ?? g.items.length} 步{g.tookMs ? ` · ${formatTook(g.tookMs)}` : ''} · 思考与工具调用）</span>
-            {#if !g.closed}<span class="process-live">· 进行中</span>{/if}
+            <span>{t('过程（{n} 步{took} · 思考与工具调用）', { n: g.steps ?? g.items.length, took: g.tookMs ? ` · ${formatTook(g.tookMs)}` : '' })}</span>
+            {#if !g.closed}<span class="process-live">{t('· 进行中')}</span>{/if}
           </button>
           {#if open}
             <div class="process-body">
@@ -2121,11 +2135,11 @@
       <div class="live-strip" role="status">
         <span class="ls-dot" aria-hidden="true"></span>
         <span class="ls-text mono">
-          第 {$stepCount || '·'} 步{runningTool
-            ? ` · ${runningTool.name} 运行中${runningToolElapsed ? ` · ${runningToolElapsed}` : ''}`
+          {t('第 {n} 步', { n: $stepCount || '·' })}{runningTool
+            ? ` · ${t('{tool} 运行中', { tool: runningTool.name })}${runningToolElapsed ? ` · ${runningToolElapsed}` : ''}`
             : ''}
         </span>
-        <button type="button" class="ls-stop" onclick={interrupt}>中断</button>
+        <button type="button" class="ls-stop" onclick={interrupt}>{t('中断')}</button>
       </div>
     {/if}
     {#if engineStalled}
@@ -2621,6 +2635,19 @@
     font-size: 10px;
     color: var(--text-muted);
     opacity: 0.85;
+  }
+  /* 消息时间戳(开关默认关):气泡尾部 时:分 小字 */
+  .msg-ts {
+    display: inline-block;
+    margin-left: 8px;
+    font-size: 10px;
+    color: var(--text-muted);
+    opacity: 0.85;
+  }
+  .assistant-bubble .msg-ts {
+    display: block;
+    margin-left: 0;
+    margin-top: 2px;
   }
   /* 回执汇总行:同工具同结局连续回执 ≥阈值收敛为一行,点击展开逐条 */
   .receipt-agg {

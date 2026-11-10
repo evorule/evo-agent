@@ -2922,6 +2922,15 @@ async fn get_transcript(
 
     let namespace = resolve_memory_namespace(&state, &agent_type);
 
+    // 审批回执旁路:本地 journal 审批事件对投影(fail-soft,缺失即空)——
+    // 审批决策不进 facts 消息流,转录面靠本旁路跨刷新留痕
+    let journal_path = state
+        .workdir()
+        .join("data")
+        .join("sessions")
+        .join(format!("{session_id}.jsonl"));
+    let approvals = crate::agent::journal::project_approvals(&journal_path);
+
     match crate::api::session_index::load_transcript(
         state.evorule_client(),
         &session_id,
@@ -2939,6 +2948,7 @@ async fn get_transcript(
                 "source": "live",
                 "count": count,
                 "has_more": has_more,
+                "approvals": approvals,
                 "messages": messages,
             })))
         }
@@ -2958,6 +2968,7 @@ async fn get_transcript(
                         "saved_at": snap.saved_at,
                         "count": count,
                         "has_more": has_more,
+                        "approvals": approvals,
                         "messages": messages,
                     })))
                 }

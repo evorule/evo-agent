@@ -422,7 +422,7 @@ export async function openSession(sid) {
   let targetSid = sid;
   try {
     const res = await getTranscript(sid, { limit: TRANSCRIPT_PAGE_SIZE });
-    loadTranscriptInto(res.messages || []);
+    loadTranscriptInto(res.messages || [], res.approvals || []);
     transcriptHasMore.set(!!res.has_more);
     if (res.source === 'snapshot') {
       // B17:快照源=引擎会话必死(30min 闲置 TTL 回收)——主动重建而非连
