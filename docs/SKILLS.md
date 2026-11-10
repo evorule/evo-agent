@@ -76,7 +76,9 @@ Import refuses to overwrite any active **or revoked** row of the same name (appr
 5. **Leak screening, two tiers** — authorship-declaration phrases (hard-block 422) and LLM-technical terms (warning, passes). Exemptions: a phrase wrapped entirely in corner brackets `「…」` is quotation context and degrades the hard block to a warning; warning hits adjacent to path/identifier characters (e.g. the product's own install root) are skipped.
 6. **Hash pin + ledger commit** — blake3 over the file, appended to the journal, snapshot updated.
 
-Every approve/revoke/import is recorded to the human-gate ledger with two attribution fields: `identity` (`human`/`anonymous` — did the call pass authentication) and `class` (`privileged`/`operator` — which token class performed it). The two fields together are what make human rulings attributable. File-face mutations (`/api/files/*` writes) carry the same `class` field, so a tool-chain write is distinguishable from a UI save in the ledger.
+When the desktop shell is present it sets `EVO_AGENT_SKILLS__CHALLENGE_CONFIRM` and the management actions run **two-phase**: the endpoint returns `202` with a short-lived challenge instead of executing, the shell asks for the ruling in a **native dialog outside the webview sandbox** (session-scoped: the first challenge of each shell boot offers "allow all skill changes this session"; a declined session falls back to per-action asks), and the shell then consumes the challenge via `POST /api/skills/confirm` (or denies via `POST /api/skills/confirm-deny`). The workbench polls `GET /api/skills/challenge/{id}` for the outcome. Execution therefore cannot be completed from inside the webview — stealing the privileged token alone is no longer a management-face pass. With the session grant active, actions execute directly and the ledger says so. Pure-web deployments (no env) keep single-phase execution.
+
+Every approve/revoke/import is recorded to the human-gate ledger with two attribution fields: `identity` (`human`/`anonymous` — did the call pass authentication) and `class` (`privileged`/`operator` — which token class performed it). The two fields together are what make human rulings attributable; in two-phase mode the executing entries additionally carry `confirmed_via` (`native-shell` = confirmed per action through the native dialog, `session-grant` = session authorization in force). File-face mutations (`/api/files/*` writes) carry the same `class` field, so a tool-chain write is distinguishable from a UI save in the ledger.
 
 ## Ledger deepening: journal, drift self-heal, signing
 
@@ -124,6 +126,7 @@ Integrity (hash) and currency (environment) are deliberately orthogonal: the has
 | `[auth] human_tokens` | config / `EVO_AGENT_AUTH__HUMAN_TOKENS` | privileged tokens; non-empty turns on the approval class gate | empty (gate off; the desktop shell always sets it to the UI token — gate on) |
 | `skills.freshnessNotices` | workbench settings | freshness notice channel switch | true |
 | `EVO_AGENT_JOURNAL__SIGNING_KEY` | env, handed by the desktop shell | boot-scoped journal signing seed (hex 32B); scrubbed from env after locking into memory | absent (unsigned mode) |
+| `EVO_AGENT_SKILLS__CHALLENGE_CONFIRM` | env, handed by the desktop shell | two-phase challenge-confirm for approve/revoke/import (native dialog outside the webview; session-scoped grant) | absent (single-phase, direct execution) |
 
 ## Troubleshooting
 
@@ -160,7 +163,7 @@ Integrity (hash) and currency (environment) are deliberately orthogonal: the has
 
 - Same-OS-user file-system attackers can rewrite journal and snapshot consistently (detection then relies on the v1 layer: gate-ledger cross-reference and manifest notices). Boot-scoped signatures make partial tampering and post-anchor appends detectable; wiping the journal entirely degrades to unsigned mode.
 - The approval class gate is only as strong as token custody: with `human_tokens` configured, privileged tokens must not be reachable by the agent runtime (the desktop hands the runtime an operator-class token; the workbench UI and any human REST calls use the privileged token).
-- Token theft is a residual surface, not a closed one: a caller that can read the workbench webview's storage can obtain the privileged UI token and pass the gate. Governance approval promises are therefore scoped to the **desktop form** (the UI token never leaves the shell-controlled webview; pure-web deployments run with the gate off unless configured, and their confirmation surface is weaker — configure `human_tokens` and keep tokens out of shared storage when serving beyond localhost).
+- Token theft no longer equals a management-face pass on desktop: two-phase confirmation executes only after a native-dialog ruling outside the webview sandbox. A stolen privileged token can still issue challenges (they expire unconsumed) and pass non-management authed reads. Governance approval promises are scoped to the **desktop form**: pure-web deployments run single-phase with the gate off unless configured — configure `human_tokens` and keep tokens out of shared storage when serving beyond localhost. The session grant narrows the dialog to one ruling per shell boot by design (ruling: coarse granularity); decline falls back to per-action asks.
 - `read_skill` verifies registered skills only; raw file reads of a SKILL.md are plain file reads (content, not activation) and remain sandboxed as usual.
 
 ## Test anchors
@@ -178,6 +181,8 @@ Integrity (hash) and currency (environment) are deliberately orthogonal: the has
 | Freshness stamp + mismatch list | `agent::skill_store::tests::test_merge_flags_env_stale_only_for_sensitive_and_mismatched`, `api::skill_api::tests::test_approve_records_env_stamp_for_sensitive_skills` |
 | Privilege gate + ledger class | `api::skill_api::tests::test_privileged_gate_blocks_operator_self_approval`, `test_approve_ledger_records_class_without_gate`, `api::file_api::tests::test_ledger_records_class_for_file_writes` |
 | Desktop dual-token provisioning | `desktop::orchestrator::tests::serve_spawn_carries_auth_token_via_env_not_command_line` |
+| Two-phase challenge flow / deny / session grant | `api::skill_api::tests::test_two_phase_challenge_flow_approve`, `test_two_phase_deny_blocks_execution`, `test_two_phase_session_grant_direct_execution` |
+| Web challenge resolution bridge | `web/tests/skills-confirm.test.js` |
 | Registry file-face protection | `api::file_api::tests::test_skill_ledger_denied_on_file_face` |
 | Anti-phishing scan parity | `agent::skill_store::tests::test_scan_rejects_frontmatter_name_mismatch` |
 | Revoked-name restore guidance | `api::skill_api::tests::test_import_revoked_name_points_to_restore_path` |

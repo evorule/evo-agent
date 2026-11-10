@@ -56,6 +56,12 @@ function fileHeaders(json = false) {
 }
 
 async function unwrap(resp) {
+  if (resp.status === 202) {
+    // 两段式确认（技能管理面）：202=挑战签发，body={challenge_id,action,...}
+    // 调用方经 skillsConfirm.resolveChallenge 走壳原生裁决
+    const body = await resp.json();
+    return { __challenge: true, ...body };
+  }
   if (!resp.ok) {
     let msg = `HTTP ${resp.status}`;
     // 先整读文本再试 JSON(JSON 失败后 body 已耗尽不能再 text());

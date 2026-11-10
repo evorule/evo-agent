@@ -885,6 +885,9 @@ fn build_serve_command(
         // approve/revoke/import 等管理动作仅特权 token 可调,运营类令牌
         // 一律 403。纯 web（非壳）部署不带此 env=闸关（opt-in 手册化）
         .env("EVO_AGENT_AUTH__HUMAN_TOKENS", serve_token)
+        // 两段式确认模式（治理面根修层）：特权管理动作改「签发挑战 →
+        // 壳原生对话框人裁 → 消费挑战执行」；纯 web 不带此 env=单段直执
+        .env("EVO_AGENT_SKILLS__CHALLENGE_CONFIRM", "true")
         // 技能期刊签名引导密钥（纵深加固 v2）：壳每次启动生成一次性 32B
         // 种子,私钥只存在于壳/serve 进程内存（env 载体交接,serve 侧固化后
         // 即清 env）——同用户文件系统攻击者不可读,期刊记录可验不可伪造。

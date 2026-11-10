@@ -6,6 +6,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
 <script>
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
+  import { resolveChallenge } from '../lib/skillsConfirm.js';
   import {
     listSkills,
     listPendingSkills,
@@ -26,6 +27,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
   let busyName = $state('');
   let detailName = $state(null); // 展开的待审批项(正文必读)
   let diffKey = $state(null); // 展开的失配项 diff(更新重批复核面)
+  let confirmMsg = $state(''); // 两段式确认等待/裁决态提示
   let importPath = $state('');
   let importMsg = $state('');
   let importing = $state(false);
@@ -61,13 +63,30 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
   async function act(kind, name, level) {
     busyName = name;
     try {
-      if (kind === 'approve') await approveSkill(name, level);
-      else if (kind === 'revoke') await revokeSkill(name, level);
+      let out;
+      if (kind === 'approve') out = await approveSkill(name, level);
+      else if (kind === 'revoke') out = await revokeSkill(name, level);
+      if (out && out.__challenge) {
+        // 两段式确认：挑战经壳原生对话框人裁（webview 沙箱外），期间轮询挑战态
+        confirmMsg = '等待原生确认（在弹出的对话框中裁决）…';
+        const resolved = await resolveChallenge(out);
+        confirmMsg = '';
+        if (!resolved.executed) {
+          const why =
+            resolved.state === 'denied'
+              ? '已在原生对话框中拒绝'
+              : `确认未完成（${resolved.state}）`;
+          err = `技能${kind === 'approve' ? '批准' : '撤销'}未执行：${why}`;
+          await refresh();
+          return;
+        }
+      }
       await refresh();
     } catch (e) {
       err = String(e?.message || e);
     } finally {
       busyName = '';
+      confirmMsg = '';
     }
   }
 
@@ -119,6 +138,9 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
   </div>
   {#if err}
     <div class="ext-err">{err}</div>
+  {/if}
+  {#if confirmMsg}
+    <div class="ext-import-msg">{confirmMsg}</div>
   {/if}
   {#if loading}
     <div class="ext-loading">加载中…</div>

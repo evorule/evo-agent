@@ -15,6 +15,7 @@ mod health;
 mod job;
 mod orchestrator;
 mod shell_config;
+mod skills_confirm;
 mod supervisor;
 mod update;
 mod wizard;
@@ -162,6 +163,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             restart_services,
             open_logs_dir,
             check_updates,
+            skills_confirm::skills_native_confirm,
             wizard::wizard_key_status,
             wizard::wizard_save_key,
             wizard::wizard_provider_status,
