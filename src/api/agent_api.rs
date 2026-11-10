@@ -299,6 +299,9 @@ pub struct AgentApiState {
     fs_events: crate::api::fs_watch::FsEventHub,
     /// 人工审计账(HumanGate 写面操作 JSONL;data/human_gate_ledger.jsonl)
     human_gate: Arc<crate::api::human_gate::HumanGateLedger>,
+    /// 技能管理动作两段式确认(挑战库+会话授权态;进程内存态)。
+    /// armed=模式开关(桌面壳 env 置位;纯 web 缺省 false=单段直执旧行为)
+    skills_confirm: std::sync::Arc<crate::api::skill_confirm::SkillConfirmState>,
     /// LSP 语言服务器活动连接注册表(每语言单连接单实例)
     lsp_registry: Arc<crate::lsp::LangRegistry>,
     /// PTY 终端会话计数护栏(并发上限 8)
@@ -456,6 +459,9 @@ impl AgentApiState {
                     .unwrap_or_else(|e| panic!("failed to init workbench settings store: {e}")),
             ),
             human_gate: Arc::new(crate::api::human_gate::HumanGateLedger::new(&workdir)),
+            skills_confirm: std::sync::Arc::new(crate::api::skill_confirm::SkillConfirmState::new(
+                false,
+            )),
             lsp_registry: Arc::new(crate::lsp::LangRegistry::new()),
             pty_registry: Arc::new(crate::pty::PtyRegistry::new()),
             task_manager: Arc::new(crate::tasks::TaskManager::new()),
@@ -615,6 +621,19 @@ impl AgentApiState {
     /// HumanGate:获取人工审计账的引用(写面操作/拒绝留痕)
     pub fn human_gate(&self) -> &crate::api::human_gate::HumanGateLedger {
         &self.human_gate
+    }
+
+    /// 技能两段式确认态（挑战库+会话授权+模式开关；只读句柄）
+    pub fn skills_confirm(&self) -> &std::sync::Arc<crate::api::skill_confirm::SkillConfirmState> {
+        &self.skills_confirm
+    }
+
+    /// 两段式模式开关（serve 启动期 env 注入；缺省 false=单段直执旧行为）
+    pub fn with_skills_challenge_confirm(mut self, armed: bool) -> Self {
+        let inner = std::sync::Arc::get_mut(&mut self.skills_confirm)
+            .expect("skills_confirm arc must be unique at construction time");
+        *inner = crate::api::skill_confirm::SkillConfirmState::new(armed);
+        self
     }
 
     /// LSP:获取语言服务器活动连接注册表的引用(每语言单连接单实例)

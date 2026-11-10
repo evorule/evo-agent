@@ -180,6 +180,33 @@ impl HumanGateLedger {
         self.write_line(entry);
     }
 
+    /// 落一条带类别+确认通道的记录（两段式确认面专用）：confirmed_via 回答
+    /// 「这次人工把关经何通道兑现」（native-shell=壳原生对话框逐次确认 /
+    /// session-grant=壳会话级授权在位直接执行）；None=未走确认通道
+    /// （纯 web 单段形态，字段缺席=旧账本行同构）。
+    pub fn record_class_via(
+        &self,
+        op: &str,
+        identity: CallerIdentity,
+        class: CallerClass,
+        path: &str,
+        outcome: &str,
+        confirmed_via: Option<&str>,
+    ) {
+        let mut entry = serde_json::json!({
+            "ts": unix_now(),
+            "op": op,
+            "path": path,
+            "identity": identity.as_str(),
+            "class": class.as_str(),
+            "outcome": outcome,
+        });
+        if let Some(via) = confirmed_via {
+            entry["confirmed_via"] = serde_json::Value::from(via);
+        }
+        self.write_line(entry);
+    }
+
     fn write_line(&self, entry: serde_json::Value) {
         let line = entry.to_string();
         if let Some(dir) = self.path.parent() {

@@ -23,7 +23,14 @@
 //! 工作台管理 UI 留 IDE 化批；本面 REST 即可操作（curl / REST 消费面先例充分）。
 //! 鉴权随路由面（`/api/skills*` 不进 PUBLIC_PATHS，默认 Bearer token 内）。
 
-use axum::{extract::Extension, extract::State, http::StatusCode, Json};
+use axum::{
+    extract::Extension,
+    extract::Path,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -135,8 +142,8 @@ pub struct PendingSkillsResponse {
     pub pending: Vec<PendingSkillView>,
 }
 
-/// approve/revoke 请求体
-#[derive(Debug, Deserialize)]
+/// approve/revoke 请求体（Serialize 供两段式挑战载荷快照）
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SkillNameRequest {
     /// 目标技能名（skill 子目录名）
     pub name: String,
@@ -147,8 +154,9 @@ pub struct SkillNameRequest {
     pub operator: Option<String>,
 }
 
-/// bundle 导入请求体（`POST /api/skills/import`）
-#[derive(Debug, Deserialize)]
+/// bundle 导入请求体（`POST /api/skills/import`；Serialize 供两段式
+/// 挑战载荷快照）
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SkillImportRequest {
     /// 工作区内 skill-pack bundle 文件路径（JSON；复用 B7 同源路径语义）
     pub path: String,
@@ -205,7 +213,7 @@ pub async fn import_skills(
     State(state): State<AgentApiState>,
     Extension(class): Extension<CallerClass>,
     Json(req): Json<SkillImportRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<Response, (StatusCode, Json<Value>)> {
     // 写面人工账（对齐 file_api gate_write 语义）。身份取**计算值**
     // （auth enabled = human）：账本不再写死 anonymous（算而不记）——
     // identity 回答「过没过鉴权」，class 回答「特权/操作者 token」。
@@ -233,6 +241,47 @@ pub async fn import_skills(
         state
             .human_gate()
             .record_class("skills_import", identity, class, &req.path, outcome);
+    };
+    // 两段式分叉点（调用方门已过；同 approve/revoke）
+    if state.skills_confirm().armed() && !state.skills_confirm().session_grant_active() {
+        let payload = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+        let (challenge_id, _) = state
+            .skills_confirm()
+            .issue(crate::api::skill_confirm::ChallengeAction::Import, payload);
+        gate("challenge");
+        let issued = crate::api::skill_confirm::ChallengeIssuedView {
+            challenge_id,
+            action: "import".to_string(),
+            expires_in: crate::api::skill_confirm::CHALLENGE_TTL_SECS,
+        };
+        return Ok((axum::http::StatusCode::ACCEPTED, Json(issued)).into_response());
+    }
+    let via = if state.skills_confirm().session_grant_active() {
+        Some("session-grant")
+    } else {
+        None
+    };
+    let resp = execute_import(&state, identity, class, req, via).await?;
+    Ok(resp.into_response())
+}
+
+/// import 执行体（两段式挑战消费与单段直执共用；identity/class 由调方传入）
+async fn execute_import(
+    state: &AgentApiState,
+    identity: CallerIdentity,
+    class: CallerClass,
+    req: SkillImportRequest,
+    confirmed_via: Option<&str>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let gate = |outcome: &str| {
+        state.human_gate().record_class_via(
+            "skills_import",
+            identity,
+            class,
+            &req.path,
+            outcome,
+            confirmed_via,
+        );
     };
 
     // bundle 路径越界守卫（工作区内；canonicalize 防穿越）
@@ -287,7 +336,7 @@ pub async fn import_skills(
     }
 
     // 账本一次加载：同名同 level 已 active/revoked → 拒（不静默覆盖已审批内容）
-    let registry = SkillRegistry::load(&registry_path(&state)).map_err(|e| {
+    let registry = SkillRegistry::load(&registry_path(state)).map_err(|e| {
         gate("error");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -367,8 +416,8 @@ pub async fn import_skills(
         }
         // 落盘 `<skills_dir>/<name>/SKILL.md`（子目录式，市面惯例一致）
         let dir = match level {
-            SkillLevel::User => user_skills_dir(&state),
-            SkillLevel::Project => project_skills_dir(&state),
+            SkillLevel::User => user_skills_dir(state),
+            SkillLevel::Project => project_skills_dir(state),
         };
         let skill_dir = dir.join(&entry.name);
         let write = std::fs::create_dir_all(&skill_dir)
@@ -650,8 +699,8 @@ pub async fn approve_skill(
     State(state): State<AgentApiState>,
     Extension(class): Extension<CallerClass>,
     Json(req): Json<SkillNameRequest>,
-) -> Result<Json<ApproveResponse>, (StatusCode, Json<LeakRejectResponse>)> {
-    let ledger = |outcome: &str, class: CallerClass| {
+) -> Result<Response, (StatusCode, Json<LeakRejectResponse>)> {
+    let ledger = |outcome: &str| {
         state.human_gate().record_class(
             "skills_approve",
             crate::api::human_gate::caller_identity(state.auth_config()),
@@ -662,7 +711,7 @@ pub async fn approve_skill(
     };
     // 写面门（auth disabled = anonymous 只读,审批属写面一律拒;拒绝本身留痕）
     if ensure_write_allowed(state.auth_config()).is_err() {
-        ledger("denied", class);
+        ledger("denied");
         return Err((
             StatusCode::FORBIDDEN,
             Json(LeakRejectResponse {
@@ -674,7 +723,7 @@ pub async fn approve_skill(
     }
     // 特权面门（类别闸开启时,操作者类 token 不得自批——人工把关的机制强制点）
     if let Err(e) = ensure_privileged(state.auth_config(), class) {
-        ledger("denied", class);
+        ledger("denied");
         return Err((
             e.0,
             Json(LeakRejectResponse {
@@ -684,6 +733,50 @@ pub async fn approve_skill(
             }),
         ));
     }
+    // 两段式分叉点（调用方门已过）：模式开且会话授权未在位 → 签发挑战
+    // 短路（202,人工在壳原生对话框裁决）；授权在位 → 直执（账本
+    // confirmed_via=session-grant）；模式关 → 直执（旧行为逐字节兼容）。
+    let confirmed_via = if state.skills_confirm().armed() {
+        if state.skills_confirm().session_grant_active() {
+            Some("session-grant")
+        } else {
+            let payload = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+            let (challenge_id, _) = state
+                .skills_confirm()
+                .issue(crate::api::skill_confirm::ChallengeAction::Approve, payload);
+            ledger("challenge");
+            let issued = crate::api::skill_confirm::ChallengeIssuedView {
+                challenge_id,
+                action: "approve".to_string(),
+                expires_in: crate::api::skill_confirm::CHALLENGE_TTL_SECS,
+            };
+            return Ok((axum::http::StatusCode::ACCEPTED, Json(issued)).into_response());
+        }
+    } else {
+        None
+    };
+    let resp = execute_approve(&state, class, req, confirmed_via).await?;
+    Ok(resp.into_response())
+}
+
+/// approve 执行体（单段直执与两段式挑战消费共用；调用方门在挑战签发前
+/// 已过，内容级检查在执行时点复验——挑战到确认之间盘上内容以执行时为准）
+async fn execute_approve(
+    state: &AgentApiState,
+    class: CallerClass,
+    req: SkillNameRequest,
+    confirmed_via: Option<&str>,
+) -> Result<Json<ApproveResponse>, (StatusCode, Json<LeakRejectResponse>)> {
+    let ledger = |outcome: &str| {
+        state.human_gate().record_class_via(
+            "skills_approve",
+            crate::api::human_gate::caller_identity(state.auth_config()),
+            class,
+            &format!("{} ({})", req.name, req.level),
+            outcome,
+            confirmed_via,
+        );
+    };
     let Some(level) = level_from_str(&req.level) else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -698,8 +791,8 @@ pub async fn approve_skill(
         ));
     };
     let dir = match level {
-        SkillLevel::User => user_skills_dir(&state),
-        SkillLevel::Project => project_skills_dir(&state),
+        SkillLevel::User => user_skills_dir(state),
+        SkillLevel::Project => project_skills_dir(state),
     };
     // 从扫描结果定位（单 skill 不合格的候选天然不在其中——approve 拒绝）
     let scanned = scan_skills_dir(&dir, level).map_err(|e| {
@@ -794,7 +887,7 @@ pub async fn approve_skill(
         .as_deref()
         .unwrap_or("local-operator")
         .to_string();
-    let mut registry = SkillRegistry::load(&registry_path(&state)).map_err(|e| {
+    let mut registry = SkillRegistry::load(&registry_path(state)).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(LeakRejectResponse {
@@ -846,7 +939,7 @@ pub async fn approve_skill(
         warnings = warnings.len(),
         "skill approved (registration gate passed)"
     );
-    ledger("ok", class);
+    ledger("ok");
     Ok(Json(ApproveResponse {
         name: req.name,
         level: req.level,
@@ -864,8 +957,8 @@ pub async fn revoke_skill(
     State(state): State<AgentApiState>,
     Extension(class): Extension<CallerClass>,
     Json(req): Json<SkillNameRequest>,
-) -> Result<Json<RevokeResponse>, (StatusCode, Json<LeakRejectResponse>)> {
-    let ledger = |outcome: &str, class: CallerClass| {
+) -> Result<Response, (StatusCode, Json<LeakRejectResponse>)> {
+    let ledger = |outcome: &str| {
         state.human_gate().record_class(
             "skills_revoke",
             crate::api::human_gate::caller_identity(state.auth_config()),
@@ -875,7 +968,7 @@ pub async fn revoke_skill(
         );
     };
     if ensure_write_allowed(state.auth_config()).is_err() {
-        ledger("denied", class);
+        ledger("denied");
         return Err((
             StatusCode::FORBIDDEN,
             Json(LeakRejectResponse {
@@ -886,7 +979,7 @@ pub async fn revoke_skill(
         ));
     }
     if let Err(e) = ensure_privileged(state.auth_config(), class) {
-        ledger("denied", class);
+        ledger("denied");
         return Err((
             e.0,
             Json(LeakRejectResponse {
@@ -896,6 +989,47 @@ pub async fn revoke_skill(
             }),
         ));
     }
+    // 两段式分叉点（同 approve：armed 且无会话授权 → 签发挑战短路 202）
+    let confirmed_via = if state.skills_confirm().armed() {
+        if state.skills_confirm().session_grant_active() {
+            Some("session-grant")
+        } else {
+            let payload = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+            let (challenge_id, _) = state
+                .skills_confirm()
+                .issue(crate::api::skill_confirm::ChallengeAction::Revoke, payload);
+            ledger("challenge");
+            let issued = crate::api::skill_confirm::ChallengeIssuedView {
+                challenge_id,
+                action: "revoke".to_string(),
+                expires_in: crate::api::skill_confirm::CHALLENGE_TTL_SECS,
+            };
+            return Ok((axum::http::StatusCode::ACCEPTED, Json(issued)).into_response());
+        }
+    } else {
+        None
+    };
+    let resp = execute_revoke(&state, class, req, confirmed_via).await?;
+    Ok(resp.into_response())
+}
+
+/// revoke 执行体（两段式挑战消费与单段直执共用）
+async fn execute_revoke(
+    state: &AgentApiState,
+    class: CallerClass,
+    req: SkillNameRequest,
+    confirmed_via: Option<&str>,
+) -> Result<Json<RevokeResponse>, (StatusCode, Json<LeakRejectResponse>)> {
+    let ledger = |outcome: &str| {
+        state.human_gate().record_class_via(
+            "skills_revoke",
+            crate::api::human_gate::caller_identity(state.auth_config()),
+            class,
+            &format!("{} ({})", req.name, req.level),
+            outcome,
+            confirmed_via,
+        );
+    };
     let Some(level) = level_from_str(&req.level) else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -909,13 +1043,13 @@ pub async fn revoke_skill(
             }),
         ));
     };
-    let mut registry = SkillRegistry::load(&registry_path(&state)).map_err(internal_err)?;
+    let mut registry = SkillRegistry::load(&registry_path(state)).map_err(internal_err)?;
     let known_in_registry = registry.find(&req.name, level).is_some();
     if !known_in_registry {
         // 目录扫到才可写显式拒绝行；否则视为未知 skill
         let dir = match level {
-            SkillLevel::User => user_skills_dir(&state),
-            SkillLevel::Project => project_skills_dir(&state),
+            SkillLevel::User => user_skills_dir(state),
+            SkillLevel::Project => project_skills_dir(state),
         };
         let scanned = scan_skills_dir(&dir, level).map_err(internal_err)?;
         if !scanned.iter().any(|s| s.name == req.name) {
@@ -932,7 +1066,7 @@ pub async fn revoke_skill(
     registry.revoke(&req.name, level);
     registry.save().map_err(internal_err)?;
     tracing::info!(skill = %req.name, level = %req.level, "skill revoked");
-    ledger("ok", class);
+    ledger("ok");
     Ok(Json(RevokeResponse {
         name: req.name,
         level: req.level,
@@ -951,7 +1085,204 @@ fn internal_err(e: String) -> (StatusCode, Json<LeakRejectResponse>) {
     )
 }
 
-/// 路由挂载（router_with_auth 内调用；鉴权内，不进 PUBLIC_PATHS）
+// =============================================================================
+// 两段式确认端点（壳原生通道）：confirm 消费挑战执行原动作 / deny 拒绝 /
+// challenge 轮询 / confirm-session-grant 会话级授权（调用方身份模型根修层）
+// =============================================================================
+
+fn confirm_gate(
+    state: &AgentApiState,
+    class: CallerClass,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if ensure_write_allowed(state.auth_config()).is_err() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": crate::api::human_gate::anonymous_write_denied()
+            })),
+        ));
+    }
+    if let Err(e) = ensure_privileged(state.auth_config(), class) {
+        return Err((e.0, Json(serde_json::json!({ "error": e.1 }))));
+    }
+    Ok(())
+}
+
+/// `POST /api/skills/confirm` — 壳消费挑战执行原动作（写面+特权面门；
+/// 执行体按挑战动作分发，账本 confirmed_via=native-shell）。
+/// 挑战不存在/已消费/已拒 → 404；已过期 → 410。
+pub async fn confirm_skill_action(
+    State(state): State<AgentApiState>,
+    Extension(class): Extension<CallerClass>,
+    Json(req): Json<crate::api::skill_confirm::ConfirmRequest>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    confirm_gate(&state, class)?;
+    let cid = req.challenge_id.clone();
+    let Some((action, payload)) = state.skills_confirm().consume(&cid) else {
+        let expired = state
+            .skills_confirm()
+            .status(&cid)
+            .map(|v| v.state == "expired")
+            .unwrap_or(false);
+        let code = if expired {
+            StatusCode::GONE
+        } else {
+            StatusCode::NOT_FOUND
+        };
+        return Err((
+            code,
+            Json(serde_json::json!({"error": format!(
+                "challenge '{}' is not pending (unknown/consumed/denied/expired)", cid
+            )})),
+        ));
+    };
+    use crate::api::skill_confirm::ChallengeAction as CA;
+    match action {
+        CA::Approve => {
+            let Ok(r) = serde_json::from_value::<SkillNameRequest>(payload) else {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "challenge payload corrupt"})),
+                ));
+            };
+            match execute_approve(&state, class, r, Some("native-shell")).await {
+                Ok(Json(v)) => {
+                    state.skills_confirm().set_result(
+                        &cid,
+                        serde_json::to_value(&v).unwrap_or(serde_json::Value::Null),
+                    );
+                    Ok(Json(v).into_response())
+                }
+                Err(e) => Err((
+                    e.0,
+                    Json(serde_json::json!({"error": e.1.reason, "hits": e.1.hits})),
+                )),
+            }
+        }
+        CA::Revoke => {
+            let Ok(r) = serde_json::from_value::<SkillNameRequest>(payload) else {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "challenge payload corrupt"})),
+                ));
+            };
+            match execute_revoke(&state, class, r, Some("native-shell")).await {
+                Ok(Json(v)) => {
+                    state.skills_confirm().set_result(
+                        &cid,
+                        serde_json::to_value(&v).unwrap_or(serde_json::Value::Null),
+                    );
+                    Ok(Json(v).into_response())
+                }
+                Err(e) => Err((
+                    e.0,
+                    Json(serde_json::json!({"error": e.1.reason, "hits": e.1.hits})),
+                )),
+            }
+        }
+        CA::Import => {
+            let Ok(r) = serde_json::from_value::<SkillImportRequest>(payload) else {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "challenge payload corrupt"})),
+                ));
+            };
+            let identity = crate::api::human_gate::caller_identity(state.auth_config());
+            match execute_import(&state, identity, class, r, Some("native-shell")).await {
+                Ok(Json(v)) => {
+                    state.skills_confirm().set_result(&cid, v.clone());
+                    Ok(Json(v).into_response())
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// `POST /api/skills/confirm-deny` — 壳原生对话框「拒绝」路径：挑战置
+/// Denied（终态），账本落 denied+confirmed_via=native-shell。
+pub async fn deny_skill_action(
+    State(state): State<AgentApiState>,
+    Extension(class): Extension<CallerClass>,
+    Json(req): Json<crate::api::skill_confirm::ConfirmRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    confirm_gate(&state, class)?;
+    // 账本 path 标签取挑战载荷的动作对象（name/level 或 bundle 路径）
+    let label = state
+        .skills_confirm()
+        .peek_payload(&req.challenge_id)
+        .map(|p| {
+            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let level = p.get("level").and_then(|v| v.as_str()).unwrap_or("");
+            let path = p.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if !name.is_empty() {
+                format!("{name} ({level})")
+            } else {
+                path.to_string()
+            }
+        })
+        .unwrap_or_else(|| req.challenge_id.clone());
+    if !state.skills_confirm().deny(&req.challenge_id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!(
+                "challenge '{}' is not pending", req.challenge_id
+            )})),
+        ));
+    }
+    let action = state
+        .skills_confirm()
+        .status(&req.challenge_id)
+        .map(|v| v.action)
+        .unwrap_or_default();
+    let identity = crate::api::human_gate::caller_identity(state.auth_config());
+    state.human_gate().record_class_via(
+        &format!("skills_{action}"),
+        identity,
+        class,
+        &label,
+        "denied",
+        Some("native-shell"),
+    );
+    Ok(Json(
+        serde_json::json!({"challenge_id": req.challenge_id, "state": "denied"}),
+    ))
+}
+
+/// `GET /api/skills/challenge/{challenge_id}` — 挑战状态轮询（web 面等
+/// 壳裁决结果用；Executed 态携带原动作响应体）
+pub async fn challenge_status(
+    State(state): State<AgentApiState>,
+    Path(challenge_id): Path<String>,
+) -> Result<Json<crate::api::skill_confirm::ChallengeStatusView>, StatusCode> {
+    state
+        .skills_confirm()
+        .status(&challenge_id)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// `POST /api/skills/confirm-session-grant` — 会话级授权置位/撤销
+/// （壳原生「允许本会话技能变更」裁决后调用；serve 进程内存态，重启消散）
+pub async fn set_confirm_session_grant(
+    State(state): State<AgentApiState>,
+    Extension(class): Extension<CallerClass>,
+    Json(req): Json<crate::api::skill_confirm::SessionGrantRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    confirm_gate(&state, class)?;
+    state.skills_confirm().set_session_grant(req.enable);
+    let identity = crate::api::human_gate::caller_identity(state.auth_config());
+    state.human_gate().record_class(
+        "skills_confirm_grant",
+        identity,
+        class,
+        &format!("enable={}", req.enable),
+        "ok",
+    );
+    Ok(Json(serde_json::json!({"session_grant": req.enable})))
+}
+
+/// 技能管理面路由挂载（router_with_auth 内调用；鉴权内，不进 PUBLIC_PATHS）
 pub fn skills_routes() -> axum::Router<AgentApiState> {
     use axum::routing::{get, post};
     axum::Router::new()
@@ -961,6 +1292,17 @@ pub fn skills_routes() -> axum::Router<AgentApiState> {
         .route("/api/skills/revoke", post(revoke_skill))
         .route("/api/skills/import", post(import_skills))
         .route("/api/skills/export", post(export_skill))
+        // 两段式确认面（挑战-确认语义；壳原生通道）
+        .route("/api/skills/confirm", post(confirm_skill_action))
+        .route("/api/skills/confirm-deny", post(deny_skill_action))
+        .route(
+            "/api/skills/confirm-session-grant",
+            post(set_confirm_session_grant),
+        )
+        .route(
+            "/api/skills/challenge/{challenge_id}",
+            get(challenge_status),
+        )
 }
 
 /// `POST /api/skills/export` — 导出已批准技能为 import 同构 bundle
@@ -1804,6 +2146,188 @@ mod tests {
             .with_human_tokens(vec!["human-token".to_string()]);
         let state = make_state(workdir).with_auth_config(auth.clone());
         crate::api::agent_api::router_with_auth(state, auth)
+    }
+
+    /// 两段式确认模式 router（serve env 置位的桌面形态；token=test-token）
+    fn confirm_router(workdir: std::path::PathBuf) -> axum::Router {
+        let auth = crate::api::auth::AuthConfig::new(vec!["test-token".to_string()], true);
+        let state = human_state(workdir)
+            .with_auth_config(auth.clone())
+            .with_skills_challenge_confirm(true);
+        crate::api::agent_api::router_with_auth(state, auth)
+    }
+
+    #[tokio::test]
+    async fn test_two_phase_challenge_flow_approve() {
+        // 挑战-确认全链：approve → 202 挑战（未执行）→ 状态轮询 pending →
+        // confirm 消费执行（active）→ 账本 confirmed_via=native-shell →
+        // 状态 executed 且带原动作响应体。纯 web 形态（模式关）不受影响。
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "data/skills",
+            "gated",
+            &clean_skill_named("gated"),
+        );
+        let app = confirm_router(tmp.path().to_path_buf());
+        let (st, body) = post(
+            app.clone(),
+            "/api/skills/approve",
+            serde_json::json!({"name": "gated", "level": "user"}),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::ACCEPTED,
+            "两段式下 approve 202 挑战: {body}"
+        );
+        let cid = body["challenge_id"].as_str().unwrap().to_string();
+        assert_eq!(body["action"], "approve");
+        // 未执行：清单无 active 行
+        let (_, inv) = get(app.clone(), "/api/skills").await;
+        let row = inv["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "gated")
+            .unwrap();
+        assert_eq!(row["status"], "discovered", "挑战未消费不得执行");
+        // 轮询 pending → confirm → executed+result
+        let (_, pv) = get(app.clone(), &format!("/api/skills/challenge/{cid}")).await;
+        assert_eq!(pv["state"], "pending");
+        let (cst, cbody) = post(
+            app.clone(),
+            "/api/skills/confirm",
+            serde_json::json!({"challenge_id": cid}),
+        )
+        .await;
+        assert_eq!(cst, StatusCode::OK, "confirm 执行原动作: {cbody}");
+        assert_eq!(cbody["status"], "active");
+        let (_, sv) = get(app.clone(), &format!("/api/skills/challenge/{cid}")).await;
+        assert_eq!(sv["state"], "executed");
+        assert_eq!(sv["result"]["status"], "active");
+        // 账本：challenge + ok(confirmed_via=native-shell)
+        let ledger =
+            std::fs::read_to_string(tmp.path().join("data/human_gate_ledger.jsonl")).unwrap();
+        let outcomes: Vec<serde_json::Value> = ledger
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["op"] == "skills_approve")
+            .collect();
+        assert!(
+            outcomes.iter().any(|e| e["outcome"] == "challenge"),
+            "挑战签发落账: {outcomes:?}"
+        );
+        let ok = outcomes
+            .iter()
+            .find(|e| e["outcome"] == "ok")
+            .expect("执行 ok 落账");
+        assert_eq!(ok["confirmed_via"], "native-shell");
+        // 一次性：二次 confirm 404
+        let (cst2, _) = post(
+            app,
+            "/api/skills/confirm",
+            serde_json::json!({"challenge_id": cid}),
+        )
+        .await;
+        assert_eq!(cst2, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_two_phase_deny_blocks_execution() {
+        // 拒绝路径：202 → confirm-deny → 状态 denied → 技能未执行 → 账本
+        // denied+confirmed_via=native-shell（人工把关的拒绝留痕）。
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "data/skills",
+            "denied",
+            &clean_skill_named("denied"),
+        );
+        let app = confirm_router(tmp.path().to_path_buf());
+        let (st, body) = post(
+            app.clone(),
+            "/api/skills/approve",
+            serde_json::json!({"name": "denied", "level": "user"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let cid = body["challenge_id"].as_str().unwrap().to_string();
+        let (dst, dbody) = post(
+            app.clone(),
+            "/api/skills/confirm-deny",
+            serde_json::json!({"challenge_id": cid}),
+        )
+        .await;
+        assert_eq!(dst, StatusCode::OK, "{dbody}");
+        let (_, sv) = get(app.clone(), &format!("/api/skills/challenge/{cid}")).await;
+        assert_eq!(sv["state"], "denied");
+        let (_, inv) = get(app.clone(), "/api/skills").await;
+        let row = inv["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "denied")
+            .unwrap();
+        assert_eq!(row["status"], "discovered", "拒绝后不得执行");
+        let ledger =
+            std::fs::read_to_string(tmp.path().join("data/human_gate_ledger.jsonl")).unwrap();
+        let denied: Vec<serde_json::Value> = ledger
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["op"] == "skills_approve" && e["outcome"] == "denied")
+            .collect();
+        assert!(
+            denied.iter().any(|e| e["confirmed_via"] == "native-shell"),
+            "拒绝留痕含确认通道: {denied:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_two_phase_session_grant_direct_execution() {
+        // 会话级授权（每壳引导一次裁决的口径）：grant 置位后 approve 直接执行（无 202），
+        // 账本 confirmed_via=session-grant；撤销授权后回落挑战模式。
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "data/skills", "g1", &clean_skill_named("g1"));
+        write_skill(tmp.path(), "data/skills", "g2", &clean_skill_named("g2"));
+        let app = confirm_router(tmp.path().to_path_buf());
+        let (gst, gbody) = post(
+            app.clone(),
+            "/api/skills/confirm-session-grant",
+            serde_json::json!({"enable": true}),
+        )
+        .await;
+        assert_eq!(gst, StatusCode::OK, "{gbody}");
+        let (st1, b1) = post(
+            app.clone(),
+            "/api/skills/approve",
+            serde_json::json!({"name": "g1", "level": "user"}),
+        )
+        .await;
+        assert_eq!(st1, StatusCode::OK, "授权在位=直执无挑战: {b1}");
+        assert_eq!(b1["status"], "active");
+        let ledger =
+            std::fs::read_to_string(tmp.path().join("data/human_gate_ledger.jsonl")).unwrap();
+        let ok1 = ledger
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["op"] == "skills_approve" && e["outcome"] == "ok")
+            .expect("直执 ok 落账");
+        assert_eq!(ok1["confirmed_via"], "session-grant");
+        // 撤销授权 → 回落挑战模式
+        let _ = post(
+            app.clone(),
+            "/api/skills/confirm-session-grant",
+            serde_json::json!({"enable": false}),
+        )
+        .await;
+        let (st2, b2) = post(
+            app,
+            "/api/skills/approve",
+            serde_json::json!({"name": "g2", "level": "user"}),
+        )
+        .await;
+        assert_eq!(st2, StatusCode::ACCEPTED, "撤销授权后回落挑战: {b2}");
     }
 
     #[tokio::test]

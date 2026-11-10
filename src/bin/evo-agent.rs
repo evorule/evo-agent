@@ -3583,7 +3583,14 @@ fn cmd_serve(
     // 配置统一:注入经统一解析的 LLM 配置(env 优先、toml 兜底)——
     // serve 面各请求路径的 handler 构造与 CLI 共用同一解析产物,
     // 不再绕过配置体系直读裸环境变量
-    .with_llm_config(config.llm.clone());
+    .with_llm_config(config.llm.clone())
+    // 两段式确认模式（桌面壳 env 置位；纯 web 缺省关=单段直执旧行为）：
+    // 特权管理动作改「签发挑战→壳原生对话框人裁→消费挑战执行」
+    .with_skills_challenge_confirm(
+        std::env::var("EVO_AGENT_SKILLS__CHALLENGE_CONFIRM")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+    );
     // 状态根接线:read-root / agent-root 独立注入(桌面壳只传 --agent-root,
     // 注入不得被 read-root 缺席阻断;缺省 None=零变化)
     state = evo_agent::api::agent_api::wire_state_roots(state, read_root_buf, agent_root_buf);
