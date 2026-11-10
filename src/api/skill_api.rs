@@ -81,6 +81,15 @@ pub struct SkillView {
     /// ——管理面只读暴露失配，不在此降级（状态迁移仍在会话创建/重批）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_matches: Option<bool>,
+    /// 已批准旧版元数据（账本有钉哈希且盘上内容失配时随行——元数据来自
+    /// 受保护的账本行，恒可信；diff 不可用时本字段仍留守）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<PreviousVersionView>,
+    /// 已批准原文 → 盘上待审文本的 unified diff（确定性 LCS，256KiB 帽+
+    /// 截断标注；依赖可验证快照——缺失/失配/内容一致时缺席，字段缺席=
+    /// 旧客户端语义不变）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 /// GET /api/skills 响应（管理面权威全清单）
@@ -90,8 +99,21 @@ pub struct SkillInventoryResponse {
     pub skills: Vec<SkillView>,
 }
 
+/// 已批准旧版元数据（清单视图附加字段：账本有钉哈希且盘上内容失配时随行
+/// ——更新重批的复核面：审批者先看「改了什么」再放行）
+#[derive(Debug, Serialize)]
+pub struct PreviousVersionView {
+    /// 批准时刻（unix secs）
+    pub approved_at: u64,
+    /// 批准者
+    pub approved_by: Option<String>,
+    /// 批准时钉死的哈希（prefixed blake3；快照完整性凭此自证）
+    pub hash: String,
+}
+
 /// 待审项（GET /api/skills/pending 元素）：discovered + 正文全文预览
-/// （审批前必读内容——人工过目 = 供应链闸口）
+/// （审批前必读内容——人工过目 = 供应链闸口；全新技能无旧版可比，
+/// diff 复核面在 GET /api/skills 清单视图的失配项上）
 #[derive(Debug, Serialize)]
 pub struct PendingSkillView {
     /// 技能名
@@ -466,6 +488,42 @@ fn build_inventory(state: &AgentApiState) -> Result<SkillInventoryResponse, Stri
         } else {
             None
         };
+        // diff 复核面数据：账本有钉哈希且盘上失配（active 失配=更新待重批；
+        // revoked 带文件=恢复重批）→ 快照（哈希自证）取旧版算 unified diff。
+        // 快照缺失/失配/读盘失败 = 字段缺席（fail-soft 回退全文预览）。
+        let mismatch = matches!((&content_hash, content_matches), (Some(_), Some(false)))
+            || (content_matches.is_none()
+                && content_hash.is_some()
+                && status == SkillStatus::Revoked
+                && hash_skill_file_prefixed(&s.path)
+                    .ok()
+                    .zip(content_hash.as_deref())
+                    .is_some_and(|(a, p)| a != p));
+        let (previous, diff) = if mismatch {
+            let hash = content_hash.clone().unwrap_or_default();
+            let prev = PreviousVersionView {
+                approved_at: approved_at.unwrap_or(0),
+                approved_by: approved_by.clone(),
+                hash: hash.clone(),
+            };
+            let diff = crate::agent::skill_store::load_snapshot(
+                state.workdir(),
+                s.level.as_str(),
+                &s.name,
+                &hash,
+            )
+            .and_then(|old| {
+                std::fs::read_to_string(&s.path)
+                    .ok()
+                    .map(|new| {
+                        crate::api::skill_diff::unified_diff(&old, &new, "approved", "pending")
+                    })
+                    .filter(|d| !d.is_empty())
+            });
+            (Some(prev), diff)
+        } else {
+            (None, None)
+        };
         views.push(SkillView {
             name: s.name.clone(),
             level: s.level.as_str().to_string(),
@@ -476,6 +534,8 @@ fn build_inventory(state: &AgentApiState) -> Result<SkillInventoryResponse, Stri
             approved_at,
             approved_by,
             content_matches,
+            previous,
+            diff,
         });
     };
     for s in &scanned_user {
@@ -501,6 +561,9 @@ fn build_inventory(state: &AgentApiState) -> Result<SkillInventoryResponse, Stri
                 approved_at: e.approved_at,
                 approved_by: e.approved_by.clone(),
                 content_matches: None,
+                // stale 行无盘上文件可比 → 无 diff 复核面
+                previous: None,
+                diff: None,
             });
         }
     }
@@ -765,6 +828,17 @@ pub async fn approve_skill(
             }),
         )
     })?;
+    // diff 审批视图数据面：批准成功后按内容哈希落快照（write-if-absent；
+    // 失败不阻断审批——快照是便利数据，缺失仅使 pending 视图回退全文预览）
+    if let Err(e) = crate::agent::skill_store::write_snapshot(
+        state.workdir(),
+        &req.level,
+        &req.name,
+        &content_hash,
+        &content,
+    ) {
+        tracing::warn!(skill = %req.name, error = %e, "skill snapshot write failed; diff view will fall back to full-text");
+    }
     tracing::info!(
         skill = %req.name,
         level = %req.level,
@@ -1763,6 +1837,82 @@ mod tests {
     fn fixture(name: &str, last: &str, extra: &str) -> String {
         // SKILL.md 文件内容 = 真换行（rust 源内以转义序列书写）
         format!("---\nname: {name}\ndescription: d\n{extra}\n---\n{last}")
+    }
+
+    #[tokio::test]
+    async fn test_inventory_carries_diff_against_approved_snapshot() {
+        // diff 复核面（更新重批）：批准 v1 → 改写正文 → 清单视图失配项携带
+        // previous+diff；快照被篡改 → 哈希自证失配 → 字段缺席（fail-soft
+        // 回退全文预览，不给未验证数据进审批面）。
+        let tmp = tempfile::tempdir().unwrap();
+        let v1 = fixture("evolving", "version one", "");
+        write_skill(tmp.path(), "data/skills", "evolving", &v1);
+        let app = human_router(tmp.path().to_path_buf());
+        let (status, _) = post(
+            app.clone(),
+            "/api/skills/approve",
+            serde_json::json!({"name": "evolving", "level": "user"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // 批准后快照落盘且哈希自洽
+        let sdir = tmp.path().join("data/skill-snapshots/user/evolving");
+        let snap = std::fs::read_dir(&sdir)
+            .expect("snapshot dir must exist after approve")
+            .next()
+            .expect("snapshot file must exist")
+            .unwrap()
+            .path();
+        let snap_content = std::fs::read_to_string(&snap).unwrap();
+        assert_eq!(snap_content, v1, "快照 = 批准时刻原文");
+
+        // v2 改写正文（同路径覆盖）→ 清单失配项携带 diff 复核面
+        let v2 = fixture("evolving", "version two CHANGED", "");
+        write_skill(tmp.path(), "data/skills", "evolving", &v2);
+        let (lstatus, body) = get(app.clone(), "/api/skills").await;
+        assert_eq!(lstatus, StatusCode::OK, "清单端点正常");
+        let item = body["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "evolving")
+            .expect("evolving row present")
+            .clone();
+        assert_eq!(item["content_matches"], false, "失配暴露（既有语义）");
+        assert!(item["previous"].is_object(), "旧版元数据随行: {item}");
+        assert!(
+            item["previous"]["hash"]
+                .as_str()
+                .unwrap()
+                .starts_with("blake3:"),
+            "旧版哈希 prefixed 形态"
+        );
+        let diff = item["diff"].as_str().unwrap();
+        assert!(
+            diff.contains("-version one") && diff.contains("+version two CHANGED"),
+            "diff 双向行随行: {diff}"
+        );
+
+        // 快照篡改 → load_snapshot 哈希自证失配 → diff 缺席；previous 是
+        // 受保护账本的元数据（恒可信），留守
+        std::fs::write(&snap, "tampered").unwrap();
+        let (_, body) = get(app, "/api/skills").await;
+        let item = body["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "evolving")
+            .expect("evolving row present")
+            .clone();
+        assert!(
+            item["diff"].is_null(),
+            "失配快照不得供 diff 进审批面: {item}"
+        );
+        assert!(
+            item["previous"].is_object(),
+            "previous=账本元数据恒留守: {item}"
+        );
+        assert_eq!(item["content_matches"], false, "失配暴露不受快照面影响");
     }
 
     #[tokio::test]
