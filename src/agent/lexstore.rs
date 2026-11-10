@@ -263,7 +263,7 @@ impl ColdStore {
                     r.mem_type,
                     r.lifecycle_state,
                     r.superseded_by,
-                    now
+                    now as i64
                 ],
             )
             .map_err(|e| LexError(format!("cold insert: {e}")))?;
@@ -634,7 +634,7 @@ impl LexStore {
                 "INSERT INTO timeline(fact_id, prefix, kind, valid_at, lifecycle_state, superseded_by)
                  VALUES (?1, ?2, ?3, ?4, ?5, NULL)
                  ON CONFLICT(fact_id) DO UPDATE SET lifecycle_state = excluded.lifecycle_state",
-                rusqlite::params![*fact_id as i64, prefix, "fact", ts, state],
+                rusqlite::params![*fact_id as i64, prefix, "fact", ts as i64, state],
             )
             .map_err(|e| LexError(format!("insert timeline: {e}")))?;
             if let Some(entities) = value.get("entities").and_then(|v| v.as_array()) {

@@ -70,18 +70,14 @@ yanked = "warn"
 # paste（RUSTSEC-2024-0436，unmaintained 类）：官方已归档，无安全升级路径；
 # 依赖方（pulp/rav1e/tokenizers）全在 fastembed 生态上游，宏展开类无运行时
 # 敞口；解除条件：fastembed 上游迁移后随版解除。
-# rusqlite 0.32 bundled（RUSTSEC-2026-0459，vulnerability 类，CVE-2026-119375
-# SQLite 页缓存未初始化内存回读）：补丁在 libsqlite3-sys 0.39（SQLite 3.54），
-# 要求 rusqlite 0.41（声明 Rust 1.89），0.30.x 无回移补丁，跨版本升级属代码
-# 改造范畴不宜混入功能批；敞口受限——本地 journal 存储，攻击向量需进程打开
-# 攻击者构造的 db+wal 文件对；解除条件：rusqlite 0.41 升级批落地同 commit 摘除。
 # （2026-10-28 顺手摘除已失效的 RUSTSEC-2026-0110 豁免：advisory DB 中已无匹配。）
+# （2026-11-10 摘除 RUSTSEC-2026-0459 豁免：rusqlite 已升 0.41 + libsqlite3-sys 0.39
+# （bundled SQLite 3.54.1），页缓存初始化补丁随版落地，修复即摘。）
 ignore = [
     "RUSTSEC-2026-0183",
     "RUSTSEC-2026-0184",
     "RUSTSEC-2024-0437",
     "RUSTSEC-2024-0436",
-    "RUSTSEC-2026-0459",
 ]
 
 # ---------------------------------------------------------------------------
