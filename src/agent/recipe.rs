@@ -131,6 +131,36 @@ pub struct BudgetConfig {
     /// 预算降级顺序（fit_recall 执行序）
     #[serde(default = "default_degradation")]
     pub degradation_order: Vec<String>,
+    /// stable 召回层绝对帽（token）：与模型窗口解耦（比例帽随窗放大，大窗
+    /// 模型上等于无帽——300+ 条全量注入实测 9.4 万 token 的失败模式）。
+    /// 帽满按 sort_by_policy 序截断，截断留痕 degradation_notices。
+    /// 首版 8000；观测面（每轮注入条数/token 落日志）每 50 轮复盘一次。
+    #[serde(default = "default_stable_cap_tokens")]
+    pub stable_cap_tokens: usize,
+    /// 判据式常驻层（design-83/85）：`stable.user.*` 且 confidence ≥ 此值
+    /// 无条件常驻（不占召回帽）；`stable.system.*` 恒常驻（安全边界不设阈）。
+    #[serde(default = "default_resident_user_confidence")]
+    pub resident_user_min_confidence: f32,
+    /// 常驻晋升 usage 门槛：user 条目 usage_count+会话 pending ≥ k 且
+    /// confidence ≥ resident_promotion_confidence → 自动晋升常驻。
+    #[serde(default = "default_resident_promotion_uses")]
+    pub resident_promotion_uses: u32,
+    /// 常驻晋升置信度阈值（与 usage 门槛联合判定；晋升逐条落 tracing 账）
+    #[serde(default = "default_resident_promotion_confidence")]
+    pub resident_promotion_confidence: f32,
+}
+
+fn default_stable_cap_tokens() -> usize {
+    8000
+}
+fn default_resident_user_confidence() -> f32 {
+    0.8
+}
+fn default_resident_promotion_uses() -> u32 {
+    3
+}
+fn default_resident_promotion_confidence() -> f32 {
+    0.5
 }
 
 /// 自省工具暴露面声明（F-611）。
@@ -382,6 +412,10 @@ impl Default for MemoryRecipe {
             },
             budget: BudgetConfig {
                 degradation_order: default_degradation(),
+                stable_cap_tokens: default_stable_cap_tokens(),
+                resident_user_min_confidence: default_resident_user_confidence(),
+                resident_promotion_uses: default_resident_promotion_uses(),
+                resident_promotion_confidence: default_resident_promotion_confidence(),
             },
             tools: ToolsSection::default(),
             sources: SourcesSection::default(),
@@ -425,6 +459,14 @@ pub struct RetrievalPolicy {
     pub half_life_semantic_days: f64,
     /// 预算降级序（fit_recall 执行序）
     pub degradation_order: Vec<String>,
+    /// stable 召回层绝对帽（token；Recipe budget.stable_cap_tokens）
+    pub stable_cap_tokens: usize,
+    /// 常驻层 user 条目置信度阈值（Recipe budget.resident_user_min_confidence）
+    pub resident_user_min_confidence: f32,
+    /// 常驻晋升 usage 门槛（Recipe budget.resident_promotion_uses）
+    pub resident_promotion_uses: u32,
+    /// 常驻晋升置信度阈值（Recipe budget.resident_promotion_confidence）
+    pub resident_promotion_confidence: f32,
     /// 配方版本戳（随召回结果落链）
     pub recipe_version: String,
 }
@@ -444,6 +486,10 @@ impl RetrievalPolicy {
             half_life_episodic_days: recipe.retrieval.half_life_days.episodic,
             half_life_semantic_days: recipe.retrieval.half_life_days.semantic,
             degradation_order: recipe.budget.degradation_order.clone(),
+            stable_cap_tokens: recipe.budget.stable_cap_tokens,
+            resident_user_min_confidence: recipe.budget.resident_user_min_confidence,
+            resident_promotion_uses: recipe.budget.resident_promotion_uses,
+            resident_promotion_confidence: recipe.budget.resident_promotion_confidence,
             recipe_version: recipe.recipe_version.clone(),
         }
     }
@@ -462,6 +508,10 @@ impl RetrievalPolicy {
             half_life_episodic_days: 14.0,
             half_life_semantic_days: 90.0,
             degradation_order: default_degradation(),
+            stable_cap_tokens: default_stable_cap_tokens(),
+            resident_user_min_confidence: default_resident_user_confidence(),
+            resident_promotion_uses: default_resident_promotion_uses(),
+            resident_promotion_confidence: default_resident_promotion_confidence(),
             recipe_version: "lexical-legacy".to_string(),
         }
     }

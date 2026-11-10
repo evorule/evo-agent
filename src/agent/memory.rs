@@ -654,6 +654,99 @@ pub(crate) fn sort_by_policy(
     }
 }
 
+/// Stable Facts 注入瘦身（design-83 立项 / design-85 裁决②「绝对帽 8K +
+/// 判据式常驻」）：判据式常驻层 + 召回层绝对帽。
+///
+/// 层分（判据式，非名单式——不拍初始名单，让判据从真实使用中长出来）：
+/// - **常驻层**（无条件注入，不占召回帽）：`stable.system.*`（系统边界/
+///   安全约束，恒常驻）；`stable.user.*` 且 confidence ≥
+///   `resident_user_min_confidence`；运行时晋升——user 条目
+///   usage_count+会话 pending ≥ `resident_promotion_uses` 且 confidence ≥
+///   `resident_promotion_confidence`（逐条落 tracing 账，可审计）。
+/// - **召回层**：其余（`stable.llm.*` + 低置信/低使用 user + 未标注）按
+///   `sort_by_policy` 序取前缀至 `stable_cap_tokens` **绝对帽**——与模型
+///   窗口解耦（比例帽随窗放大，大窗模型上等于无帽：300+ 条全量注入实测
+///   9.4 万 token 的失败模式即此）；帽满截断留痕 degradation_notices。
+///
+/// 常驻条目置于列表头部——下游 `fit_recall` 的比例预算前缀截断只切召回层
+/// 尾部，小窗模型上常驻面（安全约束）仍全保；大窗模型上比例预算永不触及
+/// stable（8K+常驻 << 比例帽），绝对帽是唯一生效约束。
+///
+/// 输入须已按 `sort_by_policy` 排序（截断即优先淘汰低价值条目）。
+/// 返回 `(注入条数, 召回层截断条数, 注入 token 估算)` 供观测面落日志。
+pub(crate) fn layerize_stable(
+    stable: &mut Vec<MemoryRecord>,
+    usage: &std::collections::HashMap<u64, u32>,
+    policy: &crate::agent::recipe::RetrievalPolicy,
+    notices: &mut Vec<String>,
+) -> (usize, usize, usize) {
+    let total = stable.len();
+    let mut resident: Vec<MemoryRecord> = Vec::new();
+    let mut recallable: Vec<MemoryRecord> = Vec::new();
+    for r in stable.drain(..) {
+        let domain = MemoryManager::stable_domain_of(&r.key);
+        let conf = r.confidence.unwrap_or(0.0);
+        let usage_hits = r
+            .fact_id
+            .and_then(|fid| usage.get(&fid))
+            .copied()
+            .unwrap_or(0)
+            + r.usage_count;
+        let promoted = domain == StableDomain::User
+            && usage_hits >= policy.resident_promotion_uses
+            && conf >= policy.resident_promotion_confidence;
+        let resident_hit = match domain {
+            StableDomain::System => true,
+            StableDomain::User => conf >= policy.resident_user_min_confidence || promoted,
+            _ => false,
+        };
+        if promoted {
+            tracing::info!(
+                key = %r.key,
+                fact_id = r.fact_id.unwrap_or(0),
+                usage = usage_hits,
+                confidence = conf,
+                "stable resident promotion: usage gate met, entry now injected unconditionally"
+            );
+        }
+        if resident_hit {
+            resident.push(r);
+        } else {
+            recallable.push(r);
+        }
+    }
+
+    // 召回层绝对帽：sort_by_policy 序前缀截取（低价值尾部落帽）
+    let recall_total = recallable.len();
+    let mut used = 0usize;
+    let cut = recallable
+        .iter()
+        .position(|r| {
+            used += ContextBudget::estimate_tokens(&r.value);
+            used > policy.stable_cap_tokens
+        })
+        .unwrap_or(recall_total);
+    recallable.truncate(cut);
+    if cut < recall_total {
+        notices.push(format!(
+            "memory budget: stable 召回层裁剪 {} 条(常驻 {} 条全保留,绝对帽 {} token)",
+            recall_total - cut,
+            resident.len(),
+            policy.stable_cap_tokens
+        ));
+    }
+
+    let injected_tokens = resident
+        .iter()
+        .chain(recallable.iter())
+        .map(|r| ContextBudget::estimate_tokens(&r.value))
+        .sum();
+    let injected = resident.len() + recallable.len();
+    stable.extend(resident);
+    stable.extend(recallable);
+    (injected, total - injected, injected_tokens)
+}
+
 /// C2: 召回上下文（三层召回结果）
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct RecallContext {
@@ -882,7 +975,7 @@ impl ContextBudget {
     ///   经验值只对 ASCII 成立。
     /// - 本实现：ASCII 按 chars/4（英文行为不变），非 ASCII（CJK 为主）
     ///   按 1 token/字计，消除中文预算超发。确定性、零依赖、可复现。
-    fn estimate_tokens(text: &str) -> usize {
+    pub(crate) fn estimate_tokens(text: &str) -> usize {
         let mut tokens = 0usize;
         let mut ascii_run = 0usize;
         for ch in text.chars() {
@@ -2261,6 +2354,24 @@ impl MemoryManager {
             {
                 let usage = self.usage_pending.lock().unwrap_or_else(|p| p.into_inner());
                 sort_by_policy(&mut ctx.stable, goal, &policy, Some(&usage));
+                // design-83/85：判据式常驻层 + 召回层绝对帽（注入瘦身）——
+                // 排序后分层，常驻面置前（下游比例预算只切召回层尾），
+                // 召回层按 sort_by_policy 序取前缀至 stable_cap_tokens。
+                let (injected, trimmed, tokens) = layerize_stable(
+                    &mut ctx.stable,
+                    &usage,
+                    &policy,
+                    &mut ctx.degradation_notices,
+                );
+                // 观测面（design-83 §四）：每轮注入条数/总量/token 落日志，
+                // 帽值复盘（每 50 轮）以此为准。
+                tracing::info!(
+                    facts_injected = injected,
+                    facts_trimmed = trimmed,
+                    stable_tokens = tokens,
+                    stable_cap_tokens = policy.stable_cap_tokens,
+                    "stable facts injection budgeted"
+                );
             }
         }
 
@@ -4215,6 +4326,179 @@ mod tests {
         ];
         sort_by_policy(&mut flipped, goal, &legacy, None);
         assert_eq!(flipped[0].key, "stable.llm.m.used");
+    }
+
+    // ===== Stable Facts 注入瘦身（design-83/85：绝对帽 8K + 判据式常驻）=====
+
+    /// layerize 测试夹具：默认策略（帽 8000/常驻阈 0.8/晋升 3 次×0.5）
+    fn layerize_policy() -> crate::agent::recipe::RetrievalPolicy {
+        crate::agent::recipe::RetrievalPolicy::from_recipe(
+            &crate::agent::recipe::MemoryRecipe::default(),
+        )
+    }
+
+    #[test]
+    fn test_layerize_resident_predicates() {
+        // 判据式常驻：system 恒常驻；user conf≥0.8 常驻；user conf<0.8 且
+        // usage<3 不常驻（落召回层）；user 晋升（usage≥3 且 conf≥0.5）常驻；
+        // llm 域永不常驻（design-85 表格：召回层含 stable.llm.*）。
+        let policy = layerize_policy();
+        let mk = |key: &str, ts: u64, conf: Option<f32>, usage: u32, fid: Option<u64>| {
+            let mut r = MemoryRecord::new(key, "内容", ts);
+            r.confidence = conf;
+            r.usage_count = usage;
+            r.fact_id = fid;
+            r
+        };
+        let mut stable = vec![
+            mk("stable.system.boundary", 1, Some(0.3), 0, None),
+            mk("stable.user.prefs", 2, Some(0.9), 0, None),
+            mk("stable.user.lowconf", 3, Some(0.6), 1, Some(11)),
+            mk("stable.user.promoted", 4, Some(0.5), 3, Some(12)),
+            mk("stable.llm.extracted", 5, Some(0.99), 99, None),
+        ];
+        let usage = std::collections::HashMap::new();
+        let mut notices = Vec::new();
+        let (injected, trimmed, _tokens) =
+            layerize_stable(&mut stable, &usage, &policy, &mut notices);
+        // 常驻 3：system.boundary + user.prefs + user.promoted（晋升）
+        assert_eq!(
+            stable
+                .iter()
+                .take(3)
+                .map(|r| r.key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "stable.system.boundary",
+                "stable.user.prefs",
+                "stable.user.promoted"
+            ],
+            "常驻面置前：system 恒常驻、user 高置信、user 晋升"
+        );
+        assert_eq!(injected, 5, "常驻 3 条 + 召回层 2 条 = 注入 5");
+        assert_eq!(trimmed, 0, "总量远低于帽，零截断");
+        assert!(
+            !notices.iter().any(|n| n.contains("召回层裁剪")),
+            "无截断不得有裁剪通知: {notices:?}"
+        );
+        // llm 高置信高使用也不常驻（design-85：常驻晋升只适用 system/user）
+        assert_eq!(stable[4].key, "stable.llm.extracted", "llm 层落召回尾部");
+    }
+
+    #[test]
+    fn test_layerize_absolute_cap_decoupled_from_window() {
+        // 绝对帽与模型窗口解耦：召回层按排序序截到帽内；常驻面全保；
+        // 截断留痕 degradation_notices（design-83 验收判据②）。
+        let policy = layerize_policy();
+        assert_eq!(policy.stable_cap_tokens, 8000, "首版帽=8000");
+        let mk = |i: usize| {
+            let mut r = MemoryRecord::new(
+                &format!("stable.llm.bulk.{i:03}"),
+                // 每条 ~2048 token（8192 ASCII chars/4）→ 5 条即超 8K
+                &"x".repeat(8192),
+                100 + i as u64,
+            );
+            r.fact_id = Some(1000 + i as u64);
+            r
+        };
+        let mut stable: Vec<MemoryRecord> = (0..10).map(mk).collect();
+        // 排序先行（截断即优先淘汰低价值条目——design-85 帽满语义）
+        sort_by_policy(&mut stable, "", &policy, None);
+        let usage = std::collections::HashMap::new();
+        let mut notices = Vec::new();
+        let (injected, trimmed, tokens) =
+            layerize_stable(&mut stable, &usage, &policy, &mut notices);
+        assert!(
+            tokens <= 8000 + 2048,
+            "注入 token ≤ 帽+尾条超量（前缀截取语义）: {tokens}"
+        );
+        assert!(trimmed > 0, "超帽必有截断");
+        assert_eq!(injected + trimmed, 10, "注入+截断=总量");
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("召回层裁剪") && n.contains("8000")),
+            "截断须留痕并点名绝对帽: {notices:?}"
+        );
+        // 确定性双跑（design-83 验收判据①）：同输入逐位一致
+        let mut stable2: Vec<MemoryRecord> = (0..10).map(mk).collect();
+        sort_by_policy(&mut stable2, "", &policy, None);
+        let mut notices2 = Vec::new();
+        layerize_stable(&mut stable2, &usage, &policy, &mut notices2);
+        let keys1: Vec<&str> = stable.iter().map(|r| r.key.as_str()).collect();
+        let keys2: Vec<&str> = stable2.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys1, keys2, "同输入双跑注入集逐位一致");
+    }
+
+    #[test]
+    fn test_layerize_promotion_logged_and_pending_aware() {
+        // 晋升门消费 usage_count+pending（与排序同口径）；晋升只对 user 域生效。
+        // 行为判别器：帽压到 1 token → 召回层全灭，唯一存活途径=常驻面
+        // （判别与排序权重解耦——authority/置信/新鲜度如何排序都不影响结论）。
+        let mut policy = layerize_policy();
+        policy.stable_cap_tokens = 1;
+        let mk = |key: &str, ts: u64, conf: Option<f32>, usage: u32, fid: Option<u64>| {
+            let mut r = MemoryRecord::new(key, "内容", ts);
+            r.confidence = conf;
+            r.usage_count = usage;
+            r.fact_id = fid;
+            r
+        };
+        // pending 2 + 存量 1 = 3 ≥ k(3)：与 conf 联合判定晋升
+        let mut pending = std::collections::HashMap::new();
+        pending.insert(9u64, 2u32);
+        let run = |target: MemoryRecord, usage: &std::collections::HashMap<u64, u32>| {
+            let mut stable = vec![
+                mk("stable.system.anchor", 2, Some(0.3), 0, None),
+                target,
+                mk("stable.llm.filler", 500, Some(0.9), 0, None),
+            ];
+            let mut notices = Vec::new();
+            layerize_stable(&mut stable, usage, &policy, &mut notices);
+            stable
+                .iter()
+                .map(|r| r.key.clone())
+                .collect::<Vec<String>>()
+        };
+
+        // user conf=0.5 + usage 达门槛 → 晋升常驻 → 召回层全灭仍存活
+        let keys = run(mk("stable.user.hot", 1, Some(0.5), 1, Some(9)), &pending);
+        assert!(
+            keys.contains(&"stable.user.hot".to_string()),
+            "pending+存量达门槛即晋升常驻: {keys:?}"
+        );
+        // user conf=0.4（低于晋升阈）→ 不晋升 → 召回层全灭即消失
+        let keys = run(mk("stable.user.cold", 1, Some(0.4), 1, Some(9)), &pending);
+        assert!(
+            !keys.contains(&"stable.user.cold".to_string()),
+            "置信低于晋升阈不晋升: {keys:?}"
+        );
+        // llm 域双达标（conf 0.9 + usage 99）也不晋升——晋升只适用 system/user
+        // （design-85 晋升子句；llm 层恒属召回层，由帽管束）
+        let keys = run(mk("stable.llm.hot", 1, Some(0.9), 99, Some(9)), &pending);
+        assert!(
+            !keys.contains(&"stable.llm.hot".to_string()),
+            "llm 域不参与常驻晋升: {keys:?}"
+        );
+        // system 锚恒常驻：任何场景都存活
+        assert!(
+            keys.contains(&"stable.system.anchor".to_string()),
+            "system 恒常驻"
+        );
+    }
+
+    #[test]
+    fn test_budget_config_defaults_and_recipe_roundtrip() {
+        // Recipe 配置面：缺省=8000/0.8/3/0.5；旧配方 JSON（无新字段）serde
+        // 缺省补齐——配置面宽容语义（零迁移）。
+        let json = r#"{"recipe_version":"memory-v1.0","retrieval":{},"lifecycle":{},"budget":{}}"#;
+        let r: crate::agent::recipe::MemoryRecipe = serde_json::from_str(json).unwrap();
+        assert_eq!(r.budget.stable_cap_tokens, 8000);
+        assert!((r.budget.resident_user_min_confidence - 0.8).abs() < 1e-6);
+        assert_eq!(r.budget.resident_promotion_uses, 3);
+        assert!((r.budget.resident_promotion_confidence - 0.5).abs() < 1e-6);
+        let policy = crate::agent::recipe::RetrievalPolicy::from_recipe(&r);
+        assert_eq!(policy.stable_cap_tokens, 8000, "策略面贯穿 Recipe 帽值");
     }
 
     #[test]
