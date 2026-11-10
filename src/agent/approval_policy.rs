@@ -371,6 +371,19 @@ impl ApprovalCallback for PolicyReview {
                     }
                     mech.push(e);
                 }
+                PolicyCondition::PathPrefix { prefixes, .. } => {
+                    let (pass, evidence) = eval_path_prefix(prefixes, &req.args);
+                    let e = MechEntry {
+                        id,
+                        kind: "path_prefix",
+                        pass,
+                        evidence,
+                    };
+                    if !e.pass {
+                        failed.push(e.clone());
+                    }
+                    mech.push(e);
+                }
                 PolicyCondition::Verify { spec, .. } => verify_conds.push((id, spec)),
             }
         }
@@ -712,6 +725,15 @@ pub enum PolicyCondition {
         /// 排除词（子串包含判定，大小写归一）
         terms: Vec<String>,
     },
+    /// 路径前缀白名单（机械层：args 中路径语义键识别出的路径值须全部落在
+    /// 白名单前缀内；任一越界=不符，零识别路径=不符——fail-closed 防参数
+    /// 键名漂移导致条件静默失效）
+    PathPrefix {
+        /// 人类可读描述
+        text: String,
+        /// 白名单路径前缀（分隔符/大小写归一后前缀比对）
+        prefixes: Vec<String>,
+    },
     /// 外部可执行验证锚点（验证层：serve 侧执行验证命令，不经 shell）
     Verify {
         /// 人类可读描述
@@ -728,6 +750,7 @@ impl PolicyCondition {
             Self::Natural(_) => "natural",
             Self::Match { .. } => "match",
             Self::Exclude { .. } => "exclude",
+            Self::PathPrefix { .. } => "path_prefix",
             Self::Verify { .. } => "verify",
         }
     }
@@ -736,18 +759,20 @@ impl PolicyCondition {
     pub fn text(&self) -> &str {
         match self {
             Self::Natural(s) => s,
-            Self::Match { text, .. } | Self::Exclude { text, .. } | Self::Verify { text, .. } => {
-                text
-            }
+            Self::Match { text, .. }
+            | Self::Exclude { text, .. }
+            | Self::PathPrefix { text, .. }
+            | Self::Verify { text, .. } => text,
         }
     }
 
-    /// 机械实判（match/exclude 条目专用；其余形态返回 None——
+    /// 机械实判（match/exclude/path_prefix 条目专用；其余形态返回 None——
     /// verify 条目由验证层执行、NL 条目交 LLM 兜底）
     pub fn evaluate_mechanical(&self, args: &serde_json::Value) -> Option<(bool, String)> {
         match self {
             Self::Match { patterns, .. } => Some(eval_match(patterns, args)),
             Self::Exclude { terms, .. } => Some(eval_exclude(terms, args)),
+            Self::PathPrefix { prefixes, .. } => Some(eval_path_prefix(prefixes, args)),
             _ => None,
         }
     }
@@ -770,23 +795,36 @@ impl PolicyCondition {
             toml::Value::String(s) => Ok(PolicyCondition::Natural(s)),
             toml::Value::Table(t) => {
                 for k in t.keys() {
-                    if !matches!(k.as_str(), "text" | "match" | "exclude" | "verify") {
+                    if !matches!(
+                        k.as_str(),
+                        "text" | "match" | "exclude" | "verify" | "path_prefix"
+                    ) {
                         return Err(format!(
-                            "unknown condition field '{k}' (accepted: text / match / exclude / verify)"
+                            "unknown condition field '{k}' (accepted: text / match / exclude / verify / path_prefix)"
                         ));
                     }
                 }
                 let sc: StructuredCondition =
                     StructuredCondition::deserialize(toml::Value::Table(t))
                         .map_err(|e| format!("condition: {e}"))?;
-                if sc.verify.is_some() && (!sc.match_patterns.is_empty() || !sc.exclude.is_empty())
-                {
+                let has_verify = sc.verify.is_some();
+                let declared_kinds = [
+                    !sc.match_patterns.is_empty(),
+                    !sc.exclude.is_empty(),
+                    !sc.path_prefix.is_empty(),
+                    has_verify,
+                ]
+                .iter()
+                .filter(|b| **b)
+                .count();
+                if declared_kinds > 1 {
                     return Err(
-                        "verify cannot be combined with match/exclude in the same condition"
+                        "match / exclude / path_prefix / verify cannot be combined in the same condition"
                             .to_string(),
                     );
                 }
-                if let Some(spec) = sc.verify {
+                if has_verify {
+                    let spec = sc.verify.expect("checked above");
                     return Ok(PolicyCondition::Verify {
                         text: sc.text,
                         spec,
@@ -804,7 +842,16 @@ impl PolicyCondition {
                         terms: sc.exclude,
                     });
                 }
-                Err("condition table must declare one of match / exclude / verify".to_string())
+                if !sc.path_prefix.is_empty() {
+                    return Ok(PolicyCondition::PathPrefix {
+                        text: sc.text,
+                        prefixes: sc.path_prefix,
+                    });
+                }
+                Err(
+                    "condition table must declare one of match / exclude / path_prefix / verify"
+                        .to_string(),
+                )
             }
             _ => Err("condition must be a string or a table".to_string()),
         }
@@ -822,6 +869,9 @@ struct StructuredCondition {
     /// 词法排除词
     #[serde(default)]
     exclude: Vec<String>,
+    /// 路径前缀白名单（TOML 键 `path_prefix`）
+    #[serde(default)]
+    path_prefix: Vec<String>,
     /// 外部验证器
     #[serde(default)]
     verify: Option<VerifySpec>,
@@ -1029,6 +1079,97 @@ fn eval_exclude(terms: &[String], args: &serde_json::Value) -> (bool, String) {
     (true, "无排除词命中".to_string())
 }
 
+/// 路径语义键显式清单（`path_prefix` 机械求值的识别面；键名小写归一比对。
+/// 清单外键名不识别——宁可判不符交修正，不做键名猜测）
+const PATH_SEMANTIC_KEYS: &[&str] = &[
+    "path",
+    "file_path",
+    "file",
+    "target",
+    "target_path",
+    "new_path",
+    "old_path",
+    "dest",
+    "destination",
+    "dir",
+    "directory",
+    "root",
+    "workspace",
+    "folder",
+];
+
+/// 路径归一：分隔符统一为 `/` + 小写（Windows 大小写容忍）；前缀与参数值
+/// 两侧同规归一后前缀比对
+fn normalize_path(s: &str) -> String {
+    s.replace('\\', "/").to_lowercase()
+}
+
+/// 收集 args 中路径语义键下的字符串叶子值（递归对象与数组；键名小写归一
+/// 后命中 [`PATH_SEMANTIC_KEYS`] 才收集）
+fn collect_path_values(value: &serde_json::Value, key_hint: &str, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => {
+            let k = key_hint.to_lowercase();
+            if PATH_SEMANTIC_KEYS.contains(&k.as_str()) {
+                out.push(s.clone());
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_path_values(item, key_hint, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                collect_path_values(v, k, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 路径前缀白名单机械求值：args 中路径语义键识别出的路径值逐个归一化后
+/// 须命中至少一个前缀——任一越界=不符（修正指令携越界值证据）；**零识别
+/// 路径=不符**（fail-closed：防参数键名漂移导致条件静默失效，与 match
+/// 「零命中=不符」同型）
+fn eval_path_prefix(prefixes: &[String], args: &serde_json::Value) -> (bool, String) {
+    let mut paths = Vec::new();
+    collect_path_values(args, "", &mut paths);
+    if paths.is_empty() {
+        return (
+            false,
+            format!(
+                "参数中未识别到任何路径语义键（识别面: {}）——条件按不符处理（fail-closed）",
+                PATH_SEMANTIC_KEYS.join(", ")
+            ),
+        );
+    }
+    let norm_prefixes: Vec<String> = prefixes.iter().map(|p| normalize_path(p)).collect();
+    for p in &paths {
+        let norm = normalize_path(p);
+        if !norm_prefixes
+            .iter()
+            .any(|pre| norm.starts_with(pre.as_str()))
+        {
+            return (
+                false,
+                format!(
+                    "路径 \"{p}\" 越出白名单前缀（prefixes: {}）",
+                    prefixes.join(", ")
+                ),
+            );
+        }
+    }
+    (
+        true,
+        format!(
+            "{} 项路径全部命中白名单前缀（{}）",
+            paths.len(),
+            prefixes.join(", ")
+        ),
+    )
+}
+
 /// 机械/验证层单条求值结果（留痕 seal 的 mechanical 数组要素）
 #[derive(Debug, Clone)]
 struct MechEntry {
@@ -1155,6 +1296,26 @@ impl ApprovalPolicyFile {
             .get(tool)
             .map(|g| g.conditions.as_slice())
             .unwrap_or(&[])
+    }
+}
+
+/// 工具→审批组归面单源（每组档位键 `approval.mode.<group>` 的路由依据；
+/// 每工具/组三档设计意图的落地面）
+///
+/// - `shell_exec` → `shellExec`（既有会话缺省键，语义不变）
+/// - 文件写族（file_write/file_create/file_move/file_edit/write_file/edit_file）
+///   → `fileEdit`
+/// - `file_delete` → `fileDelete`（注意：该工具恒命中不可逆删除红线——
+///   任何档位仍先过红线闸强制人工，组档位只在豁免显式开启后生效）
+/// - 其余工具 → `None`（回落会话缺省档位=shellExec 键，缺省不变式）
+pub fn tool_group(tool: &str) -> Option<&'static str> {
+    match tool {
+        "shell_exec" => Some("shellExec"),
+        "file_write" | "file_create" | "file_move" | "file_edit" | "write_file" | "edit_file" => {
+            Some("fileEdit")
+        }
+        "file_delete" => Some("fileDelete"),
+        _ => None,
     }
 }
 
@@ -2050,7 +2211,7 @@ conditions = [
             .unwrap_err();
         assert!(err
             .to_string()
-            .contains("must declare one of match / exclude / verify"));
+            .contains("must declare one of match / exclude / path_prefix / verify"));
     }
 
     #[test]
@@ -2429,5 +2590,127 @@ conditions = [
         assert!(!REVIEW_SYSTEM_PROMPT.contains("先例"));
         assert!(REVIEW_SYSTEM_PROMPT.contains("两源"));
         assert!(REVIEW_SYSTEM_PROMPT.contains("机械可核验条件"));
+    }
+
+    // ==== path_prefix 条件类型（机械层新属）====
+
+    /// 表形态装载：path_prefix 解析为 PathPrefix 变体，kind/text 留痕面正确
+    #[test]
+    fn schema_parses_path_prefix_condition() {
+        let file = ApprovalPolicyFile::from_toml(
+            "[file_edit]\nconditions = [{ text = \"仅工作区内\", path_prefix = [\"D:/work\"] }]",
+        )
+        .expect("valid policy");
+        let conds = file.conditions_for("file_edit");
+        assert_eq!(conds.len(), 1);
+        match &conds[0] {
+            PolicyCondition::PathPrefix { text, prefixes } => {
+                assert_eq!(text, "仅工作区内");
+                assert_eq!(prefixes, &["D:/work".to_string()]);
+            }
+            other => panic!("expected PathPrefix, got: {other:?}"),
+        }
+        assert_eq!(conds[0].kind(), "path_prefix");
+        assert_eq!(conds[0].text(), "仅工作区内");
+    }
+
+    /// 装载期拒载面：机械键混用（path_prefix 与 match/exclude/verify 同条）拒绝
+    #[test]
+    fn schema_rejects_path_prefix_mixed_with_other_kinds() {
+        let err = ApprovalPolicyFile::from_toml(
+            "[shell_exec]\nconditions = [{ text = \"x\", match = [\"a*\"], path_prefix = [\"D:/w\"] }]",
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot be combined in the same condition"));
+        let err = ApprovalPolicyFile::from_toml(
+            "[shell_exec]\nconditions = [{ text = \"x\", exclude = [\"b\"], path_prefix = [\"D:/w\"] }]",
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot be combined in the same condition"));
+        let err = ApprovalPolicyFile::from_toml(
+            "[shell_exec]\nconditions = [{ text = \"x\", verify = { cmd = \"cargo check\" }, path_prefix = [\"D:/w\"] }]",
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot be combined in the same condition"));
+    }
+
+    /// 空条件表错误文案更新回归：四机械键全缺的新文案
+    #[test]
+    fn schema_empty_condition_message_lists_path_prefix() {
+        let err = ApprovalPolicyFile::from_toml("[shell_exec]\nconditions = [{ text = \"x\" }]")
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("must declare one of match / exclude / path_prefix / verify"));
+    }
+
+    /// path_prefix 机械求值真值表：
+    /// 命中/越界/零识别路径/归一化（分隔符+大小写）/路径语义键识别面/嵌套数组
+    #[test]
+    fn path_prefix_truth_table() {
+        let cond = PolicyCondition::PathPrefix {
+            text: "仅工作区内".to_string(),
+            prefixes: vec!["D:/work".to_string(), "./out".to_string()],
+        };
+        // 命中（path 语义键 + 分隔符/大小写归一：反斜杠、大写盘符）
+        let (pass, ev) = cond
+            .evaluate_mechanical(&json!({"path": "d:\\WORK\\src\\main.rs"}))
+            .unwrap();
+        assert!(pass, "normalized backslash+case should hit: {ev}");
+        // 越界=不符（evidence 携越界路径）
+        let (pass, ev) = cond
+            .evaluate_mechanical(&json!({"path": "C:/elsewhere/x.rs"}))
+            .unwrap();
+        assert!(!pass);
+        assert!(ev.contains("C:/elsewhere/x.rs"));
+        // 零识别路径=不符（fail-closed：键名不在语义键清单）
+        let (pass, ev) = cond
+            .evaluate_mechanical(&json!({"command": "echo hi", "blob": "D:/work/a.rs"}))
+            .unwrap();
+        assert!(!pass, "non-path keys must not satisfy path_prefix");
+        assert!(ev.contains("未识别到任何路径语义键"));
+        // file_path 语义键识别
+        let (pass, _) = cond
+            .evaluate_mechanical(&json!({"file_path": "D:/work/a.rs"}))
+            .unwrap();
+        assert!(pass);
+        // 嵌套对象/数组形态下的路径值收集（语义键下数组）
+        let (pass, _) = cond
+            .evaluate_mechanical(&json!({"path": ["D:/work/a.rs", "D:/work/b.rs"]}))
+            .unwrap();
+        assert!(pass);
+        // 数组中一项越界=整体不符
+        let (pass, _) = cond
+            .evaluate_mechanical(&json!({"path": ["D:/work/a.rs", "D:/nope/b.rs"]}))
+            .unwrap();
+        assert!(!pass);
+        // 空前缀清单装载即拒（全缺报错面）
+        let err = ApprovalPolicyFile::from_toml(
+            "[shell_exec]\nconditions = [{ text = \"x\", path_prefix = [] }]",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must declare one of"));
+    }
+
+    /// 工具组归面单源：三组键映射+未列名工具回落 None（会话缺省）
+    #[test]
+    fn tool_group_classification() {
+        assert_eq!(tool_group("shell_exec"), Some("shellExec"));
+        assert_eq!(tool_group("file_write"), Some("fileEdit"));
+        assert_eq!(tool_group("file_create"), Some("fileEdit"));
+        assert_eq!(tool_group("file_move"), Some("fileEdit"));
+        assert_eq!(tool_group("file_edit"), Some("fileEdit"));
+        assert_eq!(tool_group("write_file"), Some("fileEdit"));
+        assert_eq!(tool_group("edit_file"), Some("fileEdit"));
+        assert_eq!(tool_group("file_delete"), Some("fileDelete"));
+        assert_eq!(tool_group("file_read"), None);
+        assert_eq!(tool_group("grep_files"), None);
+        assert_eq!(tool_group("workspace_undo"), None);
     }
 }

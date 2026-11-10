@@ -1753,8 +1753,9 @@ async fn run_agent(
             runner.with_approval_callback(callback)
         }
         Some("policy") => {
+            // 强制 policy 档=显式档位覆写(定义级同权),组档位键不生效
             let (approval_callback, runaway_policy) =
-                crate::api::ws_handler::build_approval_callback(&state, Some("policy"));
+                crate::api::ws_handler::build_approval_callback(&state, Some("policy"), true);
             runner
                 .with_approval_callback(approval_callback)
                 .with_runaway_policy(runaway_policy)
@@ -2160,11 +2161,15 @@ async fn run_agent_stream(
     // 补接前本端点为 auto_policy/其余二元路由,policy 档静默降 manual=缺口):
     // build_approval_callback 三态一次判别双产出——auto_policy=PolicyApproval/
     // policy=PolicyReview 评审式+Runaway 护栏策略(本端点消费 run_streaming,
-    // 护栏挂点随之生效)/其余=HttpApproval 60s 人工审批窗(manual 态现状行为)
+    // 护栏挂点随之生效)/其余=HttpApproval 60s 人工审批窗(manual 态现状行为);
+    // 组档位键(approval.mode.fileEdit/fileDelete)在 def 未指定时生效
     let resolved_mode =
         crate::api::ws_handler::resolve_approval_mode(&state, def.approval_mode.as_deref());
-    let (approval_callback, runaway_policy) =
-        crate::api::ws_handler::build_approval_callback(&state, resolved_mode.as_deref());
+    let (approval_callback, runaway_policy) = crate::api::ws_handler::build_approval_callback(
+        &state,
+        resolved_mode.as_deref(),
+        def.approval_mode.is_some(),
+    );
     // 39 号项 A:项目记忆段(AGENTS.md 层级,随 serve workdir 解析)
     let agents_md = crate::agent::runner::load_agents_md_segment(state.workdir());
     // checkpoint 写域与写面工具同源:def move 前捕获声明边界判据(同

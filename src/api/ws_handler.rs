@@ -50,6 +50,9 @@
 
 #![forbid(unsafe_code)]
 
+use crate::agent::translator::UserImageRef;
+use crate::agent::{AgentError, AgentEvent, AgentRunner, MemoryManager};
+use crate::api::agent_api::AgentApiState;
 use axum::{
     extract::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
@@ -64,9 +67,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::agent::translator::UserImageRef;
-use crate::agent::{AgentError, AgentEvent, AgentRunner, MemoryManager};
-use crate::api::agent_api::AgentApiState;
+use async_trait::async_trait;
 
 // =============================================================================
 // Query / 消息协议类型
@@ -756,7 +757,126 @@ pub(crate) fn resolve_approval_mode(
     }
 }
 
+/// 组档位设置键解析:每工具组档位键(`approval.mode.fileEdit` /
+/// `approval.mode.fileDelete`)的读取面。合法值域与会话缺省键同域;
+/// 未设/非法值 → None(回落会话缺省档位,缺省不变式)。
+fn resolve_group_mode_override(state: &AgentApiState, key: &str) -> Option<String> {
+    let (merged, _) = state.workbench_settings().merged();
+    let v = merged
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    match v {
+        "manual" | "auto_policy" | "policy" | "plan" | "workspace" | "yolo" => Some(v.to_string()),
+        _ => None,
+    }
+}
+
+/// 每组档位路由器:per-request 按 [`crate::agent::approval_policy::tool_group`]
+/// 归面路由到该组的回调栈。仅在组档位与会话缺省出现差异时装配
+/// (全同=单栈直连,装配与行为零变化);路由决策 per-request 留痕(审计同权)。
+struct GroupedApproval {
+    /// 会话缺省栈(未列名工具/shellExec 组/未装配差异组的回落面)
+    default: Arc<dyn crate::agent::approval::ApprovalCallback>,
+    /// 文件写族组栈(fileEdit 键生效时)
+    file_edit: Option<Arc<dyn crate::agent::approval::ApprovalCallback>>,
+    /// 文件删除组栈(fileDelete 键生效时;注意该组恒先过不可逆删除红线闸)
+    file_delete: Option<Arc<dyn crate::agent::approval::ApprovalCallback>>,
+}
+
+#[async_trait]
+impl crate::agent::approval::ApprovalCallback for GroupedApproval {
+    async fn request_approval(
+        &self,
+        req: &crate::agent::approval::ApprovalRequest,
+    ) -> crate::agent::approval::ApprovalDecision {
+        let group = crate::agent::approval_policy::tool_group(&req.tool_name);
+        let stack = match group {
+            Some("fileEdit") => self.file_edit.as_ref(),
+            Some("fileDelete") => self.file_delete.as_ref(),
+            _ => None,
+        };
+        match stack {
+            Some(cb) => {
+                info!(
+                    tool = %req.tool_name,
+                    group = group.unwrap_or("default"),
+                    "approval routed to per-group mode stack"
+                );
+                cb.request_approval(req).await
+            }
+            None => self.default.request_approval(req).await,
+        }
+    }
+}
+
 pub(crate) fn build_approval_callback(
+    state: &AgentApiState,
+    mode: Option<&str>,
+    def_override: bool,
+) -> (
+    Arc<dyn crate::agent::approval::ApprovalCallback>,
+    Option<crate::agent::runner::RunawayPolicy>,
+) {
+    // 每组档位扩面:文件写族/文件删除组的独立档位键。来源优先序=定义级
+    // approval_mode > 组档位键 > shellExec 会话缺省键——def 指定时(def_override)
+    // 组键不生效(行为与既有语义一致);其余情况下组键覆盖会话缺省。
+    let file_edit_override = resolve_group_mode_override(state, "approval.mode.fileEdit");
+    let file_delete_override = resolve_group_mode_override(state, "approval.mode.fileDelete");
+    let session_default = mode.map(|m| m.to_string());
+    let needs_router =
+        !def_override && (file_edit_override.is_some() || file_delete_override.is_some());
+    if !needs_router {
+        return build_mode_callback(state, mode);
+    }
+
+    // 差异装配:逐组构建独立回调栈(组键未设的组回落会话缺省栈)。
+    // Runaway 护栏取首个 policy 组产出(各 policy 组共享同一份条件文件,
+    // 护栏形态同源)。
+    let (default_cb, runaway) = build_mode_callback(state, session_default.as_deref());
+    let mut runaway = runaway;
+    let mut file_edit_stack: Option<Arc<dyn crate::agent::approval::ApprovalCallback>> = None;
+    if let Some(m) = file_edit_override.as_deref() {
+        // None 会话缺省 = workspace 缺省语义装配,与显式 manual 装配不同——
+        // 按解析值整体比较,None ≠ Some("manual") 须建独立栈
+        if session_default.as_deref() != Some(m) {
+            let (cb, r) = build_mode_callback(state, Some(m));
+            if runaway.is_none() {
+                runaway = r;
+            }
+            file_edit_stack = Some(cb);
+        }
+    }
+    let mut file_delete_stack: Option<Arc<dyn crate::agent::approval::ApprovalCallback>> = None;
+    if let Some(m) = file_delete_override.as_deref() {
+        if session_default.as_deref() != Some(m) {
+            let (cb, r) = build_mode_callback(state, Some(m));
+            if runaway.is_none() {
+                runaway = r;
+            }
+            file_delete_stack = Some(cb);
+        }
+    }
+    info!(
+        file_edit = ?file_edit_override,
+        file_delete = ?file_delete_override,
+        "per-group approval modes active: installing grouped routing callback"
+    );
+    (
+        Arc::new(GroupedApproval {
+            default: default_cb,
+            file_edit: file_edit_stack,
+            file_delete: file_delete_stack,
+        }),
+        runaway,
+    )
+}
+
+/// 单档位回调栈构建原语(会话缺省档位或单组档位的统一装配面;
+/// 每工具组档位扩面前的 [`build_approval_callback`] 全文原样迁入,
+/// 各档位装配逻辑逐位未动)
+fn build_mode_callback(
     state: &AgentApiState,
     mode: Option<&str>,
 ) -> (
@@ -988,10 +1108,11 @@ async fn construct_runner(
     };
     // G8 审批决策端 + Runaway 护栏:同一次 mode 判别/文件加载
     // 双产出(决策端挂 ApprovalCallback,护栏策略挂 with_runaway_policy)
-    // 档位解析单源:定义级优先,未指定回落设置键 approval.mode.shellExec
+    // 档位解析单源:定义级优先,未指定回落设置键 approval.mode.shellExec;
+    // 组档位键(approval.mode.fileEdit/fileDelete)在 def 未指定时生效
     let resolved_mode = resolve_approval_mode(state, def.approval_mode.as_deref());
     let (approval_callback, runaway_policy) =
-        build_approval_callback(state, resolved_mode.as_deref());
+        build_approval_callback(state, resolved_mode.as_deref(), def.approval_mode.is_some());
     let mut runner = AgentRunner::new(config, state.evorule_client().clone())
         // LLM handler 统一解析产物下放(与 HTTP 端点/CLI 同口径:env 优先、
         // toml 兜底)——缺这步 runner 落 with_defaults 4096 硬兜底,推理模型
@@ -1371,6 +1492,7 @@ pub fn agent_event_json_line(event: Result<AgentEvent, AgentError>, pretty: bool
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use crate::agent::approval::ApprovalCallback;
 
     // ===== 轮次终态帧保证(转发泵兜底) =====
 
@@ -1527,6 +1649,104 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolve_approval_mode(&state, None), None);
+    }
+
+    /// 组档位键解析面:合法三值计入,未设/非法值回落 None(缺省不变式)
+    #[test]
+    fn resolve_group_mode_override_reads_and_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("data").join("workbench_settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings_path,
+            r#"{"approval.mode.fileEdit": "policy", "approval.mode.fileDelete": "bogus"}"#,
+        )
+        .unwrap();
+        let state = resolver_state(dir.path());
+        assert_eq!(
+            resolve_group_mode_override(&state, "approval.mode.fileEdit"),
+            Some("policy".to_string())
+        );
+        assert_eq!(
+            resolve_group_mode_override(&state, "approval.mode.fileDelete"),
+            None,
+            "非法值不计入,回落会话缺省"
+        );
+    }
+
+    /// 组路由器 per-request 路由面:文件写族→fileEdit 栈、file_delete→
+    /// fileDelete 栈、未列名工具与未装配组回落会话缺省栈(路由决策以各栈
+    /// reason 标记区分)
+    #[tokio::test]
+    async fn grouped_approval_routes_per_tool_group() {
+        struct TagCallback(&'static str);
+        #[async_trait]
+        impl crate::agent::approval::ApprovalCallback for TagCallback {
+            async fn request_approval(
+                &self,
+                _req: &crate::agent::approval::ApprovalRequest,
+            ) -> crate::agent::approval::ApprovalDecision {
+                crate::agent::approval::ApprovalDecision {
+                    approved: true,
+                    approver: "auto".to_string(),
+                    verified: false,
+                    reason: self.0.to_string(),
+                    auto_rejected: false,
+                    verdict_json: None,
+                }
+            }
+        }
+        fn req(tool: &str) -> crate::agent::approval::ApprovalRequest {
+            crate::agent::approval::ApprovalRequest {
+                session_id: "s".to_string(),
+                tool_name: tool.to_string(),
+                args: serde_json::json!({"path": "D:/work/a.rs"}),
+                command: tool.to_string(),
+                risk: String::new(),
+                alternative: String::new(),
+                proposal_id: "p".to_string(),
+                host_execution: false,
+            }
+        }
+        let router = GroupedApproval {
+            default: std::sync::Arc::new(TagCallback("default")),
+            file_edit: Some(std::sync::Arc::new(TagCallback("file-edit"))),
+            file_delete: Some(std::sync::Arc::new(TagCallback("file-delete"))),
+        };
+        assert_eq!(
+            router.request_approval(&req("file_write")).await.reason,
+            "file-edit"
+        );
+        assert_eq!(
+            router.request_approval(&req("edit_file")).await.reason,
+            "file-edit"
+        );
+        assert_eq!(
+            router.request_approval(&req("file_delete")).await.reason,
+            "file-delete"
+        );
+        assert_eq!(
+            router.request_approval(&req("shell_exec")).await.reason,
+            "default"
+        );
+        assert_eq!(
+            router.request_approval(&req("file_read")).await.reason,
+            "default"
+        );
+        // 组栈未装配(键未设)→ 回落会话缺省栈
+        let partial = GroupedApproval {
+            default: std::sync::Arc::new(TagCallback("default")),
+            file_edit: None,
+            file_delete: Some(std::sync::Arc::new(TagCallback("file-delete"))),
+        };
+        assert_eq!(
+            partial.request_approval(&req("file_edit")).await.reason,
+            "default"
+        );
+        assert_eq!(
+            partial.request_approval(&req("file_delete")).await.reason,
+            "file-delete"
+        );
     }
 
     // ===== WS 主回合 runner LLM 配置兜底接线 =====
