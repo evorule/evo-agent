@@ -3404,6 +3404,7 @@ impl AgentRunner {
                     namespace: self.sediment_config.namespace.clone(),
                     session_id: session_id.to_string(),
                     archive_dir_override: None,
+                    shared_server: memory.shared_server_compaction(),
                 })
             } else {
                 None

@@ -1386,6 +1386,9 @@ pub struct MemoryManager {
     /// 存储保留期与硬配额策略（缺省 forever/compact/unlimited=清扫整体
     /// 短路零发生；判定与释放细节见 `storage_retention` 模块头）。
     retention: crate::agent::storage_retention::StorageRetentionPolicy,
+    /// 服务端共享账压实调度档（缺省 off=零动作；清扫轮尾部调度 marker，
+    /// 共享事实物理释放经服务端压实路径——agent 本地覆写不产生磁盘回收）。
+    shared_server: crate::agent::storage_retention::SharedServerCompaction,
 }
 
 /// 投影读取的三种结果（改进1：读路径"投影优先 + cache 离线兜底"）
@@ -1427,6 +1430,7 @@ impl MemoryManager {
             ),
             decay: crate::agent::memory_decay::DecayPolicy::default(),
             retention: crate::agent::storage_retention::StorageRetentionPolicy::default(),
+            shared_server: crate::agent::storage_retention::SharedServerCompaction::default(),
         }
     }
 
@@ -1499,6 +1503,27 @@ impl MemoryManager {
     /// 获取存储保留期与硬配额策略
     pub fn retention_policy(&self) -> crate::agent::storage_retention::StorageRetentionPolicy {
         self.retention.clone()
+    }
+
+    /// 设置服务端共享账压实调度档（builder 风格）
+    ///
+    /// 缺省 = [`crate::agent::storage_retention::SharedServerCompaction::Off`]
+    /// （零动作零 HTTP）；显式 archive/discard 后，非缺省清扫轮尾部调度服务端
+    /// marker（次启动生效；进程内去重）。仅清扫轮（收口钩子/启动巡检）消费，
+    /// 读路径零参与。
+    pub fn with_shared_server_compaction(
+        mut self,
+        mode: crate::agent::storage_retention::SharedServerCompaction,
+    ) -> Self {
+        self.shared_server = mode;
+        self
+    }
+
+    /// 获取服务端共享账压实调度档
+    pub fn shared_server_compaction(
+        &self,
+    ) -> crate::agent::storage_retention::SharedServerCompaction {
+        self.shared_server
     }
 
     /// 设置 session_id（可变引用）
@@ -9272,5 +9297,181 @@ mod tests {
             .with_decay_policy(decay_policy(1000));
         let result = mgr.get_scoped(MemoryScope::Shared, "topic").await.unwrap();
         assert!(result.is_none(), "TTL 优先：None 而非归档卡");
+    }
+
+    // ---- epoch 契约回归（服务端共享账压实后 version 数值跨 epoch 不连续，
+    // fact_id 唯一稳定键；equality 守卫必须感知回落，禁改单调比较）----
+
+    /// 前缀索引记录读取 mock（payload 形态=存储形态）
+    async fn mock_index_record(server: &mut mockito::Server, payload_json: &str) -> mockito::Mock {
+        let body = format!(
+            r#"[{{"version":1,"fact_id":5,"path":"__memory__.test.__prefix_index__.shared","value":{payload_json},"type":"payload_update"}}]"#
+        );
+        server
+            .mock(
+                "GET",
+                "/api/sessions/s1/facts?prefix=__memory__.test.__prefix_index__.shared",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(&body)
+            .create_async()
+            .await
+    }
+
+    async fn mock_shared_version(server: &mut mockito::Server, version: u64) -> mockito::Mock {
+        server
+            .mock("GET", "/api/shared/facts/version")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"version":{version},"history_len":{version}}}"#
+            ))
+            .create_async()
+            .await
+    }
+
+    fn index_payload_json(keys: &[&str], shared_version: u64) -> String {
+        let keys_json: Vec<String> = keys.iter().map(|k| format!("\"{k}\"")).collect();
+        format!(
+            r#"{{"kind":"memory_prefix_index","scope":"shared","v":1,"keys":[{}],"shared_version":{shared_version}}}"#,
+            keys_json.join(",")
+        )
+    }
+
+    /// 压实回落（stored=5000 vs current=7）必须判漂移 → 重建（equality 守卫
+    /// 天然感知 epoch 回落；不得改单调比较——回落通过单调守卫即假阳性方向）
+    #[tokio::test]
+    async fn epoch_version_drop_forces_index_rebuild() {
+        let mut server = mockito::Server::new_async().await;
+        let mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let _m_index = mock_index_record(&mut server, &index_payload_json(&["alpha"], 5000)).await;
+        let _m_ver = mock_shared_version(&mut server, 7).await;
+        let probe = mgr
+            .probe_shared_prefix_index("s1", "al", "__memory__.test.shared.al")
+            .await;
+        assert!(
+            matches!(
+                probe,
+                crate::agent::memory_prefix_index::PrefixIndexProbe::MissRebuildable
+            ),
+            "压实回落(建册=5000/现值=7)必须判漂移重建，不得走索引快路径"
+        );
+    }
+
+    /// 重建以当前（回落后）版本为守卫锚；重建后 equality 通过、定向读取
+    /// 权威返回 —— 索引只决定「探哪些键」，数据永远来自服务端。
+    #[tokio::test]
+    async fn epoch_rebuild_anchors_dropped_version_then_hits() {
+        use crate::agent::memory_prefix_index::PrefixIndexProbe;
+        let mut server = mockito::Server::new_async().await;
+        let mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let _m_ver = mock_shared_version(&mut server, 7).await;
+        // 重建写回：守卫锚=当前回落后版本 7（而非旧 epoch 高位值）
+        let m_write = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": "__memory__.test.__prefix_index__.shared",
+                "value": {"kind": "memory_prefix_index", "shared_version": 7, "keys": ["alpha"]}
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"fact_id":6}"#)
+            .create_async()
+            .await;
+        let entry: crate::api::evorule_client::SharedFactEntry =
+            serde_json::from_value(serde_json::json!({
+                "fact_id": 9001, "path": "shared.test.alpha",
+                "value": {"key": "alpha", "value": "v", "timestamp": 20},
+                "source_session_id": 1, "version": 3
+            }))
+            .unwrap();
+        let entries = vec![(entry, Some(MemoryRecord::new("alpha", "v", 20)))];
+        mgr.rebuild_shared_prefix_index("s1", &entries).await;
+        m_write.assert_async().await;
+        assert!(
+            !mgr.prefix_index
+                .dirty
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "重建写成功应清除脏态"
+        );
+        // 重建后探测：equality(7==7) 通过 → 区间定向读取权威返回
+        let _m_index = mock_index_record(&mut server, &index_payload_json(&["alpha"], 7)).await;
+        let _m_read = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.alpha")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"fact_id":9001,"path":"shared.test.alpha","value":{"key":"alpha","value":"v","timestamp":20},"source_session_id":1,"version":3}]"#,
+            )
+            .create_async()
+            .await;
+        let probe = mgr
+            .probe_shared_prefix_index("s1", "al", "__memory__.test.shared.al")
+            .await;
+        match probe {
+            PrefixIndexProbe::Hit(out) => {
+                assert_eq!(out.len(), 1);
+                assert_eq!(out[0].value, "v", "命中数据必须来自服务端权威读取");
+                assert_eq!(out[0].fact_id, Some(9001), "身份锚=fact_id");
+            }
+            other => panic!("重建后应命中索引快路径，got {other:?}"),
+        }
+    }
+
+    /// 索引声称在场但账面零事实（压实释放的已删键）→ 一致性失效 → 重建；
+    /// 已删键绝不复活（权威读取兜底）
+    #[tokio::test]
+    async fn epoch_stale_index_deleted_key_does_not_resurrect() {
+        use crate::agent::memory_prefix_index::PrefixIndexProbe;
+        let mut server = mockito::Server::new_async().await;
+        let mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let _m_index = mock_index_record(&mut server, &index_payload_json(&["gone"], 7)).await;
+        let _m_ver = mock_shared_version(&mut server, 7).await;
+        let _m_read = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.gone")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[]"#)
+            .create_async()
+            .await;
+        let probe = mgr
+            .probe_shared_prefix_index("s1", "gone", "__memory__.test.shared.gone")
+            .await;
+        assert!(
+            matches!(probe, PrefixIndexProbe::MissRebuildable),
+            "账面零事实=一致性失效，必须重建（键不复活）"
+        );
+    }
+
+    /// 索引维护读-改-写保留原守卫值（守卫锚刷新=rebuild 路径专属职责；
+    /// RMW 若凭空刷新锚值会在账面漂移窗口伪造一致性）
+    #[tokio::test]
+    async fn epoch_maintenance_preserves_guard_value() {
+        let mut server = mockito::Server::new_async().await;
+        let mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let _m_index = mock_index_record(&mut server, &index_payload_json(&["a"], 5000)).await;
+        let m_write = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": "__memory__.test.__prefix_index__.shared",
+                "value": {"kind": "memory_prefix_index", "shared_version": 5000, "keys": ["a", "b"]}
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"fact_id":7}"#)
+            .create_async()
+            .await;
+        mgr.maintain_shared_prefix_index(
+            "s1",
+            crate::agent::memory_prefix_index::PrefixIndexOp::Insert,
+            "b",
+        )
+        .await;
+        m_write.assert_async().await;
     }
 }

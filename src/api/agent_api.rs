@@ -813,6 +813,15 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .route("/admin/llm-model", axum::routing::post(post_llm_model))
         // G1:serve 日志环形缓冲尾部(纯内存,进程重启即清;前端控制台日志 tab 轮询)
         .route("/admin/logs", axum::routing::get(get_admin_logs))
+        // 服务端共享账压实面透传(状态+调度;正源=evorule 服务端,agent 零投影)
+        .route(
+            "/admin/shared-compaction",
+            axum::routing::get(get_shared_compaction),
+        )
+        .route(
+            "/admin/shared-compaction",
+            axum::routing::post(post_shared_compaction),
+        )
         .route("/agents", axum::routing::get(list_agents))
         .route("/agents/{agent_type}", axum::routing::get(get_agent))
         .route("/agents/{agent_type}/run", axum::routing::post(run_agent))
@@ -1318,6 +1327,62 @@ async fn get_admin_logs(
     let lines = crate::api::log_buffer::tail_lines(n);
     let count = lines.len();
     Json(serde_json::json!({ "count": count, "lines": lines }))
+}
+
+/// 服务端共享账压实状态透传（`GET /admin/shared-compaction`）。
+///
+/// 正源唯一=服务端 `/api/admin/shared/compaction`（marker 在场性+上次报告），
+/// agent 面零投影零缓存；服务端不可达/凭据不足 → 状态码直报（fail-visible，
+/// 同步面不受清扫面 fail-soft 约束）。
+async fn get_shared_compaction(State(state): State<AgentApiState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match state.evorule_client().get_shared_compaction_status().await {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({ "error": format!("服务端压实状态中继失败: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// 服务端共享账压实调度透传（`POST /admin/shared-compaction`，body `{mode}`）。
+///
+/// mode 封闭白名单 `archive|discard`（off 语义=不调度，agent 面拒绝 400）；
+/// 服务端响应原样透传（marker 次启动生效），失败 fail-visible 直报。
+async fn post_shared_compaction(
+    State(state): State<AgentApiState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(mode) = body.get("mode").and_then(|m| m.as_str()) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({ "error": "缺少 mode 字段（archive|discard）" })),
+        )
+            .into_response();
+    };
+    if mode != "archive" && mode != "discard" {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(
+                serde_json::json!({ "error": format!("mode 仅接受 archive|discard，got {mode}") }),
+            ),
+        )
+            .into_response();
+    }
+    match state
+        .evorule_client()
+        .schedule_shared_compaction(mode)
+        .await
+    {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({ "error": format!("服务端压实调度中继失败: {e}") })),
+        )
+            .into_response(),
+    }
 }
 
 /// S5:执行体模型清单中继 URL——executor_url 为 `/llm/execute` 全 URL 形态
@@ -4507,6 +4572,35 @@ async fn agent_memory_recall(
     Ok(Json(serde_json::to_value(&ctx).unwrap_or_default()))
 }
 
+/// `GET /api/meta` — 服务面自描述（路由族 + 端口面归属）
+///
+/// 桌面宿主多进程多端口（serve/engine/llm_executor 各持不同 API 面）,
+/// 调用方此前定位端点归属全靠试错。本端点回答「我这张面有什么」;
+/// 其余面的落点看 runtime.json 对应进程条目,跨端口调用一律 404。
+async fn meta() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "face": "serve (agent API)",
+        "routes": {
+            "/api/skills": "skill inventory (GET) — states: discovered/active/revoked",
+            "/api/skills/pending": "discovered skills awaiting approval (GET, body included)",
+            "/api/skills/approve": "approve a skill (POST {name, level}) — gated",
+            "/api/skills/revoke": "revoke a skill (POST {name, level}) — gated",
+            "/api/skills/import": "import a skill-pack bundle (POST {path}) — write-gated",
+            "/api/skills/export": "export an approved skill as an import-format bundle (POST {name, level})",
+            "/api/files/write": "file write (PUT {path, content})",
+            "/api/files": "file delete (DELETE ?path=)",
+            "/api/files/read|raw|list|search": "file read/raw/list/search",
+            "/api/agents/{type}/run|run/stream": "agent run / SSE stream",
+            "/api/auth/ticket": "one-shot ticket for ws/sse",
+            "/health, /metrics, /version": "ops endpoints"
+        },
+        "notes": [
+            "this face is the agent serve; other API families (native services, llm executor) live on separate ports listed in runtime.json (engine / llm_executor entries) - cross-port calls return 404",
+            "all routes require the bearer token unless listed in PUBLIC_PATHS"
+        ]
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6805,33 +6899,141 @@ mod tests {
         assert_eq!(json["total_violations"], 3);
         assert!(json["signals"].is_array());
     }
-}
 
-/// `GET /api/meta` — 服务面自描述（路由族 + 端口面归属）
-///
-/// 桌面宿主多进程多端口（serve/engine/llm_executor 各持不同 API 面）,
-/// 调用方此前定位端点归属全靠试错。本端点回答「我这张面有什么」;
-/// 其余面的落点看 runtime.json 对应进程条目,跨端口调用一律 404。
-async fn meta() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "face": "serve (agent API)",
-        "routes": {
-            "/api/skills": "skill inventory (GET) — states: discovered/active/revoked",
-            "/api/skills/pending": "discovered skills awaiting approval (GET, body included)",
-            "/api/skills/approve": "approve a skill (POST {name, level}) — gated",
-            "/api/skills/revoke": "revoke a skill (POST {name, level}) — gated",
-            "/api/skills/import": "import a skill-pack bundle (POST {path}) — write-gated",
-            "/api/skills/export": "export an approved skill as an import-format bundle (POST {name, level})",
-            "/api/files/write": "file write (PUT {path, content})",
-            "/api/files": "file delete (DELETE ?path=)",
-            "/api/files/read|raw|list|search": "file read/raw/list/search",
-            "/api/agents/{type}/run|run/stream": "agent run / SSE stream",
-            "/api/auth/ticket": "one-shot ticket for ws/sse",
-            "/health, /metrics, /version": "ops endpoints"
-        },
-        "notes": [
-            "this face is the agent serve; other API families (native services, llm executor) live on separate ports listed in runtime.json (engine / llm_executor entries) - cross-port calls return 404",
-            "all routes require the bearer token unless listed in PUBLIC_PATHS"
-        ]
-    }))
+    // ---- 服务端共享账压实面透传（GET 状态 / POST 调度；正源=evorule 服务端）----
+
+    fn make_state_with_evorule(base_url: &str) -> AgentApiState {
+        let tmp: &tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        AgentApiState::new_with_metrics(
+            AgentDefinitionManager::with_default_dir(),
+            EvoruleApiClient::new(base_url),
+            Arc::new(Metrics::new().unwrap()),
+            tmp.path().to_path_buf(),
+            Arc::new(WorkspaceApiClient::new(base_url)),
+            Arc::new(std::sync::RwLock::new(ToolHandler::new())),
+        )
+    }
+
+    /// GET 透传：服务端响应原样返回（agent 零投影零缓存）
+    #[tokio::test]
+    async fn test_shared_compaction_get_passthrough() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/admin/shared/compaction")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"marker_present":false,"last_report":null}"#)
+            .create_async()
+            .await;
+        let app = router(make_state_with_evorule(&server.url()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/shared-compaction")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["marker_present"], serde_json::json!(false));
+        mock.assert_async().await;
+    }
+
+    /// POST 透传：mode 直传服务端，响应原样返回
+    #[tokio::test]
+    async fn test_shared_compaction_post_passthrough() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/admin/shared/compaction")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({ "mode": "archive" }),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"scheduled":true,"effective":"next_restart"}"#)
+            .create_async()
+            .await;
+        let app = router(make_state_with_evorule(&server.url()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/shared-compaction")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"archive"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["scheduled"], serde_json::json!(true));
+        mock.assert_async().await;
+    }
+
+    /// POST 白名单闸：off 语义=不调度（agent 面拒绝），未知值同样 400
+    #[tokio::test]
+    async fn test_shared_compaction_post_rejects_non_scheduling_mode() {
+        let app = router(make_state_with_evorule("http://localhost:1"));
+        for body_text in [r#"{"mode":"off"}"#, r#"{"mode":"nuke"}"#, r#"{}"#] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/admin/shared-compaction")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body_text))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "body={body_text}"
+            );
+        }
+    }
+
+    /// 上游失败面：服务端 403（凭据不足）→ agent 面直报 502（fail-visible，
+    /// 同步面不受清扫面 fail-soft 约束）
+    #[tokio::test]
+    async fn test_shared_compaction_surfaces_upstream_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/admin/shared/compaction")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"administrator required"}"#)
+            .create_async()
+            .await;
+        let app = router(make_state_with_evorule(&server.url()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/shared-compaction")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"discard"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("403"));
+    }
 }
