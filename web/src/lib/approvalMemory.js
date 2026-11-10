@@ -73,9 +73,50 @@ export function recordSessionAllow(tool, command) {
   if (tool && prefix) sessionAllows.add(`${tool}|${prefix}`);
 }
 
-/** 清空会话记忆(新建会话时调用;工作区清单不受影响) */
+/** 清空会话记忆(新建会话时调用;工作区清单不受影响;回执轨迹同面清空) */
 export function clearSessionMemory() {
   sessionAllows.clear();
+  receiptTrail.length = 0;
+}
+
+// ---- 回执在场索引(结果帧双写消除):「审批结果」信息条只在回执未表达时兜底。
+// 轨迹按 (req|receipt) 事件序判定:同类工具最近事件是回执(决策原位转回执/
+// 清单收卡/超时失效)→ 事实已表达,结果帧不再追加信息条;是待批请求(新提案
+// 在途,或决策发生在其他窗口本窗口无回执)→ 保留信息条兜底不丢事实。
+const receiptTrail = []; // {kind:'req'|'receipt', tool, proposalId|null, at}
+const RECEIPT_TRAIL_CAP = 500;
+
+function trailPush(kind, tool, proposalId) {
+  if (!tool) return;
+  receiptTrail.push({ kind, tool: String(tool), proposalId: proposalId ?? null, at: Date.now() });
+  if (receiptTrail.length > RECEIPT_TRAIL_CAP) {
+    receiptTrail.splice(0, receiptTrail.length - RECEIPT_TRAIL_CAP);
+  }
+}
+
+/** 待批请求入轨(推待批卡/自动批准失败回退待批卡时调用) */
+export function markApprovalRequest(toolName, proposalId = null) {
+  trailPush('req', toolName, proposalId);
+}
+
+/** 回执入轨(决策提交原位转回执/收卡转回执/超时·失效收卡时调用) */
+export function markApprovalReceipt(toolName, proposalId = null) {
+  trailPush('receipt', toolName, proposalId);
+}
+
+/** 回执在场判定:proposalId 有值按提案精确匹配(该提案出过回执即在场);
+ *  缺省按工具名倒扫轨迹,最近一条同类事件是回执才算在场。 */
+export function hasApprovalReceipt(toolName, proposalId = null) {
+  if (!toolName) return false;
+  if (proposalId != null) {
+    return receiptTrail.some((r) => r.kind === 'receipt' && r.proposalId === proposalId);
+  }
+  const key = String(toolName);
+  for (let i = receiptTrail.length - 1; i >= 0; i--) {
+    const r = receiptTrail[i];
+    if (r.tool === key) return r.kind === 'receipt';
+  }
+  return false;
 }
 
 // ---- 工作区放行清单(per-workspace 持久化) ----

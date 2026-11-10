@@ -39,7 +39,14 @@ import {
   orchestration,
 } from './orchestration.js';
 import { getTranscript, wsAuthQuery, approveProposal } from './api.js';
-import { evaluateAutoApproval, clearSessionMemory, loadAllowlist } from './approvalMemory.js';
+import {
+  evaluateAutoApproval,
+  clearSessionMemory,
+  loadAllowlist,
+  markApprovalRequest,
+  markApprovalReceipt,
+  hasApprovalReceipt,
+} from './approvalMemory.js';
 import { assembleContext } from './mentions.js';
 import { looksLikeDeadSession, buildRebuildBlock, lastUserTextOf } from './sessionRebuild.js';
 import { push as pushNotification } from './notifications.js';
@@ -118,6 +125,7 @@ function expirePendingApprovals() {
     if (m.kind === 'approval' && m.proposalId && !m.decision) {
       // 离场语义:终态同样收敛为单行回执,不留整卡
       updateMessage(m.id, { kind: 'approval_receipt', decision: 'expired' });
+      markApprovalReceipt(m.toolName, m.proposalId);
     }
   }
 }
@@ -681,6 +689,7 @@ function handleFrame(f) {
       // 治理叠加:审批决策走既有 G8 /approve 通道。会话记忆/工作区放行清单
       // 命中的重复同类命令按既有授权自动批准(危险子命令守卫永不自动批);
       // 未命中或守卫命中 → 走三选一审批卡(人工必问)。
+      markApprovalRequest(f.tool_name, f.proposal_id);
       const verdict = evaluateAutoApproval(f.tool_name, f.command);
       if (verdict === 'session' || verdict === 'workspace') {
         const scope = verdict === 'session' ? 'auto-session' : 'auto-workspace';
@@ -692,6 +701,7 @@ function handleFrame(f) {
           scope,
           decision: 'sending',
         });
+        markApprovalReceipt(f.tool_name, f.proposal_id);
         autoApprovedProposals.add(f.proposal_id);
         // 自动批提交带决策来源标记:后端对 auto 类批准复核危险命令守卫表
         // (与 evaluateAutoApproval 的 isAutoDeny 同表镜像),命中 400 且审批
@@ -708,7 +718,9 @@ function handleFrame(f) {
               return;
             }
             // 自动批准失败(提案失效/通道错误)→ 回退为待批卡,用户手动处置
+            // (轨迹补一条待批请求:回执已回退,结果帧不得被误判为已表达)
             autoApprovedProposals.delete(f.proposal_id);
+            markApprovalRequest(f.tool_name, f.proposal_id);
             updateMessage(receiptId, {
               kind: 'approval',
               decision: 'error',
@@ -759,6 +771,7 @@ function handleFrame(f) {
           const m = list[i];
           if (m.kind === 'approval' && m.toolName === f.tool_name && m.proposalId && !m.decision) {
             updateMessage(m.id, { kind: 'approval_receipt', decision: 'timeout' });
+            markApprovalReceipt(f.tool_name, f.proposal_id);
             break;
           }
         }
@@ -772,25 +785,28 @@ function handleFrame(f) {
         const list = get(messages);
         for (let i = list.length - 1; i >= 0; i--) {
           const m = list[i];
-          if (m.kind === 'approval' && m.toolName === f.tool_name && m.proposalId && !m.decision) {
-            updateMessage(m.id, {
-              kind: 'approval_receipt',
-              decision: 'sent',
-              sentApproved: true,
-              scope: f.approver,
-            });
-            break;
-          }
+        if (m.kind === 'approval' && m.toolName === f.tool_name && m.proposalId && !m.decision) {
+          updateMessage(m.id, {
+            kind: 'approval_receipt',
+            decision: 'sent',
+            sentApproved: true,
+            scope: f.approver,
+          });
+          markApprovalReceipt(f.tool_name, f.proposal_id);
+          break;
+        }
         }
       }
-      // 离场语义:自动批准的提案,结果已并入回执行,不再追加重复的
-      // 「审批结果」信息条(结果帧可能不带提案 id,按工具名+自动批准回执
-      // 匹配最近一条;判定失败只多一行信息条,不丢事实)
+      // 离场语义:回执已表达事实的结果帧不再追加重复的「审批结果」信息条。
+      // 自动批准按提案登记精确去重;人工/收卡/超时路径按回执轨迹判定
+      // (最近同类事件是回执=已表达;是新待批请求=本窗口无回执,保留信息
+      // 条兜底,跨窗口决策等边态不丢事实)。
       const isAuto = f.proposal_id
         ? autoApprovedProposals.has(f.proposal_id)
         : lastAutoReceiptFor(f.tool_name) != null;
       if (f.proposal_id) autoApprovedProposals.delete(f.proposal_id);
-      if (!isAuto) {
+      const receiptExpressed = hasApprovalReceipt(f.tool_name, f.proposal_id ?? null);
+      if (!isAuto && !receiptExpressed) {
         const outcome =
           f.approved && f.approver === 'workspace-allowlist'
             ? '已批准(工作区清单)'

@@ -25,6 +25,9 @@ import {
   evaluateAutoApproval,
   approvalReceiptText,
   aggregateSummary,
+  markApprovalRequest,
+  markApprovalReceipt,
+  hasApprovalReceipt,
 } from '../src/lib/approvalMemory.js';
 import { readFile, writeFile } from '../src/lib/api.js';
 
@@ -218,5 +221,40 @@ describe('回执与汇总文案', () => {
 
   it('聚合阈值常量>0', () => {
     expect(AGGREGATE_THRESHOLD).toBeGreaterThan(0);
+  });
+});
+
+describe('回执在场索引(结果帧信息条兜底判定)', () => {
+  it('请求后出回执:回执在场(不再兜底信息条)', () => {
+    markApprovalRequest('shell_exec', 'p1');
+    expect(hasApprovalReceipt('shell_exec')).toBe(false);
+    markApprovalReceipt('shell_exec', 'p1');
+    expect(hasApprovalReceipt('shell_exec')).toBe(true);
+  });
+
+  it('回执后来新请求:回执不在场(新提案在途,保留兜底)', () => {
+    markApprovalReceipt('shell_exec', 'p1');
+    markApprovalRequest('shell_exec', 'p2');
+    expect(hasApprovalReceipt('shell_exec')).toBe(false);
+  });
+
+  it('提案 id 精确匹配:同工具他提案的回执不算', () => {
+    markApprovalReceipt('python_exec', 'pa');
+    expect(hasApprovalReceipt('python_exec', 'pa')).toBe(true);
+    expect(hasApprovalReceipt('python_exec', 'pb')).toBe(false);
+  });
+
+  it('按工具名隔离:他工具回执不串扰', () => {
+    markApprovalReceipt('python_exec', 'pa');
+    markApprovalRequest('shell_exec', 'pb');
+    expect(hasApprovalReceipt('shell_exec')).toBe(false);
+    expect(hasApprovalReceipt('python_exec')).toBe(true);
+  });
+
+  it('无轨迹工具不在场;清会话记忆即清轨迹', () => {
+    expect(hasApprovalReceipt('shell_exec')).toBe(false);
+    markApprovalReceipt('shell_exec', 'p1');
+    clearSessionMemory();
+    expect(hasApprovalReceipt('shell_exec', 'p1')).toBe(false);
   });
 });
