@@ -654,7 +654,7 @@ pub(crate) fn sort_by_policy(
     }
 }
 
-/// Stable Facts 注入瘦身（design-83 立项 / design-85 裁决②「绝对帽 8K +
+/// Stable Facts 注入瘦身（瘦身设计档裁决②「绝对帽 8K +
 /// 判据式常驻」）：判据式常驻层 + 召回层绝对帽。
 ///
 /// 层分（判据式，非名单式——不拍初始名单，让判据从真实使用中长出来）：
@@ -2354,7 +2354,7 @@ impl MemoryManager {
             {
                 let usage = self.usage_pending.lock().unwrap_or_else(|p| p.into_inner());
                 sort_by_policy(&mut ctx.stable, goal, &policy, Some(&usage));
-                // design-83/85：判据式常驻层 + 召回层绝对帽（注入瘦身）——
+                // 注入瘦身：判据式常驻层 + 召回层绝对帽——
                 // 排序后分层，常驻面置前（下游比例预算只切召回层尾），
                 // 召回层按 sort_by_policy 序取前缀至 stable_cap_tokens。
                 let (injected, trimmed, tokens) = layerize_stable(
@@ -2363,7 +2363,7 @@ impl MemoryManager {
                     &policy,
                     &mut ctx.degradation_notices,
                 );
-                // 观测面（design-83 §四）：每轮注入条数/总量/token 落日志，
+                // 观测面（瘦身设计档 §四）：每轮注入条数/总量/token 落日志，
                 // 帽值复盘（每 50 轮）以此为准。
                 tracing::info!(
                     facts_injected = injected,
@@ -4328,7 +4328,7 @@ mod tests {
         assert_eq!(flipped[0].key, "stable.llm.m.used");
     }
 
-    // ===== Stable Facts 注入瘦身（design-83/85：绝对帽 8K + 判据式常驻）=====
+    // ===== Stable Facts 注入瘦身（绝对帽 8K + 判据式常驻）=====
 
     /// layerize 测试夹具：默认策略（帽 8000/常驻阈 0.8/晋升 3 次×0.5）
     fn layerize_policy() -> crate::agent::recipe::RetrievalPolicy {
@@ -4341,7 +4341,7 @@ mod tests {
     fn test_layerize_resident_predicates() {
         // 判据式常驻：system 恒常驻；user conf≥0.8 常驻；user conf<0.8 且
         // usage<3 不常驻（落召回层）；user 晋升（usage≥3 且 conf≥0.5）常驻；
-        // llm 域永不常驻（design-85 表格：召回层含 stable.llm.*）。
+        // llm 域永不常驻（分层表：召回层含 stable.llm.*）。
         let policy = layerize_policy();
         let mk = |key: &str, ts: u64, conf: Option<f32>, usage: u32, fid: Option<u64>| {
             let mut r = MemoryRecord::new(key, "内容", ts);
@@ -4381,14 +4381,14 @@ mod tests {
             !notices.iter().any(|n| n.contains("召回层裁剪")),
             "无截断不得有裁剪通知: {notices:?}"
         );
-        // llm 高置信高使用也不常驻（design-85：常驻晋升只适用 system/user）
+        // llm 高置信高使用也不常驻（常驻晋升只适用 system/user）
         assert_eq!(stable[4].key, "stable.llm.extracted", "llm 层落召回尾部");
     }
 
     #[test]
     fn test_layerize_absolute_cap_decoupled_from_window() {
         // 绝对帽与模型窗口解耦：召回层按排序序截到帽内；常驻面全保；
-        // 截断留痕 degradation_notices（design-83 验收判据②）。
+        // 截断留痕 degradation_notices（验收判据②）。
         let policy = layerize_policy();
         assert_eq!(policy.stable_cap_tokens, 8000, "首版帽=8000");
         let mk = |i: usize| {
@@ -4402,7 +4402,7 @@ mod tests {
             r
         };
         let mut stable: Vec<MemoryRecord> = (0..10).map(mk).collect();
-        // 排序先行（截断即优先淘汰低价值条目——design-85 帽满语义）
+        // 排序先行（截断即优先淘汰低价值条目——帽满语义）
         sort_by_policy(&mut stable, "", &policy, None);
         let usage = std::collections::HashMap::new();
         let mut notices = Vec::new();
@@ -4420,7 +4420,7 @@ mod tests {
                 .any(|n| n.contains("召回层裁剪") && n.contains("8000")),
             "截断须留痕并点名绝对帽: {notices:?}"
         );
-        // 确定性双跑（design-83 验收判据①）：同输入逐位一致
+        // 确定性双跑（验收判据①）：同输入逐位一致
         let mut stable2: Vec<MemoryRecord> = (0..10).map(mk).collect();
         sort_by_policy(&mut stable2, "", &policy, None);
         let mut notices2 = Vec::new();
@@ -4474,7 +4474,7 @@ mod tests {
             "置信低于晋升阈不晋升: {keys:?}"
         );
         // llm 域双达标（conf 0.9 + usage 99）也不晋升——晋升只适用 system/user
-        // （design-85 晋升子句；llm 层恒属召回层，由帽管束）
+        // （晋升子句限 system/user；llm 层恒属召回层，由帽管束）
         let keys = run(mk("stable.llm.hot", 1, Some(0.9), 99, Some(9)), &pending);
         assert!(
             !keys.contains(&"stable.llm.hot".to_string()),

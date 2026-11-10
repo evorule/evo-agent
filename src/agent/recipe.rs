@@ -137,7 +137,7 @@ pub struct BudgetConfig {
     /// 首版 8000；观测面（每轮注入条数/token 落日志）每 50 轮复盘一次。
     #[serde(default = "default_stable_cap_tokens")]
     pub stable_cap_tokens: usize,
-    /// 判据式常驻层（design-83/85）：`stable.user.*` 且 confidence ≥ 此值
+    /// 判据式常驻层：`stable.user.*` 且 confidence ≥ 此值
     /// 无条件常驻（不占召回帽）；`stable.system.*` 恒常驻（安全边界不设阈）。
     #[serde(default = "default_resident_user_confidence")]
     pub resident_user_min_confidence: f32,
