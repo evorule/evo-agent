@@ -14,6 +14,8 @@
 //! - ASCII 字符:4 chars ≈ 1 token
 //! - CJK 字符:1 char ≈ 1 token(中文 1 字 ≈ 1 token 是经验值)
 //! - 每条消息固定开销 4 token(role 标签 + 结构分隔符)
+//! - 旁路图片 base64 按 ASCII 同率折算(4 chars ≈ 1 token;媒体载荷
+//!   不计入会让压缩触发对图文消息失明)
 //!
 //! 精度 ±15%,对裁剪决策足够。如需高精度可后续加 `tiktoken` feature。
 //!
@@ -141,6 +143,17 @@ impl TokenCounter for ApproxTokenCounter {
         for msg in messages {
             total += self.per_message_overhead;
             total += self.count_text(msg.content());
+            // 图片旁路 base64 计入(User/Tool 两变体;base64 长度按 ASCII 同率
+            // 折算 4 chars/token)。不计入会让百分比触发的压缩/裁剪对媒体载荷
+            // 失明(几 MB 截图在计数里≈0);折算方向保守(宁早触发不晚触发)
+            match msg {
+                Message::User { images, .. } | Message::Tool { images, .. } => {
+                    for img in images {
+                        total += self.count_text(&img.data_base64);
+                    }
+                }
+                _ => {}
+            }
             if let Message::Assistant {
                 tool_calls: Some(calls),
                 ..
@@ -405,7 +418,7 @@ impl Clone for ContextWindowManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::translator::ToolCall;
+    use crate::agent::translator::{ImageData, ToolCall};
     use serde_json::json;
 
     fn user(content: &str) -> Message {
@@ -493,6 +506,51 @@ mod tests {
         // + tail 3
         // = 4 + 2 + 2 + 3 + 3 = 14
         assert_eq!(total, 14);
+    }
+
+    // ========== 图片旁路 base64 计入测试 ==========
+
+    /// 媒体载荷失明回归锁:User 轮旁路图 base64 必须按长度折算进计数
+    /// (几 MB 截图在 token 计数里≈0 会让百分比触发对图片载荷失明)
+    #[test]
+    fn test_count_user_image_base64_counted() {
+        let c = ApproxTokenCounter::new();
+        // 400 个 ASCII 字符(base64 形态)→ 100 tokens
+        let b64 = "QUJD".repeat(100);
+        let msgs = vec![Message::User {
+            content: "hello".to_string(),
+            images: vec![ImageData {
+                mime_type: "image/png".to_string(),
+                data_base64: b64,
+            }],
+        }];
+        // 4 (overhead) + 2 (text) + 100 (image) + 3 (tail) = 109
+        assert_eq!(c.count_messages(&msgs), 109);
+    }
+
+    /// Tool 变体旁路图同样计入
+    #[test]
+    fn test_count_tool_image_base64_counted() {
+        let c = ApproxTokenCounter::new();
+        let b64 = "QUJD".repeat(100); // 400 chars → 100 tokens
+        let msgs = vec![Message::Tool {
+            content: "hi".to_string(),     // 2 chars → 1 token
+            tool_name: "echo".to_string(), // 4 chars → 1 token
+            images: vec![ImageData {
+                mime_type: "image/png".to_string(),
+                data_base64: b64,
+            }],
+        }];
+        // 4 (overhead) + 1 (content) + 1 (tool_name) + 100 (image) + 3 (tail) = 109
+        assert_eq!(c.count_messages(&msgs), 109);
+    }
+
+    /// 无图消息计数与既有口径逐 token 一致(基线保护)
+    #[test]
+    fn test_count_without_images_unchanged() {
+        let c = ApproxTokenCounter::new();
+        let msgs = vec![user("hello")];
+        assert_eq!(c.count_messages(&msgs), 9);
     }
 
     // ========== ContextWindowManager.trim 测试 ==========

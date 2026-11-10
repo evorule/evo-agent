@@ -6527,6 +6527,303 @@ fn test_emergency_trim_history_compaction_keeps_recent_rounds() {
     // 轮界切分保证有 tool_calls 场景同轮不破)
 }
 
+// ---- L2 发送面:紧急裁剪图片盲区回归锁 ----
+
+fn png_image(b64_len_hint: usize) -> (crate::agent::translator::ImageData, String, Vec<u8>) {
+    // 构造可解码的伪 PNG(魔数头 + 填充),返回 (ImageData, base64, 原始字节)
+    let mut bytes = vec![0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    bytes.resize(bytes.len() + b64_len_hint, 0x41);
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    (
+        crate::agent::translator::ImageData {
+            mime_type: "image/png".to_string(),
+            data_base64: b64.clone(),
+        },
+        b64,
+        bytes,
+    )
+}
+
+/// count_chars 口径含图片旁路 base64(裁剪报告与重试判据不得对媒体失明):
+/// before_chars 必须计入带图工具结果的 base64 字节
+#[test]
+fn test_emergency_trim_counting_includes_images() {
+    use super::emergency_trim_for_payload_limit;
+    let (img, b64, _raw) = png_image(400);
+    let mut msgs = vec![Message::System {
+        content: "sys".into(),
+    }];
+    for i in 0..3 {
+        msgs.push(Message::User {
+            content: format!("u{i}"),
+            images: vec![],
+        });
+        msgs.push(Message::Assistant {
+            content: format!("a{i}"),
+            tool_calls: None,
+        });
+        msgs.push(Message::Tool {
+            content: if i == 0 {
+                "y".repeat(50_000)
+            } else {
+                "y".repeat(100)
+            },
+            tool_name: "file_read".into(),
+            images: if i == 0 { vec![img.clone()] } else { vec![] },
+        });
+    }
+    let report = emergency_trim_for_payload_limit(&mut msgs);
+    assert!(
+        report.before_chars > 50_000 + b64.len(),
+        "before_chars 必须计入图片 base64: {}",
+        report.before_chars
+    );
+    assert!(report.after_chars < report.before_chars);
+}
+
+/// ①层折叠的图片指纹经③层占位符可查(blake3 对解码后字节,与 B1 落盘
+/// `data/agent-images/<fingerprint>.<ext>` 内容寻址口径同源可回取;禁只留文字占位)
+#[test]
+fn test_emergency_trim_placeholder_carries_folded_image_fingerprints() {
+    use super::emergency_trim_for_payload_limit;
+    let (img, _b64, raw) = png_image(400);
+    let expected_fp = format!("blake3:{}", blake3::hash(&raw).to_hex());
+    let mut msgs = vec![Message::System {
+        content: "sys".into(),
+    }];
+    for i in 0..3 {
+        msgs.push(Message::User {
+            content: format!("u{i}"),
+            images: vec![],
+        });
+        msgs.push(Message::Assistant {
+            content: format!("a{i}"),
+            tool_calls: None,
+        });
+        msgs.push(Message::Tool {
+            content: if i == 0 {
+                "y".repeat(50_000)
+            } else {
+                "y".repeat(100)
+            },
+            tool_name: "file_read".into(),
+            images: if i == 0 { vec![img.clone()] } else { vec![] },
+        });
+    }
+    let _report = emergency_trim_for_payload_limit(&mut msgs);
+    let placeholder = msgs
+        .iter()
+        .find(|m| {
+            m.content()
+                .contains("[history compacted due to request body limit:")
+        })
+        .expect("③层占位符应在")
+        .content()
+        .to_string();
+    assert!(
+        placeholder.contains(&expected_fp),
+        "占位符必须携带被裁图片的 blake3 指纹引用: {placeholder}"
+    );
+    assert!(placeholder.contains("images elided"), "{placeholder}");
+    // 被裁图片本体不再滞留任何消息
+    assert!(
+        !msgs.iter().any(|m| match m {
+            Message::Tool { images, .. } | Message::User { images, .. } => !images.is_empty(),
+            _ => false,
+        }),
+        "折叠区旁路图应全部清空"
+    );
+}
+
+/// ②层审批往返折叠标记携带图片指纹引用(近程区内存活,直接可见)
+#[test]
+fn test_emergency_trim_approval_fold_carries_image_fingerprint() {
+    use super::emergency_trim_for_payload_limit;
+    let (img, _b64, raw) = png_image(200);
+    let expected_fp = format!("blake3:{}", blake3::hash(&raw).to_hex());
+    let approval_payload =
+        r#"{"proposal_id": "p1", "tool": "file_write", "decision": "approved", "reason": "ok"}"#
+            .replace("ok", &"x".repeat(30_000));
+    let mut msgs = vec![
+        Message::System {
+            content: "sys".into(),
+        },
+        Message::User {
+            content: "recent turn".into(),
+            images: vec![],
+        },
+        Message::User {
+            content: approval_payload,
+            images: vec![img],
+        },
+    ];
+    // 审批轮在近程区内(仅 1 个 user 轮 + 审批轮,③不触发;②层全程折叠)
+    let report = emergency_trim_for_payload_limit(&mut msgs);
+    assert_eq!(report.folded_approvals, 1);
+    let approval = &msgs[2];
+    match approval {
+        Message::User { content, images } => {
+            assert!(
+                content.starts_with("[approval roundtrip elided:"),
+                "{content}"
+            );
+            assert!(
+                content.contains(&expected_fp),
+                "折叠标记须含指纹引用: {content}"
+            );
+            assert!(images.is_empty());
+        }
+        other => panic!("expected User, got {other:?}"),
+    }
+    // 近程区不带图用户轮不在②层折叠语义内(非审批载荷),内容保真
+    match &msgs[1] {
+        Message::User { content, images } => {
+            assert_eq!(content, "recent turn");
+            assert!(images.is_empty());
+        }
+        other => panic!("expected User, got {other:?}"),
+    }
+}
+
+/// ③层占位符收割被压缩段残留图片指纹(①层只清 Tool 图,User 图随段消失前
+/// 必须以指纹引用落进占位符)
+#[test]
+fn test_emergency_trim_placeholder_harvests_user_images() {
+    use super::emergency_trim_for_payload_limit;
+    let (img, _b64, raw) = png_image(400);
+    let expected_fp = format!("blake3:{}", blake3::hash(&raw).to_hex());
+    let mut msgs = vec![Message::System {
+        content: "sys".into(),
+    }];
+    for i in 0..3 {
+        msgs.push(Message::User {
+            content: format!("u{i}"),
+            images: if i == 0 { vec![img.clone()] } else { vec![] },
+        });
+        msgs.push(Message::Assistant {
+            content: "x".repeat(10_000),
+            tool_calls: None,
+        });
+        msgs.push(Message::Tool {
+            content: "y".repeat(100),
+            tool_name: "file_read".into(),
+            images: vec![],
+        });
+    }
+    let report = emergency_trim_for_payload_limit(&mut msgs);
+    assert!(report.history_compacted);
+    let placeholder = msgs
+        .iter()
+        .find(|m| {
+            m.content()
+                .contains("[history compacted due to request body limit:")
+        })
+        .expect("③层占位符应在")
+        .content()
+        .to_string();
+    assert!(
+        placeholder.contains(&expected_fp),
+        "占位符必须收割被压缩段 User 图片指纹: {placeholder}"
+    );
+}
+
+// ---- 发送前字节门(统一门:两发送路径接线前纯函数验收) ----
+
+/// 字节门:阈值下零动作(消息不动,未预警未裁剪)
+#[test]
+fn test_payload_byte_gate_below_thresholds_noop() {
+    use super::enforce_payload_byte_gate;
+    let mut msgs = vec![Message::System {
+        content: "x".repeat(1_000),
+    }];
+    let snapshot = serde_json::to_string(&msgs).unwrap();
+    let r = enforce_payload_byte_gate(&mut msgs);
+    assert!(!r.warned && !r.trimmed);
+    assert!(r.trim_report.is_none());
+    assert_eq!(r.bytes_before, r.bytes_after);
+    assert_eq!(
+        serde_json::to_string(&msgs).unwrap(),
+        snapshot,
+        "零动作=消息面原样"
+    );
+}
+
+/// 字节门:1.5MB-2MB 区间预警不裁剪(观测面先亮,不擅自折叠)
+#[test]
+fn test_payload_byte_gate_warns_below_trim() {
+    use super::{enforce_payload_byte_gate, PAYLOAD_WARN_BYTES};
+    let mut msgs = vec![Message::System {
+        content: "y".repeat(PAYLOAD_WARN_BYTES + 1_000),
+    }];
+    let r = enforce_payload_byte_gate(&mut msgs);
+    assert!(r.warned, "≥1.5MB 必须预警");
+    assert!(!r.trimmed, "<2MB 不得主动裁剪");
+    assert_eq!(r.bytes_after, r.bytes_before);
+}
+
+/// 字节门:≥2MB 主动紧急裁剪(折叠大工具结果,字节骤降;报告同口径)
+#[test]
+fn test_payload_byte_gate_trims_over_limit() {
+    use super::{enforce_payload_byte_gate, PAYLOAD_TRIM_BYTES, PAYLOAD_WARN_BYTES};
+    let mut msgs = vec![Message::System {
+        content: "sys".to_string(),
+    }];
+    for i in 0..3 {
+        msgs.push(Message::User {
+            content: format!("u{i}"),
+            images: vec![],
+        });
+        msgs.push(Message::Assistant {
+            content: format!("a{i}"),
+            tool_calls: None,
+        });
+        msgs.push(Message::Tool {
+            content: if i == 0 {
+                "z".repeat(PAYLOAD_TRIM_BYTES)
+            } else {
+                "ok".to_string()
+            },
+            tool_name: "file_read".to_string(),
+            images: vec![],
+        });
+    }
+    let r = enforce_payload_byte_gate(&mut msgs);
+    assert!(r.trimmed, "≥2MB 必须主动裁剪");
+    let tr = r.trim_report.expect("裁剪报告应携带");
+    assert_eq!(tr.elided_tool_results, 1);
+    assert!(
+        r.bytes_after < PAYLOAD_WARN_BYTES,
+        "裁后应降回预警线下: {}",
+        r.bytes_after
+    );
+    // 发送副本被就地压缩:③层占位符落地,大工具结果不再滞留
+    assert!(
+        msgs.iter().any(|m| m
+            .content()
+            .starts_with("[history compacted due to request body limit:")),
+        "③层占位符应在发送副本"
+    );
+}
+
+/// 字节门:裁剪无可折叠载荷时如实报告不循环——裁后仍超限交由
+/// 413 恢复路径/fail-visible 兜底,门不静默假装已治理
+#[test]
+fn test_payload_byte_gate_no_foldable_content_reports_honestly() {
+    use super::{enforce_payload_byte_gate, PAYLOAD_TRIM_BYTES};
+    let mut msgs = vec![Message::User {
+        content: "u".repeat(PAYLOAD_TRIM_BYTES + 4096),
+        images: vec![],
+    }];
+    let r = enforce_payload_byte_gate(&mut msgs);
+    assert!(r.trimmed);
+    assert!(
+        r.bytes_after >= PAYLOAD_TRIM_BYTES,
+        "无可折叠内容时字节不降,如实上报: {}",
+        r.bytes_after
+    );
+}
+
 // ---- 超大工具结果引用化出站门 ----
 
 fn gate_test_runner(dir: &std::path::Path) -> AgentRunner {
