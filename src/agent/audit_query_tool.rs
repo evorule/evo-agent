@@ -39,8 +39,9 @@ const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
 
 /// session facts 单条 value 内联上限（字节）：超限大 value 降级标注（口径
-/// 对齐 journal 写入侧 checkpoint 内联阈值）
-const SESSION_FACTS_VALUE_INLINE_LIMIT: usize = 4096;
+/// 对齐 journal 写入侧 checkpoint 内联阈值）。audit_summary 摘要卡
+/// recent_facts 元数据行共用同一口径（单源纪律）。
+pub(crate) const SESSION_FACTS_VALUE_INLINE_LIMIT: usize = 4096;
 
 /// session facts 输出总字节预算（字节）：value 为任意 JSON（含媒体 base64
 /// 可能单条巨大），条数 limit 之外再按字节收口
@@ -340,6 +341,17 @@ async fn session_scope(
     Ok(out)
 }
 
+/// 超限大 value 的降级标注（既有口径 `{truncated,bytes,digest}` blake3——
+/// budgeted_fact_rows 与 audit_summary 摘要卡共用单源）。
+/// `serialized` = value 的 JSON 序列化字节（bytes 取其长度，含引号/转义）。
+pub(crate) fn oversized_value_marker(serialized: &str) -> Value {
+    json!({
+        "truncated": true,
+        "bytes": serialized.len(),
+        "digest": crate::agent::journal::evorule_digest(serialized),
+    })
+}
+
 /// session facts 视图装配：fact_id 降序（新在前）+ 条数 limit + 字节预算。
 /// 预算放不下的大 value 降级为 `{truncated,bytes,digest}` 标注（全文按
 /// fact_id 经 causal-chain 视图回账）；小 value 超预算即收口。
@@ -362,11 +374,7 @@ fn budgeted_fact_rows(
         if size > SESSION_FACTS_VALUE_INLINE_LIMIT {
             // 大 value 一律降级（与 journal 查询同口径：单条内联阈值封顶，
             // 全文按 fact_id 经 causal-chain 视图回账）
-            let marker = json!({
-                "truncated": true,
-                "bytes": size,
-                "digest": crate::agent::journal::evorule_digest(&serialized),
-            });
+            let marker = oversized_value_marker(&serialized);
             let marker_size = serde_json::to_string(&marker).map(|s| s.len()).unwrap_or(0);
             if acc + marker_size > SESSION_FACTS_BUDGET_BYTES {
                 budget_truncated = true;

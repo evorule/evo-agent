@@ -398,58 +398,83 @@ pub async fn sediment(
     result
 }
 
-/// journal 摘要投影构造（确定性纯函数；同输入逐字节同输出）。
+/// journal 摘要投影数据面（确定性纯投影零渲染）：`build_journal_digest`
+/// 渲染面与 `audit_summary` 摘要卡共用的单一投影源——投影与渲染分离，
+/// 两侧行为均与抽取前逐字节/逐字段一致。
+pub(crate) struct JournalDigestStats {
+    /// 轮目标（去重截 5 条）
+    pub goals: Vec<String>,
+    /// LLM 调用总量
+    pub llm_total: usize,
+    /// LLM react 用途调用数（sidecar 用途不入此列）
+    pub llm_react: usize,
+    /// 工具调用按名分布（字典序）
+    pub tool_by_name: std::collections::BTreeMap<String, usize>,
+    /// 工具成功计数
+    pub tool_ok: usize,
+    /// 工具失败清单（"工具 调用失败(call_id)" 逐条，seq 序）
+    pub tool_err: Vec<String>,
+    /// policy 拦截计数
+    pub policy_blocked: usize,
+    /// 审批拒绝计数
+    pub approvals_rejected: usize,
+    /// 收尾状态（status, steps, duration_ms；无 turn_ended 记录 = None）
+    pub ended: Option<(String, u64, u64)>,
+}
+
+/// journal 摘要投影构造（确定性纯函数；同输入同输出）。
 ///
 /// 投影面：轮目标（去重截 5 条）/LLM 调用计数（react 与 sidecar 分列）/
-/// 工具调用总量与按名分布（字典序）/成功失败计数/错误与死路清单（工具
-/// 失败逐条+policy 拦截+审批拒绝计数，seq 序）/收尾状态。零 LLM、
-/// 零向量（检索红线内）。
-pub(crate) fn build_journal_digest(session_id: &str, lines: &[JournalLine]) -> String {
-    let mut goals: Vec<String> = Vec::new();
-    let mut llm_total = 0usize;
-    let mut llm_react = 0usize;
-    let mut tool_by_name: std::collections::BTreeMap<String, usize> = Default::default();
+/// 工具调用总量与按名分布/成功失败计数/policy 拦截/审批拒绝/收尾状态。
+/// 零 LLM、零向量（检索红线内）。
+pub(crate) fn journal_digest_stats(lines: &[JournalLine]) -> JournalDigestStats {
+    let mut stats = JournalDigestStats {
+        goals: Vec::new(),
+        llm_total: 0,
+        llm_react: 0,
+        tool_by_name: Default::default(),
+        tool_ok: 0,
+        tool_err: Vec::new(),
+        policy_blocked: 0,
+        approvals_rejected: 0,
+        ended: None,
+    };
     let mut call_tool: std::collections::BTreeMap<String, String> = Default::default();
-    let mut tool_ok = 0usize;
-    let mut tool_err: Vec<String> = Vec::new();
-    let mut policy_blocked = 0usize;
-    let mut approvals_rejected = 0usize;
-    let mut ended: Option<(&str, u64, u64)> = None;
     for line in lines {
         match &line.event {
             JournalEvent::TurnStarted { goal, .. } => {
-                if !goals.contains(goal) && goals.len() < 5 {
-                    goals.push(goal.clone());
+                if !stats.goals.contains(goal) && stats.goals.len() < 5 {
+                    stats.goals.push(goal.clone());
                 }
             }
             JournalEvent::LlmCalled { purpose, .. } => {
-                llm_total += 1;
+                stats.llm_total += 1;
                 if purpose == "react" {
-                    llm_react += 1;
+                    stats.llm_react += 1;
                 }
             }
             JournalEvent::ToolInvoked { call_id, tool, .. } => {
-                *tool_by_name.entry(tool.clone()).or_insert(0) += 1;
+                *stats.tool_by_name.entry(tool.clone()).or_insert(0) += 1;
                 call_tool.insert(call_id.clone(), tool.clone());
             }
             JournalEvent::ToolResult {
                 call_id, status, ..
             } => {
                 if status == "ok" {
-                    tool_ok += 1;
+                    stats.tool_ok += 1;
                 } else {
                     let tool = call_tool.get(call_id).cloned().unwrap_or_default();
-                    tool_err.push(format!("{tool} 调用失败({call_id})"));
+                    stats.tool_err.push(format!("{tool} 调用失败({call_id})"));
                 }
             }
             JournalEvent::PolicyJudged { verdict, .. } => {
                 if verdict == "blocked" {
-                    policy_blocked += 1;
+                    stats.policy_blocked += 1;
                 }
             }
             JournalEvent::ApprovalResolved { decision, .. } => {
                 if decision != "approved" {
-                    approvals_rejected += 1;
+                    stats.approvals_rejected += 1;
                 }
             }
             JournalEvent::TurnEnded {
@@ -457,45 +482,65 @@ pub(crate) fn build_journal_digest(session_id: &str, lines: &[JournalLine]) -> S
                 steps,
                 duration_ms,
                 ..
-            } => ended = Some((status.as_str(), *steps, *duration_ms)),
+            } => stats.ended = Some((status.clone(), *steps, *duration_ms)),
             _ => {}
         }
     }
-    let tool_total: usize = tool_by_name.values().sum();
-    let dist = tool_by_name
+    stats
+}
+
+/// journal 摘要投影构造（确定性纯函数；同输入逐字节同输出）。
+///
+/// 投影面：轮目标（去重截 5 条）/LLM 调用计数（react 与 sidecar 分列）/
+/// 工具调用总量与按名分布（字典序）/成功失败计数/错误与死路清单（工具
+/// 失败逐条+policy 拦截+审批拒绝计数，seq 序）/收尾状态。零 LLM、
+/// 零向量（检索红线内）。投影逻辑单源化在 [`journal_digest_stats`]，
+/// 渲染面与摘要卡工具共用（零行为变化）。
+pub(crate) fn build_journal_digest(session_id: &str, lines: &[JournalLine]) -> String {
+    let stats = journal_digest_stats(lines);
+    let tool_total: usize = stats.tool_by_name.values().sum();
+    let dist = stats
+        .tool_by_name
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join(", ");
     let mut s = format!("会话 journal 摘要（session {session_id}）。\n");
-    if goals.is_empty() {
+    if stats.goals.is_empty() {
         s.push_str("轮目标: 无\n");
     } else {
-        s.push_str(&format!("轮目标: {}\n", goals.join("；")));
+        s.push_str(&format!("轮目标: {}\n", stats.goals.join("；")));
     }
-    s.push_str(&format!("LLM 调用: {llm_total}（react {llm_react}）。\n"));
+    s.push_str(&format!(
+        "LLM 调用: {}（react {}）。\n",
+        stats.llm_total, stats.llm_react
+    ));
     if tool_total == 0 {
         s.push_str("工具调用: 无。\n");
     } else {
         s.push_str(&format!(
-            "工具调用: {tool_total}（成功 {tool_ok} / 失败 {}）；分布: {dist}。\n",
-            tool_total - tool_ok
+            "工具调用: {tool_total}（成功 {} / 失败 {}）；分布: {dist}。\n",
+            stats.tool_ok,
+            tool_total - stats.tool_ok
         ));
     }
-    let dead_ends = if tool_err.is_empty() && policy_blocked == 0 && approvals_rejected == 0 {
+    let dead_ends = if stats.tool_err.is_empty()
+        && stats.policy_blocked == 0
+        && stats.approvals_rejected == 0
+    {
         "无".to_string()
     } else {
-        let mut parts = tool_err;
-        if policy_blocked > 0 {
-            parts.push(format!("policy 拦截 {policy_blocked} 次"));
+        let mut parts = stats.tool_err.clone();
+        if stats.policy_blocked > 0 {
+            parts.push(format!("policy 拦截 {} 次", stats.policy_blocked));
         }
-        if approvals_rejected > 0 {
-            parts.push(format!("审批拒绝 {approvals_rejected} 次"));
+        if stats.approvals_rejected > 0 {
+            parts.push(format!("审批拒绝 {} 次", stats.approvals_rejected));
         }
         parts.join("；")
     };
     s.push_str(&format!("错误与死路: {dead_ends}。\n"));
-    match ended {
+    match stats.ended {
         Some((status, steps, ms)) => {
             s.push_str(&format!("收尾: {status}，{steps} 步，{ms}ms。\n"));
         }

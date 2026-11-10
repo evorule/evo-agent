@@ -377,6 +377,13 @@ const SWITCH_MEMORY_RECALL: &str = AGENT_TOOLS_MEMORY_RECALL;
 pub const AGENT_TOOLS_AUDIT_QUERY: &str = "agentTools.audit_query";
 const SWITCH_AUDIT_QUERY: &str = AGENT_TOOLS_AUDIT_QUERY;
 
+/// agentTools.audit_summary（默认关；审计摘要卡只读工具——digest 级「最近
+/// 发生了什么」小视图，输出总预算 64KiB，显式开启才进 LLM 契约）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_AUDIT_SUMMARY: &str = "agentTools.audit_summary";
+const SWITCH_AUDIT_SUMMARY: &str = AGENT_TOOLS_AUDIT_SUMMARY;
+
 /// agentTools.memory_tombstone（默认关；记忆墓碑写入工具——沉淀污染环
 /// 存量出口，显式启用后仍走 Sensitive 意图裁决 + candidate 审批）
 ///
@@ -563,6 +570,11 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 审计查询：三 scope 只读入口（gov/session/
         // journal）。注册/重绑/审批面同 memory_recall（只读 Standard+AutoPolicy）。
         b("audit_query", vec![Memory]),
+        // 审计摘要卡：digest 级「最近发生了什么」小视图（recent_events/
+        // digest/recent_facts 三卡合一，输出总预算 64KiB）。注册/重绑/审批面
+        // 同 audit_query（只读 Standard+AutoPolicy）；缺省关
+        // （agentTools.audit_summary）——显式开启才进 LLM 契约。
+        b("audit_summary", vec![Memory]),
         // 记忆墓碑（沉淀污染环存量出口）：null 墓碑写入（path+reason，
         // 存在性核对在执行体内）。注册/重绑同 memory_recall；Sensitive +
         // ManualDefault（双闸同 session_spawn——写面治理意图必报 + 人工
@@ -603,7 +615,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             "file_read" | "image_load" | "file_list" | "search_files" | "grep_files"
             | "code_search" | "git_status" | "git_diff" | "git_log" | "query_journal"
             | "query_trace" | "read_back" | "diff_runs" | "read_skill" | "memory_recall"
-            | "audit_query" | "todo_read" | "handover_read" | "web_search" => {
+            | "audit_query" | "audit_summary" | "todo_read" | "handover_read" | "web_search" => {
                 m.side_effect = EffectClass::ReadOnly;
             }
             _ => {}
@@ -703,6 +715,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             "memory_recall" => sw(SWITCH_MEMORY_RECALL, true),
             // 审计查询：只读入口，默认开
             "audit_query" => sw(SWITCH_AUDIT_QUERY, true),
+            // 审计摘要卡：只读小视图，缺省关（替代拉链检查的摘要入口，
+            // 显式启用才进 LLM 契约面）
+            "audit_summary" => sw(SWITCH_AUDIT_SUMMARY, false),
             // 记忆墓碑：写入面默认关（显式启用才进 LLM 契约）
             "memory_tombstone" => sw(SWITCH_MEMORY_TOMBSTONE, false),
             // todo 任务清单族（批K 段4）：单键双绑（工具契约面过滤 +
@@ -1101,9 +1116,11 @@ mod tests {
         //   （交互批 计划模式 plan_submit +1：内置 37→38，数量锁 103→104）
         //   （取回件 tool_result_fetch +1：内置 38→39，数量锁 104→105）
         //   （工作区构建反馈回路 build_check +1：内置 39→40，数量锁 105→106）
-        assert_eq!(builtin_manifests().len(), 40);
+        //   （审计摘要卡 audit_summary +1：内置 40→41，数量锁 106→107，
+        //     缺省关——开关显式开启才进 LLM 契约）
+        assert_eq!(builtin_manifests().len(), 41);
         assert_eq!(rule_manifests().len(), 60);
-        assert_eq!(all().len(), 107);
+        assert_eq!(all().len(), 108);
     }
 
     #[test]
@@ -1226,20 +1243,22 @@ mod tests {
 
     #[test]
     fn test_effect_class_calibration_locked() {
-        // 读写分级标定锁（并行调度分组判据）：只读族显式标定数=27；
-        // 未标定一律 Mutating（保守串行，缺省不变式）。扩标须 diff 审改数。
+        // 读写分级标定锁（并行调度分组判据）：只读族显式标定数=28
+        // （审计摘要卡 audit_summary 只读小视图 +1）；未标定一律 Mutating
+        // （保守串行，缺省不变式）。扩标须 diff 审改数。
         let all = static_manifests();
         let readonly: Vec<&str> = all
             .iter()
             .filter(|m| m.side_effect == EffectClass::ReadOnly)
             .map(|m| m.name.as_str())
             .collect();
-        assert_eq!(readonly.len(), 27, "ReadOnly 标定数锁: {:?}", readonly);
+        assert_eq!(readonly.len(), 28, "ReadOnly 标定数锁: {:?}", readonly);
         let look = |n: &str| lookup_static(n).unwrap().side_effect;
         // 内置只读族抽样
         assert_eq!(look("file_read"), EffectClass::ReadOnly);
         assert_eq!(look("grep_files"), EffectClass::ReadOnly);
         assert_eq!(look("memory_recall"), EffectClass::ReadOnly);
+        assert_eq!(look("audit_summary"), EffectClass::ReadOnly);
         assert_eq!(look("todo_read"), EffectClass::ReadOnly);
         assert_eq!(look("handover_read"), EffectClass::ReadOnly);
         assert_eq!(look("web_search"), EffectClass::ReadOnly);
@@ -1396,7 +1415,8 @@ mod tests {
     /// 历史批注曾滞后于实际行数，20261021 批K 段4 修正口径）；批K 段4
     /// todo_write/todo_read 接入 → 43 条；批K 段5 http_request 接入
     /// （默认关）→ 44 条；批K 段7 ask_user 接入 → 45 条；写面撤销批
-    /// workspace_undo 接入（默认开）→ 46 条
+    /// workspace_undo 接入（默认开）→ 46 条；审计摘要卡 audit_summary
+    /// 接入（默认关）→ 47 条
     const SWITCH_SNAPSHOT: &[(&str, &str, bool)] = &[
         ("file_create", "agentTools.fileCreate", true),
         ("edit_file", "agentTools.editFile", true),
@@ -1442,6 +1462,8 @@ mod tests {
         ("memory_recall", "agentTools.memory_recall", true),
         // 审计查询
         ("audit_query", "agentTools.audit_query", true),
+        // 审计摘要卡（默认关：digest 级小视图，显式开启才进 LLM 契约）
+        ("audit_summary", "agentTools.audit_summary", false),
         // 记忆墓碑（默认关）
         ("memory_tombstone", "agentTools.memory_tombstone", false),
         // todo 任务清单族（批K 段4）：单键双绑同列

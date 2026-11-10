@@ -359,6 +359,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.audit_summary",
+            kind: SettingType::Boolean,
+            default: json!(false),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "审计摘要卡工具（audit_summary，只读）：digest 级「最近发生了什么」小视图——journal 最新事件清单/sediment 会话摘要投影/会话 facts 元数据三卡合一，输出总预算 64KiB、超限大字段降级 digest 标注、定位键永不降级（替代 scope 全量拉链检查的摘要入口；默认关——显式开启才进 LLM 契约，关闭时 agent 用 audit_query 拉链检查）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "agentTools.memory_tombstone",
             kind: SettingType::Boolean,
             default: json!(false),
@@ -1029,7 +1039,8 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 61); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键)
+        assert_eq!(settings.len(), 62); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键;审计摘要卡 audit_summary 接入 +1)
+        assert_eq!(settings["agentTools.audit_summary"], json!(false));
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));

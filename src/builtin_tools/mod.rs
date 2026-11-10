@@ -405,6 +405,14 @@ fn default_safe_toolkit_core(
         crate::agent::audit_query_tool::AUDIT_QUERY_TOOL,
         Arc::new(crate::agent::audit_query_tool::AuditQueryTool::unwired()),
     );
+    // 审计摘要卡：digest 级「最近发生了什么」小视图（recent_events/digest/
+    // recent_facts 三卡合一，输出总预算 64KiB，定位键永不降级）；占位/
+    // 会话期重绑同构，开关 agentTools.audit_summary 缺省关——显式开启才进
+    // LLM 契约。只读工具（不产生任何写入事实）
+    handler.register_static(
+        crate::agent::audit_summary_tool::AUDIT_SUMMARY_TOOL,
+        Arc::new(crate::agent::audit_summary_tool::AuditSummaryTool::unwired()),
+    );
     // 自主开会话工具（自主交接设计 PR-H3）：同上占位/会话期重绑形态；
     // 重绑时注入链共享态与子 runner 工厂（护栏三件+fork+自动驱动在执行体内）
     handler.register_static(
@@ -1357,6 +1365,29 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     required: false,
                 },
             ],
+        },
+        ToolSpec {
+            name: "audit_summary".to_string(),
+            description: "Read-only digest-level summary card of what recently happened in \
+                          this session — prefer this over pulling full audit chains with \
+                          audit_query. Returns three cards in one call: recent_events \
+                          (latest journal events as seq/ts/type/summary_line locator rows, \
+                          newest first), digest (projection of the session journal: turn \
+                          goals, LLM call counts, tool-call distribution, ok/failed \
+                          counts, policy blocks, approval rejections, end status), and \
+                          recent_facts (session fact metadata rows: fact_id/path/ts/bytes \
+                          — oversized values appear only as a blake3 digest; full values \
+                          are never inlined, fetch them by fact_id via audit_query). \
+                          Total output is capped at 64KiB; oversized single fields are \
+                          downgraded to {truncated,bytes,digest} markers. The tool never \
+                          writes."
+                .to_string(),
+            parameters: vec![ParameterSpec {
+                name: "limit".to_string(),
+                r#type: "integer".to_string(),
+                description: "Max rows per card (default 20, max 50)".to_string(),
+                required: false,
+            }],
         },
         ToolSpec {
             name: "query_journal".to_string(),

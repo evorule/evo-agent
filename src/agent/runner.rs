@@ -4693,6 +4693,23 @@ impl AgentRunner {
                 .register_static(crate::agent::audit_query_tool::AUDIT_QUERY_TOOL, exec);
             tracing::debug!("audit_query tool re-bound (session-scoped, read-only)");
         }
+        // 审计摘要卡接线:audit_summary 占位→wired。门控同 audit_query(启动
+        // 期占位在场才接线——缺省关时开关过滤后不在场即跳过);journal 句柄
+        // 透传(None 时调用 fail-visible)。
+        if self
+            .tool_handler
+            .has_tool(crate::agent::audit_summary_tool::AUDIT_SUMMARY_TOOL)
+        {
+            let exec: std::sync::Arc<dyn crate::io_handlers::tool_handler::ToolFunction> =
+                std::sync::Arc::new(crate::agent::audit_summary_tool::AuditSummaryTool::wired(
+                    session_id.to_string(),
+                    client.clone(),
+                    journal.clone(),
+                ));
+            self.tool_handler
+                .register_static(crate::agent::audit_summary_tool::AUDIT_SUMMARY_TOOL, exec);
+            tracing::debug!("audit_summary tool re-bound (session-scoped, read-only)");
+        }
         // 自主开会话接线(自主交接设计 PR-H3):门控同 handover(启动期占位
         // 在场才接线)。链态惰性初始化(发起方会话首个接线点创建);链 token
         // 计量注入(既有 delegate 预算计数器在场时让位——链预算降级为仅计
