@@ -13,10 +13,13 @@
       "freshness": {
         "repo": "C:\\path\\to\\evorule-server",
         "paths": [
-          "src",
+          "evorule-server/src",
+          "evorule-server/build.rs",
+          "evorule-server/Cargo.toml",
+          "core",
+          "plugins",
           "Cargo.toml",
-          "Cargo.lock",
-          "build.rs"
+          "Cargo.lock"
         ],
         "policy": "enforce"
       }
@@ -46,8 +49,7 @@
         "paths": [
           "src",
           "Cargo.toml",
-          "Cargo.lock",
-          "build.rs"
+          "Cargo.lock"
         ],
         "policy": "enforce"
       }
