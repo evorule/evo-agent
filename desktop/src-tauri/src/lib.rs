@@ -178,6 +178,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let handle = app.handle().clone();
             let nav_port: NavPort = Arc::new(RwLock::new(None));
             let serve_token = orchestrator::gen_token();
+            // 运营类第二令牌（token 拓扑面）：进 serve 鉴权列表但不注入
+            // webview——持此令牌的调用落 operator 类（特权闸开启时管理面
+            // 403）。与其它令牌同款纪律（不落盘/不进命令行/不进日志）
+            let ops_token = orchestrator::gen_token();
             let engine_token = orchestrator::gen_token();
             // 执行体调用方令牌：serve 与 LLM 执行体共享，仅 env 注入双方
             let executor_token = orchestrator::gen_token();
@@ -222,6 +226,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 console,
                 engine_extra_args,
                 serve_token,
+                ops_token,
                 engine_token,
                 executor_token,
                 service_token,

@@ -70,13 +70,13 @@ Import refuses to overwrite any active **or revoked** row of the same name (appr
 `POST /api/skills/approve` runs, in order:
 
 1. **Write-face gate** — authentication must be enabled (anonymous/`--no-auth` mode is read-only; the denial is itself ledgered).
-2. **Privilege-class gate** — when the optional `[auth] human_tokens` list is configured, only tokens on that list may approve/revoke/import; other valid tokens are operator-class and receive a 403 with configuration guidance. With the list empty, the gate is off and behavior matches the pre-gate releases.
+2. **Privilege-class gate** — when the `[auth] human_tokens` list is non-empty, only tokens on that list may approve/revoke/import; other valid tokens are operator-class and receive a 403 with configuration guidance. With the list empty the gate is off (pure-web / manual deployments: opt-in). **The desktop shell turns the gate on by default** — it provisions two per-boot tokens: the UI token (injected into the workbench webview, privileged class) and a separate ops token (never injected into the webview, operator class), so the approval gate is enforced out of the box.
 3. **Frontmatter + name-parity validation** — unparseable frontmatter or a declared name that mismatches the directory name is rejected (the latter is the anti-phishing check, parity with import).
 4. **Encoding gate** — content containing U+FFFD replacement characters (encoding corruption) is rejected 422 before the hash can pin corrupted bytes.
 5. **Leak screening, two tiers** — authorship-declaration phrases (hard-block 422) and LLM-technical terms (warning, passes). Exemptions: a phrase wrapped entirely in corner brackets `「…」` is quotation context and degrades the hard block to a warning; warning hits adjacent to path/identifier characters (e.g. the product's own install root) are skipped.
 6. **Hash pin + ledger commit** — blake3 over the file, appended to the journal, snapshot updated.
 
-Every approve/revoke/import is recorded to the human-gate ledger with two attribution fields: `identity` (`human`/`anonymous` — did the call pass authentication) and `class` (`privileged`/`operator` — which token class performed it). The two fields together are what make human rulings attributable.
+Every approve/revoke/import is recorded to the human-gate ledger with two attribution fields: `identity` (`human`/`anonymous` — did the call pass authentication) and `class` (`privileged`/`operator` — which token class performed it). The two fields together are what make human rulings attributable. File-face mutations (`/api/files/*` writes) carry the same `class` field, so a tool-chain write is distinguishable from a UI save in the ledger.
 
 ## Ledger deepening: journal, drift self-heal, signing
 
@@ -121,7 +121,7 @@ Integrity (hash) and currency (environment) are deliberately orthogonal: the has
 |-----|-------|---------|---------|
 | `[auth] enabled` | config / `EVO_AGENT_AUTH__ENABLED` | authentication on/off (off = read-only face) | false |
 | `[auth] tokens` | config / `EVO_AGENT_AUTH__TOKENS` | valid API tokens | empty |
-| `[auth] human_tokens` | config / `EVO_AGENT_AUTH__HUMAN_TOKENS` | privileged tokens; non-empty turns on the approval class gate | empty (gate off) |
+| `[auth] human_tokens` | config / `EVO_AGENT_AUTH__HUMAN_TOKENS` | privileged tokens; non-empty turns on the approval class gate | empty (gate off; the desktop shell always sets it to the UI token — gate on) |
 | `skills.freshnessNotices` | workbench settings | freshness notice channel switch | true |
 | `EVO_AGENT_JOURNAL__SIGNING_KEY` | env, handed by the desktop shell | boot-scoped journal signing seed (hex 32B); scrubbed from env after locking into memory | absent (unsigned mode) |
 
@@ -160,6 +160,7 @@ Integrity (hash) and currency (environment) are deliberately orthogonal: the has
 
 - Same-OS-user file-system attackers can rewrite journal and snapshot consistently (detection then relies on the v1 layer: gate-ledger cross-reference and manifest notices). Boot-scoped signatures make partial tampering and post-anchor appends detectable; wiping the journal entirely degrades to unsigned mode.
 - The approval class gate is only as strong as token custody: with `human_tokens` configured, privileged tokens must not be reachable by the agent runtime (the desktop hands the runtime an operator-class token; the workbench UI and any human REST calls use the privileged token).
+- Token theft is a residual surface, not a closed one: a caller that can read the workbench webview's storage can obtain the privileged UI token and pass the gate. Governance approval promises are therefore scoped to the **desktop form** (the UI token never leaves the shell-controlled webview; pure-web deployments run with the gate off unless configured, and their confirmation surface is weaker — configure `human_tokens` and keep tokens out of shared storage when serving beyond localhost).
 - `read_skill` verifies registered skills only; raw file reads of a SKILL.md are plain file reads (content, not activation) and remain sandboxed as usual.
 
 ## Test anchors
@@ -175,7 +176,8 @@ Integrity (hash) and currency (environment) are deliberately orthogonal: the has
 | Replay across reload | `agent::skill_store::tests::test_journal_replays_across_reload` |
 | Signed mode roundtrip + tamper | `agent::skill_store::tests::test_journal_signed_mode_roundtrip_and_tamper` |
 | Freshness stamp + mismatch list | `agent::skill_store::tests::test_merge_flags_env_stale_only_for_sensitive_and_mismatched`, `api::skill_api::tests::test_approve_records_env_stamp_for_sensitive_skills` |
-| Privilege gate + ledger class | `api::skill_api::tests::test_privileged_gate_blocks_operator_self_approval`, `test_approve_ledger_records_class_without_gate` |
+| Privilege gate + ledger class | `api::skill_api::tests::test_privileged_gate_blocks_operator_self_approval`, `test_approve_ledger_records_class_without_gate`, `api::file_api::tests::test_ledger_records_class_for_file_writes` |
+| Desktop dual-token provisioning | `desktop::orchestrator::tests::serve_spawn_carries_auth_token_via_env_not_command_line` |
 | Registry file-face protection | `api::file_api::tests::test_skill_ledger_denied_on_file_face` |
 | Anti-phishing scan parity | `agent::skill_store::tests::test_scan_rejects_frontmatter_name_mismatch` |
 | Revoked-name restore guidance | `api::skill_api::tests::test_import_revoked_name_points_to_restore_path` |

@@ -60,6 +60,10 @@ pub struct Supervisor {
     pub console: Console,
     pub engine_extra_args: Vec<String>,
     pub serve_token: String,
+    /// 运营类第二令牌（token 拓扑面）：与 serve_token 同批生成，仅进 serve
+    /// 鉴权列表，不注入 webview——持此令牌的一切调用落 operator 类
+    /// （管理面 approve/revoke/import 在特权闸开启时 403）。
+    pub ops_token: String,
     pub engine_token: String,
     pub executor_token: String,
     /// service 身份令牌（sediment 受信通道写受保护域用；仅 env 注入
@@ -85,6 +89,7 @@ impl Supervisor {
         console: Console,
         engine_extra_args: Vec<String>,
         serve_token: String,
+        ops_token: String,
         engine_token: String,
         executor_token: String,
         service_token: String,
@@ -107,6 +112,7 @@ impl Supervisor {
             console,
             engine_extra_args,
             serve_token,
+            ops_token,
             engine_token,
             executor_token,
             service_token,
@@ -132,6 +138,7 @@ impl Supervisor {
             console: &self.console,
             engine_extra_args: &self.engine_extra_args,
             serve_token: &self.serve_token,
+            ops_token: &self.ops_token,
             engine_token: &self.engine_token,
             executor_token: &self.executor_token,
             service_token: &self.service_token,
