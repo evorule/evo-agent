@@ -1380,6 +1380,9 @@ pub struct MemoryManager {
     /// 共享，Mutex 同款理由——axum State 要求 Sync）。纯性能层：任何索引
     /// 故障只降级回既有扫描路径，不得改变读写结果。
     prefix_index: std::sync::Arc<crate::agent::memory_prefix_index::PrefixIndexState>,
+    /// 共享记忆读取时衰减策略（缺省关闭=现行为零变化；显式配置激活）。
+    /// 只作用于共享分区读视图；判定与存储细节见 `memory_decay` 模块头。
+    decay: crate::agent::memory_decay::DecayPolicy,
 }
 
 /// 投影读取的三种结果（改进1：读路径"投影优先 + cache 离线兜底"）
@@ -1419,6 +1422,7 @@ impl MemoryManager {
             prefix_index: std::sync::Arc::new(
                 crate::agent::memory_prefix_index::PrefixIndexState::default(),
             ),
+            decay: crate::agent::memory_decay::DecayPolicy::default(),
         }
     }
 
@@ -1455,6 +1459,22 @@ impl MemoryManager {
     pub fn with_cache_verify_interval_secs(mut self, secs: u64) -> Self {
         self.cache_verify_interval_secs = secs;
         self
+    }
+
+    /// 设置共享记忆读取时衰减策略（builder 风格）
+    ///
+    /// 缺省 = [`crate::agent::memory_decay::DecayPolicy::default()`]（关闭）：
+    /// 读路径整体短路，既有行为逐字节不变。显式传入 `enabled: true` 后，
+    /// 共享分区存活记录若闲置超上限，读取时降级为归档引用卡（零原文留存；
+    /// 原值永在账，判定细节见 `memory_decay` 模块头）。
+    pub fn with_decay_policy(mut self, policy: crate::agent::memory_decay::DecayPolicy) -> Self {
+        self.decay = policy;
+        self
+    }
+
+    /// 获取读取时衰减策略
+    pub fn decay_policy(&self) -> crate::agent::memory_decay::DecayPolicy {
+        self.decay
     }
 
     /// 设置 session_id（可变引用）
@@ -1875,7 +1895,42 @@ impl MemoryManager {
             Err(e) => Err(e), // SessionNotSet 传播（不变量）
             // 权威真相：server 可达，以 evorule 为准并回填 cache
             Ok(ProjectOutcome::Reachable(Some(record))) => {
-                let record = *record;
+                let mut record = *record;
+                // 共享分区读取时衰减（缺省关闭：`enabled=false` 时本分支整体
+                // 短路，既有读行为逐字节不变）。墓碑/TTL 已在投影层优先裁决
+                // 为"权威无记忆"，衰减只对存活记录做读面视图降级，不会双重
+                // 遮蔽；零物理处理——原值永在账，只改读面（判定与存储细节
+                // 见 `memory_decay` 模块头）。
+                if self.decay.enabled && matches!(scope, MemoryScope::Shared) {
+                    if let Ok(session_id) = self.session_id_for_scope(&scope) {
+                        let last_access = self.read_shared_access_stamp(&session_id, key).await;
+                        let effective_ts = crate::agent::memory_decay::decay_effective_ts(
+                            last_access,
+                            record.timestamp,
+                        );
+                        let now = now_secs();
+                        if crate::agent::memory_decay::is_archived(&self.decay, effective_ts, now) {
+                            let path = self.build_path_scoped(&scope, key);
+                            let card = crate::agent::memory_decay::build_archived_card(
+                                &record,
+                                &path,
+                                last_access,
+                            );
+                            if let Ok(card_json) = serde_json::to_string(&card) {
+                                record.value = card_json;
+                                // 归档卡读不刷新访问戳：读引用卡不算真实访问
+                                // （否则周期性摸卡即可永久免衰减，判定时钟被
+                                // 读操作自身击穿）
+                                self.cache.insert(cache_key, record.clone());
+                                return Ok(Some(record));
+                            }
+                            // 卡片序列化失败（纯数据面，不应发生）→ 回落全量读
+                        }
+                        // 全量读 = 有效访问：best-effort 刷新访问戳（fail-soft
+                        // 写副作用；戳写任何故障不得影响本次读结果）
+                        self.touch_shared_access_stamp(&session_id, key, now).await;
+                    }
+                }
                 self.cache.insert(cache_key, record.clone());
                 Ok(Some(record))
             }
@@ -1895,6 +1950,51 @@ impl MemoryManager {
                 }
                 Ok(None)
             }
+        }
+    }
+
+    /// 读共享键的访问戳（衰减判定时钟输入；fail-soft）。
+    ///
+    /// 任何故障（端点失败/载荷损坏/键不符）→ `None`：判定时钟回落写入
+    /// 时间（纯函数对未知戳的既定输入），绝不影响读结果。
+    async fn read_shared_access_stamp(&self, session_id: &str, key: &str) -> Option<u64> {
+        let stamp_path = crate::agent::memory_decay::access_stamp_path(&self.namespace, key);
+        let facts = self
+            .evorule_client
+            .get_facts(session_id, Some(&stamp_path))
+            .await
+            .ok()?;
+        let payload = facts
+            .into_iter()
+            .rfind(|f| f.path == stamp_path)
+            .and_then(|f| {
+                serde_json::from_value::<crate::agent::memory_decay::AccessStampPayload>(f.value)
+                    .ok()
+            })
+            .filter(|p| p.is_sane(key))?;
+        Some(payload.last_access_secs)
+    }
+
+    /// 刷新共享键的访问戳（全量读视为有效访问；fail-soft best-effort）。
+    ///
+    /// 写失败只留 debug 痕，绝不向调用方传播（读结果已定，戳纯为判定时钟）。
+    async fn touch_shared_access_stamp(&self, session_id: &str, key: &str, now: u64) {
+        let payload = crate::agent::memory_decay::AccessStampPayload::new(key, now);
+        let Ok(value) = serde_json::to_value(&payload) else {
+            return;
+        };
+        let stamp_path = crate::agent::memory_decay::access_stamp_path(&self.namespace, key);
+        if let Err(e) = self
+            .evorule_client
+            .update_payload(session_id, &stamp_path, &value)
+            .await
+        {
+            tracing::debug!(
+                session_id = %session_id,
+                path = %stamp_path,
+                error = %e,
+                "access stamp write failed (fail-soft); decay clock falls back to write timestamp"
+            );
         }
     }
 
@@ -8767,5 +8867,386 @@ mod tests {
                 assert_eq!(b[i].fact_id, a[i].fact_id, "键 {k}: 两路 fact_id 一致");
             }
         }
+    }
+
+    // =====================================================================
+    // 共享记忆读取时衰减（缺省关闭；显式配置激活后读面降级为归档引用卡）
+    // 零物理处理：原值永在账，衰减只改读面视图；判定纯函数可回放。
+    // 墓碑/TTL 优先于衰减（投影层已裁决为权威无记忆，不做双重遮蔽）。
+    // =====================================================================
+
+    use crate::agent::memory_decay as decay;
+
+    /// 显式开启的衰减策略（闲置上限参数化）
+    fn decay_policy(max_idle_age_secs: u64) -> decay::DecayPolicy {
+        decay::DecayPolicy {
+            enabled: true,
+            max_idle_age_secs,
+        }
+    }
+
+    #[test]
+    fn decay_settings_wiring_reflected_in_manager_policy() {
+        // 装配接线映射：设置键 → DecayPolicy::from_settings → with_decay_policy
+        // → decay_policy() 反映（serve 主会话装配点同款链路，type-checked 一行）
+        let map = serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(
+            serde_json::json!({
+                "memory.decay.enabled": true,
+                "memory.decay.maxIdleAgeSecs": 7200
+            }),
+        )
+        .unwrap();
+        let mgr = MemoryManager::new("test", make_test_client())
+            .with_decay_policy(decay::DecayPolicy::from_settings(&map));
+        assert!(mgr.decay_policy().enabled, "设置开启 → 管理器策略激活");
+        assert_eq!(mgr.decay_policy().max_idle_age_secs, 7200);
+
+        // 缺省（键缺席）→ 管理器策略关闭 = 现行为零变化
+        let empty = serde_json::Map::new();
+        let mgr = MemoryManager::new("test", make_test_client())
+            .with_decay_policy(decay::DecayPolicy::from_settings(&empty));
+        assert!(!mgr.decay_policy().enabled, "设置缺席 → 缺省关闭");
+        assert_eq!(
+            mgr.decay_policy().max_idle_age_secs,
+            decay::DEFAULT_MAX_IDLE_AGE_SECS
+        );
+
+        // 未显式接线的裸构造（子代理/HTTP 观测面路径）→ 同样缺省关闭
+        let bare = MemoryManager::new("test", make_test_client());
+        assert!(!bare.decay_policy().enabled);
+    }
+
+    #[tokio::test]
+    async fn decay_disabled_by_default_full_value_parity() {
+        // 缺省不变式：衰减关闭（缺省策略）时读行为与账面逐字节一致，
+        // 且零访问戳写（分支整体短路，读路径零新增交互）
+        let mut server = mockito::Server::new_async().await;
+        let mut mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        assert!(!mgr.decay_policy().enabled, "缺省策略必须关闭");
+        assert_eq!(
+            mgr.decay_policy().max_idle_age_secs,
+            decay::DEFAULT_MAX_IDLE_AGE_SECS,
+            "闲置上限缺省口径"
+        );
+
+        let stamp_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .expect(0)
+            .create_async()
+            .await;
+        // 随机化夹具（xorshift 确定性种子，可复算）：逐键断言全量读回
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let now = now_secs();
+        for i in 0..8u64 {
+            let key = format!("k{i}");
+            let value = format!("parity-value-{}", next() % 1_000_000);
+            let ts = now.saturating_sub(60 * (i + 1));
+            let body = pidx_shared_fact_json(
+                100 + i,
+                &format!("shared.test.{key}"),
+                1,
+                serde_json::json!({"key": key, "value": value, "timestamp": ts}),
+            );
+            let _get = server
+                .mock(
+                    "GET",
+                    format!("/api/shared/facts?prefix=shared.test.{key}").as_str(),
+                )
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create_async()
+                .await;
+            let record = mgr
+                .get_scoped(MemoryScope::Shared, &key)
+                .await
+                .unwrap()
+                .expect("命中");
+            assert_eq!(record.value, value, "键 {key}: 衰减关闭=账面值逐字节返回");
+            assert_eq!(record.timestamp, ts, "键 {key}: 时间戳原样");
+            assert_eq!(record.key, key);
+        }
+        stamp_post.assert_async().await; // 关闭态零访问戳写
+    }
+
+    #[tokio::test]
+    async fn decay_enabled_archived_read_returns_reference_card() {
+        // 闲置超上限 → 读取降级为归档引用卡：digest 口径正确、账面锚点齐全、
+        // 零原文留存；归档读不刷新访问戳（读卡不算真实访问）
+        let mut server = mockito::Server::new_async().await;
+        let original = "long-dormant-fact-original-text";
+        let now = now_secs();
+        let ts = now.saturating_sub(2000); // 闲置 2000s > 上限 1000s
+        let body = pidx_shared_fact_json(
+            52,
+            "shared.test.topic",
+            3,
+            serde_json::json!({"key": "topic", "value": original, "timestamp": ts}),
+        );
+        let _get = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.topic")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        let stamp_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()))
+            .with_session_id("s1")
+            .with_decay_policy(decay_policy(1000));
+        let record = mgr
+            .get_scoped(MemoryScope::Shared, "topic")
+            .await
+            .unwrap()
+            .expect("存活记录必命中");
+        assert_ne!(record.value, original, "归档读不得返回原值");
+        let card: serde_json::Value =
+            serde_json::from_str(&record.value).expect("value 必须是归档卡 JSON");
+        assert_eq!(card["archived"], serde_json::json!(true));
+        assert_eq!(
+            card["digest"],
+            serde_json::json!(crate::agent::journal::evorule_digest(original)),
+            "digest 口径 = 生态既有 blake3（对原 value）"
+        );
+        assert_eq!(card["path"], serde_json::json!("shared.test.topic"));
+        assert_eq!(card["ts"], serde_json::json!(ts));
+        assert_eq!(
+            card["anchors"]["fact_id"],
+            serde_json::json!(52),
+            "账面锚点"
+        );
+        assert!(
+            !record.value.contains(original),
+            "归档卡零原文留存: {}",
+            record.value
+        );
+        assert_eq!(record.key, "topic");
+        assert_eq!(record.timestamp, ts, "记录身份字段原样");
+        stamp_post.assert_async().await; // 归档读零戳刷新
+                                         // cache 同步降级（离线兜底路径拿到的也是卡）
+        assert!(mgr.cache.contains_key("shared::topic"));
+        assert_ne!(mgr.cache.get("shared::topic").unwrap().value, original);
+    }
+
+    #[tokio::test]
+    async fn decay_enabled_fresh_read_returns_full_value_and_touches_stamp() {
+        // 未达闲置上限 → 全量返回 + best-effort 访问戳刷新（写副作用）
+        let mut server = mockito::Server::new_async().await;
+        let now = now_secs();
+        let ts = now.saturating_sub(10);
+        let body = pidx_shared_fact_json(
+            53,
+            "shared.test.topic",
+            1,
+            serde_json::json!({"key": "topic", "value": "fresh-value", "timestamp": ts}),
+        );
+        let _get = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.topic")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        let _stamp_get = server
+            .mock(
+                "GET",
+                format!(
+                    "/api/sessions/s1/facts?prefix={}",
+                    decay::access_stamp_path("test", "topic")
+                )
+                .as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]") // 无既有戳 → 判定时钟回落写入时间
+            .create_async()
+            .await;
+        let stamp_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": decay::access_stamp_path("test", "topic"),
+                "value": {"kind": decay::ACCESS_STAMP_KIND, "v": 1, "key": "topic"}
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"fact_id":77}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()))
+            .with_session_id("s1")
+            .with_decay_policy(decay_policy(1000));
+        let record = mgr
+            .get_scoped(MemoryScope::Shared, "topic")
+            .await
+            .unwrap()
+            .expect("命中");
+        assert_eq!(record.value, "fresh-value", "未归档=全量返回");
+        stamp_post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn decay_stamp_last_access_extends_life() {
+        // 判定时钟 = 最后访问时间与写入时间取较新者：写入时间虽早已超上限，
+        // 但访问戳较新 → 不归档（访问即续期）
+        let mut server = mockito::Server::new_async().await;
+        let now = now_secs();
+        let ts = now.saturating_sub(5000); // 写入时间超上限（5000 > 1000）
+        let body = pidx_shared_fact_json(
+            54,
+            "shared.test.topic",
+            1,
+            serde_json::json!({"key": "topic", "value": "recently-touched-value", "timestamp": ts}),
+        );
+        let _get = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.topic")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        let stamp_path = decay::access_stamp_path("test", "topic");
+        let _stamp_get = server
+            .mock(
+                "GET",
+                format!("/api/sessions/s1/facts?prefix={stamp_path}").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(pidx_session_fact_json(
+                300,
+                &stamp_path,
+                serde_json::json!({
+                    "kind": decay::ACCESS_STAMP_KIND, "v": 1,
+                    "key": "topic", "last_access_secs": now.saturating_sub(100)
+                }),
+            ))
+            .create_async()
+            .await;
+        let stamp_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"path": stamp_path}),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"fact_id":78}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()))
+            .with_session_id("s1")
+            .with_decay_policy(decay_policy(1000));
+        let record = mgr
+            .get_scoped(MemoryScope::Shared, "topic")
+            .await
+            .unwrap()
+            .expect("访问戳新鲜 → 不归档");
+        assert_eq!(
+            record.value, "recently-touched-value",
+            "访问戳续期 → 全量返回"
+        );
+        stamp_post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn decay_stamp_write_failure_read_still_succeeds() {
+        // fail-soft：访问戳读/写端点全部故障（stub 故障存储，零 mock 命中=404）
+        // → 读仍成功返回全量值，绝不因戳故障改变读结果
+        let mut server = mockito::Server::new_async().await;
+        let now = now_secs();
+        let ts = now.saturating_sub(10);
+        let body = pidx_shared_fact_json(
+            55,
+            "shared.test.topic",
+            1,
+            serde_json::json!({"key": "topic", "value": "value-despite-stamp-failure", "timestamp": ts}),
+        );
+        let _get = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.topic")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()))
+            .with_session_id("s1")
+            .with_decay_policy(decay_policy(1000));
+        let record = mgr
+            .get_scoped(MemoryScope::Shared, "topic")
+            .await
+            .unwrap()
+            .expect("戳故障不得影响读");
+        assert_eq!(record.value, "value-despite-stamp-failure");
+    }
+
+    #[tokio::test]
+    async fn decay_tombstone_precedence_over_decay() {
+        // 墓碑优先于衰减：最新版 null → 权威无记忆（None），
+        // 衰减不得把已删除的记忆"复活"为引用卡
+        let mut server = mockito::Server::new_async().await;
+        let now = now_secs();
+        let body = serde_json::json!([
+            {"fact_id":61,"path":"shared.test.topic","value":{"key":"topic","value":"ancient","timestamp":now.saturating_sub(100_000)},"source_session_id":9,"version":1},
+            {"fact_id":62,"path":"shared.test.topic","value":null,"source_session_id":9,"version":2}
+        ])
+        .to_string();
+        let _get = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.topic")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()))
+            .with_session_id("s1")
+            .with_decay_policy(decay_policy(1000));
+        let result = mgr.get_scoped(MemoryScope::Shared, "topic").await.unwrap();
+        assert!(result.is_none(), "墓碑优先：None 而非归档卡");
+    }
+
+    #[tokio::test]
+    async fn decay_ttl_precedence_over_decay() {
+        // TTL 优先于衰减：TTL 已过期（500 > 100）但未达闲置上限（500 < 1000）
+        // → 权威无记忆（None），不做双重遮蔽（既不返回卡也不返回值）
+        let mut server = mockito::Server::new_async().await;
+        let now = now_secs();
+        let ts = now.saturating_sub(500);
+        let body = pidx_shared_fact_json(
+            56,
+            "shared.test.topic",
+            1,
+            serde_json::json!({"key": "topic", "value": "ttl-expired-value", "timestamp": ts}),
+        );
+        let _get = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.topic")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()))
+            .with_session_id("s1")
+            .with_ttl_secs(100)
+            .with_decay_policy(decay_policy(1000));
+        let result = mgr.get_scoped(MemoryScope::Shared, "topic").await.unwrap();
+        assert!(result.is_none(), "TTL 优先：None 而非归档卡");
     }
 }

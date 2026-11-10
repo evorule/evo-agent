@@ -677,6 +677,26 @@ pub fn schema() -> Vec<SettingEntry> {
         SettingEntry {
             key: "longSession.compaction.keepRounds",            kind: SettingType::Number,            default: json!(6),            enum_values: None,            range: Some([2, 50]),            category: "长会话",            description: "主动压缩时保留的最近对话轮数（这些轮次全量保真，构成近期工作记忆；更早的轮次进入滚动摘要）。默认 6" ,            scope: "window",        },
         SettingEntry {
+            key: "memory.decay.enabled",
+            kind: SettingType::Boolean,
+            default: json!(false),
+            enum_values: None,
+            range: None,
+            category: "记忆",
+            description: "共享记忆读取时衰减：长期未被访问的共享记忆在读取时降级为 {archived, digest, path/ts/anchors} 引用卡（digest 为原值 blake3 摘要，回溯经账面锚点 join 取原文）。零物理处理——原值永远留存账本，衰减只改读面视图，无删除；判定为确定性纯函数可重放；会话分区不受影响（每会话短生命周期数据无闲置语义）。默认关闭——读行为与现状逐字节一致，显式开启后生效",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "memory.decay.maxIdleAgeSecs",
+            kind: SettingType::Number,
+            default: json!(2592000),
+            enum_values: None,
+            range: Some([60, 31536000]),
+            category: "记忆",
+            description: "共享记忆衰减的闲置时长上限（秒，按最后访问时间与写入时间的较新者计；恰在上限当刻不降级，严格超出才归档，与 TTL 判定语义同构）。默认 30 天；仅 memory.decay.enabled 开启时生效",
+            scope: "window",
+        },
+        SettingEntry {
             key: "mentions.maxFileLines",
             kind: SettingType::Number,
             default: json!(600),
@@ -1039,7 +1059,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 62); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键;审计摘要卡 audit_summary 接入 +1)
+        assert_eq!(settings.len(), 64); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键;审计摘要卡 audit_summary 接入 +1;共享记忆读取时衰减 memory.decay.enabled/maxIdleAgeSecs 两键 +2)
         assert_eq!(settings["agentTools.audit_summary"], json!(false));
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
@@ -1108,6 +1128,10 @@ mod tests {
         // index.semantic.enabled 默认关:首次启用触发约 24MB 模型下载(明示),
         // 依赖 index.enabled;缺省关 = 零外发零行为变化
         assert_eq!(settings["index.semantic.enabled"], json!(false));
+        // memory.decay.* 2 键:读取时衰减缺省关 = 现行为零变化(缺省不变式);
+        // 闲置上限默认 30 天,仅 enabled 时生效
+        assert_eq!(settings["memory.decay.enabled"], json!(false));
+        assert_eq!(settings["memory.decay.maxIdleAgeSecs"], json!(2592000));
         for (k, v) in &sources {
             assert_eq!(v, &json!("default"), "key {k} should be default");
         }

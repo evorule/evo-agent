@@ -32,6 +32,7 @@ pub mod judge_guard;
 pub mod lexstore;
 pub mod materializer;
 pub mod memory;
+pub mod memory_decay;
 pub mod memory_event;
 pub(crate) mod memory_prefix_index;
 pub mod memory_recall_tool;
