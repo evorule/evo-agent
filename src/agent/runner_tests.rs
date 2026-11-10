@@ -2463,6 +2463,53 @@ fn serve_assembly_switch_adjudication_orthogonal() {
 }
 
 #[test]
+fn audit_summary_switch_defaults_off_and_opt_in() {
+    // 缺省不变式:audit_summary(只读摘要卡)缺省关——键缺失时不在 LLM 契约面
+    // (与 http_request 默认关先例同向,与 audit_query 默认开反向);显式
+    // agentTools.audit_summary=true 后在场。runner 重绑以 has_tool 门控,
+    // 缺省关时占位过滤后不在场,重绑自然跳过(三面过滤单键自动工作)。
+    let mut union = crate::io_handlers::tool_handler::ToolHandler::new();
+    union.register_static(
+        crate::agent::audit_summary_tool::AUDIT_SUMMARY_TOOL,
+        std::sync::Arc::new(crate::agent::audit_summary_tool::AuditSummaryTool::unwired())
+            as std::sync::Arc<dyn ToolFunction>,
+    );
+    union.register_static(
+        crate::agent::audit_query_tool::AUDIT_QUERY_TOOL,
+        std::sync::Arc::new(crate::agent::audit_query_tool::AuditQueryTool::unwired())
+            as std::sync::Arc<dyn ToolFunction>,
+    );
+    let whitelist = vec!["audit_summary".to_string(), "audit_query".to_string()];
+    // 缺省(键缺失):audit_query 在面(默认开),audit_summary 不在面(默认关)
+    let default_off = crate::api::serve_tools::build_filtered_toolkit_with_switches(
+        &union,
+        &whitelist,
+        &serde_json::Map::new(),
+    );
+    assert!(
+        !default_off.has_tool("audit_summary"),
+        "audit_summary must default OFF (not in LLM contract surface)"
+    );
+    assert!(
+        default_off.has_tool("audit_query"),
+        "audit_query stays on by default (sibling baseline)"
+    );
+    // 显式 opt-in:工具进契约面
+    let mut settings = serde_json::Map::new();
+    settings.insert(
+        "agentTools.audit_summary".to_string(),
+        serde_json::json!(true),
+    );
+    let opted_in = crate::api::serve_tools::build_filtered_toolkit_with_switches(
+        &union, &whitelist, &settings,
+    );
+    assert!(
+        opted_in.has_tool("audit_summary"),
+        "explicit opt-in must surface the tool"
+    );
+}
+
+#[test]
 #[ignore = "B2 窗口期声明:主路径 focus 收窄为注册面严格子集随装配收口批次启用(工具面统一架构基准档处置台账 B2/PR-3 判据5);现状=注册面∪静态表,本测试当前必红"]
 fn b2_main_path_focus_is_strict_subset_of_registration() {
     // 期望终态:空注册面 runner 的主路径聚焦快照为空(注册面严格子集)——

@@ -12,6 +12,7 @@ pub mod approval_tier;
 pub mod assembly;
 pub mod atif;
 pub mod audit_query_tool;
+pub mod audit_summary_tool;
 pub mod audited_llm;
 pub mod callback;
 pub mod constitution;
