@@ -231,7 +231,8 @@
                     onchange={(e) => changeSetting(entry.key, e.target.value, e.target)}
                   >
                     {#each entry.enum_values || [] as opt (opt)}
-                      <option value={opt}>{opt}</option>
+                      <!-- 空串选项=该键缺省语义「未设/回落上层档位」,显式标注避免空白下拉项 -->
+                      <option value={opt}>{opt === '' ? '(跟随上层档位)' : opt}</option>
                     {/each}
                   </select>
                 {:else if entry.type === 'number'}

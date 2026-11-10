@@ -459,6 +459,26 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "approval.mode.fileEdit",
+            kind: SettingType::Enum,
+            default: json!(""),
+            enum_values: Some(vec!["", "manual", "auto_policy", "policy"]),
+            range: None,
+            category: "Agent 工具",
+            description: "文件写族工具（file_write/file_create/file_move/file_edit/write_file/edit_file）的审批档位（每工具组独立档位：留空=跟随 approval.mode.shellExec 会话缺省档位，行为零变化；manual=每次人工审批；auto_policy=判定式无人值守放行；policy=对照 .evo/approval-policy.toml 中 [file_edit] 等组预置条件自动评审，可用 path_prefix/match/exclude/verify 机械条件实现零 LLM 放行。注意：写治理配置路径在任何档位强制人工。仅 agent 定义未显式指定 approval_mode 时生效；重启会话生效）",
+            scope: "application",
+        },
+        SettingEntry {
+            key: "approval.mode.fileDelete",
+            kind: SettingType::Enum,
+            default: json!(""),
+            enum_values: Some(vec!["", "manual", "auto_policy", "policy"]),
+            range: None,
+            category: "Agent 工具",
+            description: "文件删除工具（file_delete）的审批档位（每工具组独立档位：留空=跟随 approval.mode.shellExec 会话缺省档位。注意：不可逆删除是红线操作——无论本键如何设置，file_delete 在任何档位下默认强制人工审批，仅在 approval.exemptionOverride 显式开启后由条件评审接管；本键主要影响豁免开启后的判定形态。重启会话生效）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "dap.adapters",
             kind: SettingType::String,
             default: json!("{}"),
@@ -1009,7 +1029,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 59); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch;批K 段4 todo;批K 段5 httpRequest;批K 段7 askUser;workbench.uiFontSize;M4 workspaceUndo;第五批 compaction.keepRounds)
+        assert_eq!(settings.len(), 61); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));

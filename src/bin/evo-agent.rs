@@ -1152,9 +1152,25 @@ fn cmd_run(
     // 无人值守预检:policy 评审档在 run 面拒启——评审调用走 LLM 且不受步预算
     // 约束,端点慢时段无界挂起,而 run 面无人工可回落;启动期 fail-fast 并指向
     // 判定式档位(auto_policy)。attended 评审走 serve 面(有会话面人工兜底)。
+    // 组档位扩面:任一组档位键=policy 同理拒启(同风险面同口径)。
     if let Some(msg) = run_policy_gate_reject(approval_mode_resolved(&def, workdir).as_deref()) {
         eprintln!("{msg}");
         return ExitCode::from(2);
+    }
+    let (group_file_edit_ov, group_file_delete_ov) = approval_group_overrides_resolved(workdir);
+    for (key, ov) in [
+        ("approval.mode.fileEdit", group_file_edit_ov.as_deref()),
+        ("approval.mode.fileDelete", group_file_delete_ov.as_deref()),
+    ] {
+        if ov == Some("policy") {
+            eprintln!(
+                "error: unattended run does not support group override '{key}=policy': \
+                 policy review invokes the LLM without a step budget and can hang \
+                 indefinitely; set the group key to 'auto_policy' for unattended runs, \
+                 or run via 'serve' for attended policy review"
+            );
+            return ExitCode::from(2);
+        }
     }
 
     // 人工审查开合(2026-09-28):def move 前捕获审批模式(auto_policy → PolicyApproval)
@@ -1524,6 +1540,18 @@ fn cmd_run(
             None,
         )
     };
+    // 组档位扩面:def 未指定且无 auto 旗标时组键生效,组装 CLI 组路由器
+    // 包住会话缺省栈(组 policy 已被无人值守预检拒启,不会在此出现)
+    let (callback, runaway_policy) = maybe_wrap_cli_group_router(
+        workdir,
+        &def,
+        approval_auto || auto_approve_candidates,
+        &client,
+        &config,
+        approval_wait_timeout,
+        callback,
+        runaway_policy,
+    );
     let runner = runner
         .with_approval_callback(callback)
         .with_runaway_policy(runaway_policy)
@@ -1604,6 +1632,218 @@ fn approval_policy_mode_resolved(
     workdir: &Path,
 ) -> bool {
     approval_mode_resolved(def, workdir).as_deref() == Some("policy")
+}
+
+/// 组档位覆写解析(与 serve 面 resolve_group_mode_override 同口径):每工具组
+/// 档位键 approval.mode.fileEdit / approval.mode.fileDelete 的 CLI 读取面。
+/// 合法值域 manual/auto_policy/policy;未设/非法值 → None(回落会话缺省档位,
+/// 缺省不变式)。设置仓不可用 → 双 None。
+fn approval_group_overrides_resolved(workdir: &Path) -> (Option<String>, Option<String>) {
+    let read = |key: &str| -> Option<String> {
+        evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+            .ok()
+            .and_then(|s| {
+                let (merged, _) = s.merged();
+                merged.get(key).and_then(|v| v.as_str()).map(str::to_string)
+            })
+            .filter(|v| v == "manual" || v == "auto_policy" || v == "policy")
+    };
+    (
+        read("approval.mode.fileEdit"),
+        read("approval.mode.fileDelete"),
+    )
+}
+
+/// CLI 组档位独立栈构建(与各面既有会话栈同型装配,装配逻辑逐位未动;
+/// timeout 由调用面传入——run 面用 approval_wait_timeout、repl 面无超时)
+fn cli_group_stack(
+    mode: &str,
+    workdir: &Path,
+    client: &EvoruleApiClient,
+    config: &evo_agent::config::Config,
+    timeout_secs: Option<u64>,
+) -> (
+    std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback>,
+    Option<evo_agent::agent::runner::RunawayPolicy>,
+) {
+    match mode {
+        "auto_policy" => {
+            let override_flag = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+                .map(|s| {
+                    s.merged()
+                        .0
+                        .get("approval.exemptionOverride")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let manual: std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback> =
+                std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
+                    auto_approve: false,
+                    timeout_secs,
+                });
+            (
+                std::sync::Arc::new(evo_agent::agent::approval::RedLineGuardApproval::new(
+                    std::sync::Arc::new(
+                        evo_agent::agent::approval::AutoDecisionGuardApproval::new(
+                            std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
+                            manual.clone(),
+                        ),
+                    ),
+                    manual,
+                    override_flag,
+                )),
+                None,
+            )
+        }
+        "policy" => {
+            let policy_path = workdir.join(".evo").join("approval-policy.toml");
+            match evo_agent::agent::approval_policy::ApprovalPolicyFile::load(&policy_path) {
+                Ok(policy) => {
+                    let override_flag =
+                        evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+                            .map(|s| {
+                                s.merged()
+                                    .0
+                                    .get("approval.exemptionOverride")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                    let audited = evo_agent::agent::audited_llm::AuditedLlm::new(
+                        client.clone(),
+                        evo_agent::io_handlers::LlmHandler::from_config(&config.llm),
+                    );
+                    let runaway =
+                        evo_agent::agent::runner::RunawayPolicy::from_policy_file(&policy);
+                    (
+                        std::sync::Arc::new(evo_agent::agent::approval_policy::PolicyReview::new(
+                            policy,
+                            std::sync::Arc::new(
+                                evo_agent::agent::approval_policy::AuditedReviewInvoker::new(
+                                    audited,
+                                ),
+                            ),
+                            std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
+                                auto_approve: false,
+                                timeout_secs,
+                            }),
+                            override_flag,
+                            Some(workdir.to_path_buf()),
+                        )),
+                        Some(runaway),
+                    )
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[approval-policy] 组档位条件文件加载失败,该组降级人工审批: {e} ({})",
+                        policy_path.display()
+                    );
+                    (
+                        std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
+                            auto_approve: false,
+                            timeout_secs,
+                        }),
+                        None,
+                    )
+                }
+            }
+        }
+        // manual 及其余合法值 → 人工交互栈(与各面 manual 态同型)
+        _ => (
+            std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
+                auto_approve: false,
+                timeout_secs,
+            }),
+            None,
+        ),
+    }
+}
+
+/// CLI 组档位路由器(与 serve 面 GroupedApproval 同口径):per-request 按工具组
+/// 归面路由到该组独立栈;仅在组键生效且组栈已装配时路由,否则回落会话缺省栈。
+struct CliGroupedApproval {
+    /// 会话缺省栈(shellExec 组/未装配差异组/未列名工具的回落面)
+    default: std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback>,
+    /// 文件写族组栈(fileEdit 键生效时)
+    file_edit: Option<std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback>>,
+    /// 文件删除组栈(fileDelete 键生效时;该组恒先过不可逆删除红线闸)
+    file_delete: Option<std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback>>,
+}
+
+#[async_trait::async_trait]
+impl evo_agent::agent::approval::ApprovalCallback for CliGroupedApproval {
+    async fn request_approval(
+        &self,
+        req: &evo_agent::agent::approval::ApprovalRequest,
+    ) -> evo_agent::agent::approval::ApprovalDecision {
+        let group = evo_agent::agent::approval_policy::tool_group(&req.tool_name);
+        let stack = match group {
+            Some("fileEdit") => self.file_edit.as_ref(),
+            Some("fileDelete") => self.file_delete.as_ref(),
+            _ => None,
+        };
+        match stack {
+            Some(cb) => cb.request_approval(req).await,
+            None => self.default.request_approval(req).await,
+        }
+    }
+}
+
+/// 组档位装配统一入口(serve/CLI 双面同语义):定义级 approval_mode 未指定、
+/// 无 auto 旗标、且任一组键生效时,组装 CLI 组路由器包住会话缺省栈;
+/// Runaway 护栏取首个 policy 组产出(与 serve 面同口径)。
+#[allow(clippy::too_many_arguments)]
+fn maybe_wrap_cli_group_router(
+    workdir: &Path,
+    def: &evo_agent::agent::definition::AgentDefinition,
+    session_auto: bool,
+    client: &EvoruleApiClient,
+    config: &evo_agent::config::Config,
+    timeout_secs: Option<u64>,
+    default_cb: std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback>,
+    default_runaway: Option<evo_agent::agent::runner::RunawayPolicy>,
+) -> (
+    std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback>,
+    Option<evo_agent::agent::runner::RunawayPolicy>,
+) {
+    let (file_edit_ov, file_delete_ov) = approval_group_overrides_resolved(workdir);
+    if def.approval_mode.is_none()
+        && !session_auto
+        && (file_edit_ov.is_some() || file_delete_ov.is_some())
+    {
+        let mut runaway = default_runaway;
+        let mut file_edit_stack = None;
+        if let Some(m) = &file_edit_ov {
+            let (cb, r) = cli_group_stack(m, workdir, client, config, timeout_secs);
+            if runaway.is_none() {
+                runaway = r;
+            }
+            file_edit_stack = Some(cb);
+        }
+        let mut file_delete_stack = None;
+        if let Some(m) = &file_delete_ov {
+            let (cb, r) = cli_group_stack(m, workdir, client, config, timeout_secs);
+            if runaway.is_none() {
+                runaway = r;
+            }
+            file_delete_stack = Some(cb);
+        }
+        eprintln!(
+            "[approval-policy] per-group approval modes active: fileEdit={:?} fileDelete={:?}",
+            file_edit_ov, file_delete_ov
+        );
+        (
+            std::sync::Arc::new(CliGroupedApproval {
+                default: default_cb,
+                file_edit: file_edit_stack,
+                file_delete: file_delete_stack,
+            }),
+            runaway,
+        )
+    } else {
+        (default_cb, default_runaway)
+    }
 }
 
 /// run 面无人值守预检:policy 评审档拒启文案单源(返回 Some=拒启)。
@@ -4546,6 +4786,18 @@ fn run_repl_turn(
             None,
         )
     };
+    // 组档位扩面:def 未指定且无 auto 旗标时组键生效,组装 CLI 组路由器
+    // (attended 面,组 policy 档允许——有交互人工兜底)
+    let (callback, runaway_policy) = maybe_wrap_cli_group_router(
+        workdir,
+        def,
+        auto_approve_candidates,
+        client,
+        config,
+        None,
+        callback,
+        runaway_policy,
+    );
     let mut runner = runner
         .with_approval_callback(callback)
         .with_runaway_policy(runaway_policy)
