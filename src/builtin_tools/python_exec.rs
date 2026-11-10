@@ -239,6 +239,27 @@ impl ToolFunction for PythonExecTool {
     }
 }
 
+async fn drain_tapped<S: tokio::io::AsyncRead + Unpin>(
+    s: &mut S,
+    pid: u32,
+    stream: &'static str,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut seg = [0u8; 8192];
+    loop {
+        match s.read(&mut seg).await {
+            Ok(0) => break,
+            Ok(n) => {
+                crate::builtin_tools::shell_exec::tap_send_pid(pid, stream, &seg[..n]);
+                buf.extend_from_slice(&seg[..n]);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,27 +436,4 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-/// 尾随读循环(观察态):分段读+按 pid 归属转发 tap,累积返回(与 output()
-/// 全量形态字节一致)。tokio 形态,供 python_exec 执行段 join 使用。
-async fn drain_tapped<S: tokio::io::AsyncRead + Unpin>(
-    s: &mut S,
-    pid: u32,
-    stream: &'static str,
-) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-    let mut buf = Vec::new();
-    let mut seg = [0u8; 8192];
-    loop {
-        match s.read(&mut seg).await {
-            Ok(0) => break,
-            Ok(n) => {
-                crate::builtin_tools::shell_exec::tap_send_pid(pid, stream, &seg[..n]);
-                buf.extend_from_slice(&seg[..n]);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(buf)
 }

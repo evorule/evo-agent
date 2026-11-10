@@ -1426,6 +1426,7 @@ pub fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json:
             risk,
             alternative,
             proposal_id,
+            preview,
         }) => serde_json::json!({
             "type": "ApprovalRequired",
             "tool_name": tool_name,
@@ -1433,6 +1434,7 @@ pub fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json:
             "risk": risk,
             "alternative": alternative,
             "proposal_id": proposal_id,
+            "preview": preview,
         }),
         Ok(AgentEvent::ApprovalResult {
             tool_name,
@@ -2059,6 +2061,7 @@ mod tests {
             risk: "high".to_string(),
             alternative: "use trash".to_string(),
             proposal_id: "ap-ws-1".to_string(),
+            preview: None,
         }));
         assert_eq!(v["type"], "ApprovalRequired");
         assert_eq!(v["tool_name"], "shell_exec");
@@ -2115,6 +2118,7 @@ mod tests {
                 risk: "low".to_string(),
                 alternative: String::new(),
                 proposal_id: "ap-iso".to_string(),
+                preview: None,
             }),
             Ok(AgentEvent::ApprovalResult {
                 tool_name: "shell_exec".to_string(),

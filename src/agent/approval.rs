@@ -59,6 +59,98 @@ pub fn new_proposal_id() -> String {
     format!("ap-{:x}", nanos)
 }
 
+/// 审批内容级预览(观察态):文件写族的「将发生什么」统一 diff 文本。
+/// 纯观察面——不落 journal 不进账,审批语义/留痕/守卫零变化。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ApprovalPreview {
+    /// 目标路径
+    pub path: String,
+    /// 统一 diff 文本(移除块 − 行 / 新增块 + 行;双帽截尾后带头行标注)
+    pub diff: String,
+    /// 是否已发生帽截尾(32KB/256 行,超限丢尾部)
+    pub truncated: bool,
+}
+
+/// diff 双帽(字节/行数;超限丢尾部+截断标——对齐 TOOL_PAYLOAD_CAP 哲学)
+const PREVIEW_DIFF_MAX_BYTES: usize = 32 * 1024;
+const PREVIEW_DIFF_MAX_LINES: usize = 256;
+
+/// 行级统一 diff 预览(纯函数):移除块(old 全部,以减号标)与新增块(new
+/// 全部,以加号标)——不做精确 LCS(审批预览要的是「内容全量呈现」而非
+/// 最小编辑序),O(old+new) 无爆炸风险。双帽截尾。非文件族/无内容返回 None。
+pub fn build_preview(tool_name: &str, args: &serde_json::Value) -> Option<ApprovalPreview> {
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if path.is_empty() {
+        return None;
+    }
+    let get_str = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let (removed, added) = match tool_name {
+        "search_replace" | "edit_file" => {
+            let old = get_str("old_string");
+            let new = get_str("new_string");
+            if old.is_empty() && new.is_empty() {
+                return None;
+            }
+            (old.to_string(), new.to_string())
+        }
+        "file_write" | "file_create" => (String::new(), get_str("content").to_string()),
+        _ => return None,
+    };
+    let mut diff = String::new();
+    if !removed.is_empty() {
+        diff.push_str("--- 现状(将移除)\n");
+        for l in removed.lines() {
+            diff.push_str("- ");
+            diff.push_str(l);
+            diff.push('\n');
+        }
+    }
+    if !added.is_empty() {
+        diff.push_str("+++ 变更后(将写入)\n");
+        for l in added.lines() {
+            diff.push_str("+ ");
+            diff.push_str(l);
+            diff.push('\n');
+        }
+    }
+    if diff.is_empty() {
+        return None;
+    }
+    let mut truncated = false;
+    if diff.len() > PREVIEW_DIFF_MAX_BYTES {
+        diff = diff
+            .chars()
+            .take(PREVIEW_DIFF_MAX_BYTES)
+            .collect::<String>();
+        truncated = true;
+    }
+    let line_count = diff.lines().count();
+    if line_count > PREVIEW_DIFF_MAX_LINES {
+        let keep: String = {
+            let mut acc = String::new();
+            for l in diff.lines().take(PREVIEW_DIFF_MAX_LINES) {
+                acc.push_str(l);
+                acc.push('\n');
+            }
+            acc
+        };
+        diff = keep;
+        truncated = true;
+    }
+    if truncated {
+        diff.push_str("… (预览已截断,完整内容以执行结果为准)\n");
+    }
+    Some(ApprovalPreview {
+        path,
+        diff,
+        truncated,
+    })
+}
+
 /// 审批决定 — 带决策者身份与验证状态(审计链留痕用)
 ///
 /// - `approver`:验证后的用户名,或 `"unverified"` / `"cli-user"` / `"auto"`
@@ -1271,5 +1363,57 @@ mod tests {
             })
             .unwrap();
         let _ = wait_fut.await;
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    #[test]
+    fn test_build_preview_search_replace_pair() {
+        let args = serde_json::json!({
+            "path": "src/a.rs",
+            "old_string": "line1\nline2",
+            "new_string": "line1-fix\nline2\nline3",
+        });
+        let pv = build_preview("search_replace", &args).expect("应产出预览");
+        assert_eq!(pv.path, "src/a.rs");
+        assert!(pv.diff.contains("- line1"));
+        assert!(pv.diff.contains("+ line1-fix"));
+        assert!(pv.diff.contains("+ line3"));
+        assert!(!pv.truncated);
+    }
+
+    #[test]
+    fn test_build_preview_file_write_new_content() {
+        let args = serde_json::json!({ "path": "a.txt", "content": "hello\nworld" });
+        let pv = build_preview("file_write", &args).expect("应产出预览");
+        assert!(pv.diff.contains("+ hello"));
+        assert!(pv.diff.contains("+ world"));
+        assert!(!pv.diff.contains('-'), "纯新增无移除块");
+    }
+
+    #[test]
+    fn test_build_preview_non_file_tools_none() {
+        assert!(build_preview("shell_exec", &serde_json::json!({ "command": "ls" })).is_none());
+        assert!(build_preview("grep_files", &serde_json::json!({ "pattern": "x" })).is_none());
+    }
+
+    #[test]
+    fn test_build_preview_missing_path_none() {
+        assert!(build_preview("file_write", &serde_json::json!({ "content": "x" })).is_none());
+    }
+
+    #[test]
+    fn test_build_preview_large_content_truncated() {
+        let big = "x".repeat(64 * 1024);
+        let args = serde_json::json!({ "path": "big.txt", "content": big });
+        let pv = build_preview("file_write", &args).expect("大内容应产出截断预览");
+        assert!(pv.truncated, "超 32KB 帽须置截断标");
+        assert!(
+            pv.diff.len() <= PREVIEW_DIFF_MAX_BYTES + 128,
+            "截尾后不超帽(留标注余量)"
+        );
     }
 }

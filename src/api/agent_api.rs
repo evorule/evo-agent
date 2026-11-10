@@ -2775,6 +2775,7 @@ fn agent_event_to_sse(event: Result<AgentEvent, AgentError>) -> Result<Event, In
             risk,
             alternative,
             proposal_id,
+            preview,
         }) => Event::default().event("approval_required").data(
             serde_json::json!({
                 "tool_name": tool_name,
@@ -2782,6 +2783,7 @@ fn agent_event_to_sse(event: Result<AgentEvent, AgentError>) -> Result<Event, In
                 "risk": risk,
                 "alternative": alternative,
                 "proposal_id": proposal_id,
+                "preview": preview,
             })
             .to_string(),
         ),
@@ -6107,6 +6109,7 @@ mod tests {
             risk: "high".to_string(),
             alternative: "use trash instead".to_string(),
             proposal_id: "ap-test-1".to_string(),
+            preview: None,
         }))
         .unwrap();
         let s = format!("{:?}", ev);

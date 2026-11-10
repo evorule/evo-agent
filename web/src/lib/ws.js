@@ -791,6 +791,7 @@ function handleFrame(f) {
         alternative: f.alternative,
         proposalId: f.proposal_id,
         guardDeny: verdict === 'deny',
+        preview: f.preview || null,
       });
       pushPanelEvent('gov', {
         label: 'ApprovalRequired',

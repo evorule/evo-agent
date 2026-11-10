@@ -571,6 +571,7 @@ mod tests {
                 risk: "high".to_string(),
                 alternative: "use trash".to_string(),
                 proposal_id: "ap-1".to_string(),
+                preview: None,
             },
             AgentEvent::ApprovalResult {
                 tool_name: "shell_exec".to_string(),
@@ -684,6 +685,7 @@ mod tests {
             risk: "high".to_string(),
             alternative: "trash".to_string(),
             proposal_id: "ap-2".to_string(),
+            preview: None,
         })
         .await;
 
