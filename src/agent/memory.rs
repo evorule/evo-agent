@@ -2272,6 +2272,39 @@ impl MemoryManager {
         Some((frozen as usize, text, gen))
     }
 
+    /// 压缩视图落链（PayloadUpdate 专用路径）。
+    ///
+    /// 路径：`__memory__.{ns}.session_{sid}.compaction_view`
+    /// （与滚动摘要同层：压缩/裁剪产物的回写持久化账。重建读账时应用该视图
+    /// 即可确定性复原发送视图，无需 LLM 重算；失败按 best-effort 留痕，
+    /// 不阻塞主流程。单会话单节点——最新视图覆盖旧账）。
+    pub(crate) async fn save_compaction_view(
+        &self,
+        session_id: &str,
+        record: &crate::agent::runner::CompactionViewRecord,
+    ) -> Result<(), MemoryError> {
+        let path = self.build_path_scoped(
+            &MemoryScope::Session(session_id.to_string()),
+            "compaction_view",
+        );
+        let value = serde_json::to_value(record)?;
+        self.evorule_client
+            .update_payload(session_id, &path, &value)
+            .await?;
+        Ok(())
+    }
+
+    /// 从 payload 状态回读压缩视图（None = 未落账）。
+    pub(crate) fn compaction_view_from_state(
+        state: &serde_json::Value,
+        namespace: &str,
+        session_id: &str,
+    ) -> Option<crate::agent::runner::CompactionViewRecord> {
+        let node = &state["payload"]["__memory__"][namespace][&format!("session_{}", session_id)]
+            ["compaction_view"];
+        serde_json::from_value(node.clone()).ok()
+    }
+
     /// 批量追加消息（EveryN/PerReactRound 模式）
     ///
     /// **真批量**——一次 HTTP 写入整批（server

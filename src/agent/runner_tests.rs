@@ -7525,3 +7525,419 @@ async fn resolve_approval_keeps_decision_when_reexec_fails() {
         "approval record must be attached for the audit chain"
     );
 }
+
+// ===== 压缩视图回写持久化测试组 =====
+//
+// 覆盖四面:①视图应用纯函数(拼接/覆盖/校验拒绝/越界跳过);
+// ②紧急裁剪产物 → 视图 → 复原的黄金对照(应用结果与直接裁剪逐字节等价);
+// ③重建读账应用视图并记录下标差 + 摘要缓存种子;
+// ④下标差对齐后续持久化落点(不覆盖账面既有记录)。
+
+/// 压缩视图记录基座:区间 [1,5) 折叠为单条摘要占位(主动压缩形态)
+fn compact_view_record() -> CompactionViewRecord {
+    CompactionViewRecord {
+        view_version: "compaction_view/v1".to_string(),
+        kind: "active_compaction".to_string(),
+        region_start_idx: 1,
+        region_end_idx: 5,
+        region_hash: "region-hash-seed".to_string(),
+        replacement: vec![Message::System {
+            content: "[earlier conversation summary] cached digest".to_string(),
+        }],
+        overrides: Vec::new(),
+        generation: 2,
+        at_epoch_ms: 7,
+    }
+}
+
+/// 账面状态基座:6 条消息(idx 0..5)+ 可选压缩视图节点
+fn payload_state_with_view(view_json: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "payload": {
+            "__memory__": {
+                "default": {
+                    "session_s1": {
+                        "messages": {
+                            "0": {"idx":0,"role":"system","content":"sys prompt","timestamp":1000},
+                            "1": {"idx":1,"role":"user","content":"round one","timestamp":1001},
+                            "2": {"idx":2,"role":"assistant","content":"working","tool_calls":null,"timestamp":1002},
+                            "3": {"idx":3,"role":"tool","content":"tool output","tool_name":"shell_exec","timestamp":1003},
+                            "4": {"idx":4,"role":"user","content":"round two","timestamp":1004},
+                            "5": {"idx":5,"role":"assistant","content":"done","tool_calls":null,"timestamp":1005}
+                        },
+                        "compaction_view": view_json,
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn test_image() -> crate::agent::translator::ImageData {
+    crate::agent::translator::ImageData {
+        mime_type: "image/png".to_string(),
+        data_base64: "aGk=".to_string(),
+    }
+}
+
+#[test]
+fn compaction_view_apply_splices_active_region() {
+    // 视图把 [1,4) 区间替换为摘要占位+清引用结果,首尾原样拼接
+    let original = vec![
+        Message::System {
+            content: "sys".into(),
+        },
+        Message::User {
+            content: "u1".into(),
+            images: Vec::new(),
+        },
+        Message::Assistant {
+            content: "a1".into(),
+            tool_calls: None,
+        },
+        Message::Tool {
+            content: "big tool output".into(),
+            tool_name: "shell_exec".into(),
+            images: Vec::new(),
+        },
+        Message::User {
+            content: "u2".into(),
+            images: Vec::new(),
+        },
+        Message::Assistant {
+            content: "a2".into(),
+            tool_calls: None,
+        },
+    ];
+    let view = CompactionViewRecord {
+        view_version: "compaction_view/v1".to_string(),
+        kind: "active_compaction".to_string(),
+        region_start_idx: 1,
+        region_end_idx: 4,
+        region_hash: String::new(),
+        replacement: vec![
+            Message::System {
+                content: "[earlier conversation summary] text".to_string(),
+            },
+            Message::Tool {
+                content: "[cleared: shell_exec]".to_string(),
+                tool_name: "shell_exec".to_string(),
+                images: Vec::new(),
+            },
+        ],
+        overrides: Vec::new(),
+        generation: 3,
+        at_epoch_ms: 42,
+    };
+    let applied = apply_compaction_view(&original, &view).expect("视图应可应用");
+    assert_eq!(applied.len(), 5, "6 条折叠为 5 条(区间 3 条换 2 条)");
+    assert!(matches!(&applied[0], Message::System { content } if content == "sys"));
+    assert!(
+        matches!(&applied[1], Message::System { content } if content.contains("earlier conversation summary"))
+    );
+    assert!(
+        matches!(&applied[2], Message::Tool { content, .. } if content == "[cleared: shell_exec]")
+    );
+    assert!(matches!(&applied[3], Message::User { content, .. } if content == "u2"));
+    assert!(matches!(&applied[4], Message::Assistant { content, .. } if content == "a2"));
+}
+
+#[test]
+fn compaction_view_apply_overrides_and_image_clear() {
+    // 区外就地覆盖:User/Tool 替换 content 并清旁路图;System 不受覆盖影响
+    let original = vec![
+        Message::System {
+            content: "sys".into(),
+        },
+        Message::User {
+            content: "u1".into(),
+            images: vec![test_image()],
+        },
+        Message::Tool {
+            content: "t1".into(),
+            tool_name: "shell_exec".into(),
+            images: vec![test_image()],
+        },
+    ];
+    let view = CompactionViewRecord {
+        view_version: "compaction_view/v1".to_string(),
+        kind: "emergency_trim".to_string(),
+        region_start_idx: 0,
+        region_end_idx: 0,
+        region_hash: String::new(),
+        replacement: Vec::new(),
+        overrides: vec![
+            ViewOverride {
+                idx: 1,
+                content: "[approval roundtrip elided: 40 bytes; decision: approved]".to_string(),
+            },
+            ViewOverride {
+                idx: 2,
+                content: "[tool result elided: 2 bytes]".to_string(),
+            },
+        ],
+        generation: 0,
+        at_epoch_ms: 1,
+    };
+    let applied = apply_compaction_view(&original, &view).expect("视图应可应用");
+    assert_eq!(applied.len(), 3, "区间 (0,0) 为空替换,长度不变");
+    match &applied[1] {
+        Message::User { content, images } => {
+            assert_eq!(
+                content,
+                "[approval roundtrip elided: 40 bytes; decision: approved]"
+            );
+            assert!(images.is_empty(), "覆盖必须连带清旁路图");
+        }
+        other => panic!("位置 1 应为 User 消息,实际 {other:?}"),
+    }
+    match &applied[2] {
+        Message::Tool {
+            content, images, ..
+        } => {
+            assert_eq!(content, "[tool result elided: 2 bytes]");
+            assert!(images.is_empty(), "覆盖必须连带清旁路图");
+        }
+        other => panic!("位置 2 应为 Tool 消息,实际 {other:?}"),
+    }
+}
+
+#[test]
+fn compaction_view_apply_rejects_stale_records() {
+    let short = vec![Message::System {
+        content: "sys".into(),
+    }];
+    // 区间越界:重建序列比视图记账时短(账面被截断/换会话)
+    let mut view = compact_view_record();
+    assert!(
+        apply_compaction_view(&short, &view).is_none(),
+        "区间越界应拒绝"
+    );
+    // 结构版本不符
+    view.region_end_idx = 1;
+    view.view_version = "compaction_view/v0".to_string();
+    assert!(
+        apply_compaction_view(&short, &view).is_none(),
+        "版本不符应拒绝"
+    );
+    // 未知类别
+    let mut stale_kind = compact_view_record();
+    stale_kind.region_end_idx = 1;
+    stale_kind.kind = "legacy_trim".to_string();
+    assert!(
+        apply_compaction_view(&short, &stale_kind).is_none(),
+        "未知类别应拒绝"
+    );
+    // 对照:合法记录可应用
+    let mut ok = compact_view_record();
+    ok.region_end_idx = 1;
+    assert!(apply_compaction_view(&short, &ok).is_some());
+}
+
+#[test]
+fn compaction_view_apply_skips_out_of_range_overrides() {
+    // 越界覆盖一律跳过不报错(fail-soft,不阻断重建)
+    let original = vec![Message::User {
+        content: "u".into(),
+        images: Vec::new(),
+    }];
+    let view = CompactionViewRecord {
+        view_version: "compaction_view/v1".to_string(),
+        kind: "emergency_trim".to_string(),
+        region_start_idx: 0,
+        region_end_idx: 0,
+        region_hash: String::new(),
+        replacement: Vec::new(),
+        overrides: vec![ViewOverride {
+            idx: 9,
+            content: "nope".to_string(),
+        }],
+        generation: 0,
+        at_epoch_ms: 1,
+    };
+    let applied = apply_compaction_view(&original, &view).expect("视图应可应用");
+    assert_eq!(applied.len(), 1);
+    assert!(matches!(&applied[0], Message::User { content, .. } if content == "u"));
+}
+
+/// 紧急裁剪黄金对照基座(整段压缩触发形态):大体积工具结果+审批往返带图
+fn roundtrip_fixture_region_hit() -> Vec<Message> {
+    vec![
+        Message::System {
+            content: "sys".into(),
+        },
+        Message::User {
+            content: "round one".into(),
+            images: Vec::new(),
+        },
+        Message::Assistant {
+            content: "working".into(),
+            tool_calls: None,
+        },
+        Message::Tool {
+            content: "very large tool output ".repeat(64),
+            tool_name: "shell_exec".into(),
+            images: Vec::new(),
+        },
+        Message::User {
+            content: "round two".into(),
+            images: Vec::new(),
+        },
+        Message::Assistant {
+            content: "still working".into(),
+            tool_calls: None,
+        },
+        Message::User {
+            content: r#"{"proposal_id":"p-1","decision":"approved"}"#.into(),
+            images: vec![test_image()],
+        },
+    ]
+}
+
+/// 紧急裁剪黄金对照基座(整段压缩未触发形态):仅审批往返折叠
+fn roundtrip_fixture_no_region() -> Vec<Message> {
+    vec![
+        Message::System {
+            content: "sys".into(),
+        },
+        Message::User {
+            content: "round one".into(),
+            images: Vec::new(),
+        },
+        Message::Assistant {
+            content: "working".into(),
+            tool_calls: None,
+        },
+        Message::Tool {
+            content: "tool output".into(),
+            tool_name: "shell_exec".into(),
+            images: Vec::new(),
+        },
+        Message::User {
+            content: r#"{"proposal_id":"p-2","decision":"rejected"}"#.into(),
+            images: vec![test_image()],
+        },
+    ]
+}
+
+#[test]
+fn emergency_trim_view_roundtrip_region_hit() {
+    let original = roundtrip_fixture_region_hit();
+    let mut trimmed = original.clone();
+    let report = emergency_trim_for_payload_limit(&mut trimmed);
+    assert!(report.history_compacted, "该形态应触发整段压缩兜底层");
+    assert!(report.region.is_some() && report.placeholder.is_some());
+    let view = emergency_trim_view_from_report(&report);
+    let applied = apply_compaction_view(&original, &view).expect("视图应可应用");
+    // 黄金断言:视图复原 == 直接裁剪产物(逐条等价)
+    assert_eq!(applied, trimmed);
+    // 区外编辑经 override 保留;区内编辑已被占位吸收
+    let end = view.region_end_idx;
+    assert!(
+        view.overrides.iter().any(|ov| ov.idx >= end),
+        "区外审批折叠应保留为覆盖项"
+    );
+    assert!(
+        !view.overrides.iter().any(|ov| ov.idx < end),
+        "区内编辑已被占位吸收,不得重复落覆盖"
+    );
+}
+
+#[test]
+fn emergency_trim_view_roundtrip_without_region() {
+    let original = roundtrip_fixture_no_region();
+    let mut trimmed = original.clone();
+    let report = emergency_trim_for_payload_limit(&mut trimmed);
+    assert!(!report.history_compacted, "两轮形态不触发整段压缩");
+    assert!(report.region.is_none() && report.placeholder.is_none());
+    let view = emergency_trim_view_from_report(&report);
+    let applied = apply_compaction_view(&original, &view).expect("视图应可应用");
+    assert_eq!(applied, trimmed, "空区间视图应等价于纯就地覆盖");
+}
+
+#[tokio::test]
+async fn rebuild_applies_compaction_view_and_records_delta() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let state = payload_state_with_view(serde_json::to_value(compact_view_record()).unwrap());
+    server
+        .mock("GET", "/api/sessions/s1/state")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&state).unwrap())
+        .create_async()
+        .await;
+    let runner = AgentRunner::new(AgentConfig::default(), client.clone())
+        .with_memory(MemoryManager::new("default", client));
+
+    let messages = AgentRunner::load_messages_from_payload(&runner, "s1")
+        .await
+        .unwrap();
+    // 账面 6 条 → 视图折叠区间 [1,5) 为单条摘要占位 → 3 条
+    assert_eq!(messages.len(), 3);
+    assert!(matches!(&messages[0], Message::System { content } if content == "sys prompt"));
+    assert!(
+        matches!(&messages[1], Message::System { content } if content.contains("earlier conversation summary"))
+    );
+    assert!(matches!(&messages[2], Message::Assistant { content, .. } if content == "done"));
+    // 下标差 = 账面末条下标+1 - 折叠后长度 = 6 - 3
+    assert_eq!(
+        runner
+            .persist_idx_delta
+            .load(std::sync::atomic::Ordering::Relaxed),
+        3
+    );
+    // 摘要缓存种子:主动压缩视图携带的摘要文本按区哈希回填(重建零重算)
+    let cache = runner.region_summary_cache.lock().unwrap();
+    assert_eq!(
+        cache.get("region-hash-seed").map(String::as_str),
+        Some("[earlier conversation summary] cached digest")
+    );
+}
+
+#[tokio::test]
+async fn rebuild_delta_aligns_subsequent_persist_index() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let mut state = payload_state_with_view(serde_json::to_value(compact_view_record()).unwrap());
+    // 账面末条(idx 5)设为悬挂 assistant(带未响应工具调用):视图区间 [1,5)
+    // 不覆盖 idx 5,重建后它落在 applied 序列末尾。repair_dangling_tail 处置的
+    // 是已落账消息,持久化下标按下标差对齐到 messages.6
+    // (路径不匹配则 mock 不命中 → 501 → 持久化 Err → 断言失败)
+    state["payload"]["__memory__"]["default"]["session_s1"]["messages"]["5"] = serde_json::json!({
+        "idx": 5,
+        "role": "assistant",
+        "content": "done",
+        "tool_calls": [{"tool_name": "shell_exec", "args": {"command": "echo hi"}, "id": null}],
+        "timestamp": 1005
+    });
+    server
+        .mock("GET", "/api/sessions/s1/state")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&state).unwrap())
+        .create_async()
+        .await;
+    server
+        .mock("POST", "/api/sessions/s1/payload")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "path": "__memory__.default.session_s1.messages.6"
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{\"fact_id\":1}")
+        .create_async()
+        .await;
+    let mut runner = AgentRunner::new(AgentConfig::default(), client.clone())
+        .with_memory(MemoryManager::new("default", client));
+
+    let mut messages = AgentRunner::load_messages_from_payload(&runner, "s1")
+        .await
+        .unwrap();
+    let report = runner
+        .repair_dangling_tail("s1", &mut messages, None)
+        .await
+        .expect("悬挂处置应成功");
+    assert_eq!(report.observed, 1, "非幂等悬挂走崩溃观察");
+    // mock 命中即证明持久化落点为 messages.6(下标差对齐生效)
+}
