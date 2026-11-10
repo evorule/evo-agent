@@ -2643,8 +2643,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         {
             let w = JournalWriter::open(&dir, "s-pa").unwrap();
-            w.approval_requested("ap-1", "shell_exec", "find src").unwrap();
-            w.approval_requested("ap-2", "python_exec", "print(1)").unwrap();
+            w.approval_requested("ap-1", "shell_exec", "find src")
+                .unwrap();
+            w.approval_requested("ap-2", "python_exec", "print(1)")
+                .unwrap();
             w.approval_resolved("ap-2", "approved").unwrap();
             w.approval_resolved("ap-1", "rejected").unwrap();
             // 悬挂请求(无决定)不投影
