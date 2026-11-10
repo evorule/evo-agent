@@ -17,6 +17,9 @@ export default defineConfig({
     // 开发态代理到本地 evo-agent serve(API 与 WebSocket 同源)
     proxy: {
       '/api': { target: 'http://127.0.0.1:8081', ws: true },
+      // G8 审批/问答回传/取消走 REST /agents/*(api.js 相对路径 fetch)——
+      // 缺此行时 dev 态打到 vite 本身=404「提交失败」(D3 根因,生产同源无此面)
+      '/agents': 'http://127.0.0.1:8081',
       '/admin': 'http://127.0.0.1:8081',
       '/health': 'http://127.0.0.1:8081',
     },

@@ -19,6 +19,7 @@
     approvalPresetView,
   } from '../lib/approval.js';
   import { settingsState, setSetting } from '../lib/settings.js';
+  import { push } from '../lib/notifications.js';
   import { reconnectCurrent } from '../lib/ws.js';
   import { fetchNotices } from '../lib/api.js';
   import { sortNotices, sliceForDisplay, levelClass } from '../lib/notices.js';
@@ -63,9 +64,19 @@
     if (modeBusy) return;
     modeBusy = true;
     modeErr = '';
+    const prev = modeActive;
     try {
       const preset = m === 'strict' ? 'manual' : 'auto';
       for (const [k, v] of approvalPresetWrites(preset)) await setSetting(k, v);
+      // D4 修复(方案 A):写的是缺省档位设置,对新建/重连会话生效;
+      // 已建立会话档位不变(serving 侧会话建立时定档)。如实告知,不留假象。
+      if (m !== prev) {
+        push(
+          'info',
+          m === 'strict' ? '已切换为「严格」缺省档位' : '已切换为「自由」缺省档位',
+          '对新会话/新连接生效;当前会话保持原有审批行为,重连后按新档位生效。',
+        );
+      }
     } catch (e) {
       modeErr = String(e?.message || e);
     } finally {
@@ -212,6 +223,7 @@
         {modeActive === 'strict'
           ? '严格:每次工具调用先经人工确认,适合不熟悉的项目与高危目录。'
           : '自由:工具调用自动评审判定放行并留痕,适合可信项目的高效迭代。'}
+        切换为缺省档位设置,对新会话/新连接生效;已建立会话保持原有审批行为。
       </p>
       <p class="hint red">任何模式下,红线类操作(删除文件 / 推送远端 / 数据外发 / 修改治理配置文件)始终强制人工确认。</p>
       {#if modeErr}<p class="err">{modeErr}</p>{/if}
