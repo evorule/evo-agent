@@ -1513,6 +1513,15 @@ pub struct AgentRunner {
     /// with_workspace_checkpoint 接线时与 workdir 合成生产编排器——
     /// verify 命令须在 agent workdir 执行,workdir 只在接线点可得)
     verify_config: Option<crate::agent::verify::VerifyConfig>,
+    /// 压缩视图回写后,权威历史与持久化账面的消息下标差
+    /// (重建时视图把 N 条消息折叠为更短的发送视图,账面仍按原下标落账;
+    /// 后续 persist 以 messages.len() + 本值对齐账面,避免覆盖既有记录)。
+    /// 仅在重建读账应用视图时被写入;delta=0 时行为字节级不变。
+    persist_idx_delta: std::sync::atomic::AtomicUsize,
+    /// 近摘要区摘要缓存(键=区内容哈希):压缩命中缓存时零 LLM 重算;
+    /// 重建读账时从压缩视图种子恢复,运行期与重建面同源。
+    region_summary_cache:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 /// 管道阶段⑦执行器：runner 的 call_service 通路
@@ -1642,6 +1651,10 @@ impl AgentRunner {
             checkpoint: None,
             verify: None,
             verify_config: None,
+            persist_idx_delta: std::sync::atomic::AtomicUsize::new(0),
+            region_summary_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -2897,11 +2910,16 @@ impl AgentRunner {
         trim_messages: &mut [Message],
         goal: &str,
         purpose: &str,
-    ) -> Result<(), AgentError> {
+    ) -> Result<Option<u64>, AgentError> {
         let outcome = summarizer
             .summarize_dropped_with_purpose(dropped, goal, purpose)
             .await
             .map_err(AgentError::Internal)?;
+        let gen = if let SummarizeOutcome::Generated(meta) = &outcome {
+            Some(meta.gen)
+        } else {
+            None
+        };
         // 摘要保真对照(规格修正批交付物 B):被裁剪消息确定性锚点 vs 摘要
         // 文本,每次压缩自动对照(I5 升级)。journal 在位才落账(流式路径);
         // ratio<0.5 warn(fail-visible);空摘要=跳过判定但事件照落。
@@ -2932,7 +2950,7 @@ impl AgentRunner {
         }
         let Some(formatted) = summary_text else {
             tracing::debug!(%session_id, "R3: summary skipped (below threshold or empty)");
-            return Ok(());
+            return Ok(None);
         };
         if let SummarizeOutcome::Generated(meta) = &outcome {
             if let Some(memory) = &self.memory {
@@ -2968,7 +2986,7 @@ impl AgentRunner {
                 }
             }
         }
-        Ok(())
+        Ok(gen)
     }
 
     /// B21 D3 主动 compaction:阈值驱动的窗口压力管理(被动 trim 的前置层)。
@@ -3012,6 +3030,8 @@ impl AgentRunner {
             return None;
         }
         let region = &messages[system_end..split];
+        // 区内容哈希(摘要缓存键:同区复用零 LLM;重建面经视图种子同源回填)
+        let region_hash = region_hash_of(region);
         // ③工具结果引用替代(近摘要区内;保留尾段不动=近期工作记忆全量保真)
         let (cleared_region, cleared_n) = clear_tool_results(region, policy.max_clear_tool_results);
         // ④摘要块占位回注区前(handle_summary_outcome 把首条 [earlier 开头的
@@ -3024,28 +3044,76 @@ impl AgentRunner {
             ),
         }];
         body.extend(cleared_region);
-        // ②滚动摘要(purpose=compaction;保真对照/记忆落链在 helper 内)
-        if let Err(e) = self
-            .handle_summary_outcome(
-                session_id,
-                summarizer,
-                region,
-                &mut body,
-                goal,
-                "compaction",
-            )
-            .await
-        {
-            warn!(
-                %session_id,
-                error = %e,
-                "D3: compaction summary failed, keeping placeholder hint"
-            );
+        // ②滚动摘要(purpose=compaction):缓存命中直取摘要零 LLM;
+        // 未命中经 LLM 摘要并把产出回填缓存。失败仅 warn,占位保留。
+        let mut summary_gen: Option<u64> = None;
+        let cached_summary = if region_hash.is_empty() {
+            None
+        } else {
+            self.region_summary_cache
+                .lock()
+                .ok()
+                .and_then(|c| c.get(&region_hash).cloned())
+        };
+        if let Some(text) = cached_summary {
+            body[0] = Message::System { content: text };
+        } else {
+            match self
+                .handle_summary_outcome(
+                    session_id,
+                    summarizer,
+                    region,
+                    &mut body,
+                    goal,
+                    "compaction",
+                )
+                .await
+            {
+                Ok(gen) => summary_gen = gen,
+                Err(e) => warn!(
+                    %session_id,
+                    error = %e,
+                    "D3: compaction summary failed, keeping placeholder hint"
+                ),
+            }
+            // 摘要产出即回填区缓存(同区复用零 LLM)
+            if !region_hash.is_empty() {
+                if let Message::System { content } = &body[0] {
+                    if content.starts_with("[earlier conversation summary]") {
+                        if let Ok(mut cache) = self.region_summary_cache.lock() {
+                            cache.insert(region_hash.clone(), content.clone());
+                        }
+                    }
+                }
+            }
         }
         let summary_generated = matches!(
             &body[0],
             Message::System { content } if content.starts_with("[earlier conversation summary]")
         );
+        // 压缩视图回写持久化(fail-soft):重建读账时确定性复原发送视图,
+        // 无需 LLM 重算;失败仅 warn 不阻塞压缩主流程
+        if let Some(memory) = &self.memory {
+            let view = CompactionViewRecord {
+                view_version: COMPACTION_VIEW_VERSION.to_string(),
+                kind: "active_compaction".to_string(),
+                region_start_idx: system_end,
+                region_end_idx: split,
+                region_hash: region_hash.clone(),
+                replacement: body.clone(),
+                overrides: Vec::new(),
+                generation: summary_gen.unwrap_or(0),
+                at_epoch_ms: now_epoch_ms(),
+            };
+            match memory.save_compaction_view(session_id, &view).await {
+                Ok(()) => info!(%session_id, "compaction view landed (payload)"),
+                Err(e) => warn!(
+                    %session_id,
+                    error = %e,
+                    "compaction view landing failed (best-effort)"
+                ),
+            }
+        }
         let mut compacted: Vec<Message> = messages[..system_end].to_vec();
         compacted.extend(body);
         compacted.extend_from_slice(&messages[split..]);
@@ -3071,6 +3139,25 @@ impl AgentRunner {
             after_chars: after,
             summary_generated,
         })
+    }
+
+    /// 紧急裁剪产物 → 压缩视图回写持久化(best-effort;失败仅 warn 不阻塞)。
+    ///
+    /// 仅在「发送副本下标 ≡ 权威历史下标」时被调用(对齐守卫在调用方判定);
+    /// 错位轮不落账=等同现行为,避免裁剪/换区后下标失真导致的视图语义漂移。
+    async fn persist_emergency_trim_view(&self, session_id: &str, report: &EmergencyTrimReport) {
+        let Some(memory) = &self.memory else {
+            return;
+        };
+        let view = emergency_trim_view_from_report(report);
+        match memory.save_compaction_view(session_id, &view).await {
+            Ok(()) => info!(%session_id, "emergency trim view landed (payload)"),
+            Err(e) => warn!(
+                %session_id,
+                error = %e,
+                "emergency trim view landing failed (best-effort)"
+            ),
+        }
     }
 
     /// 会话终态标记（PayloadUpdate，append-only 不改既有事实）。
@@ -3734,7 +3821,10 @@ impl AgentRunner {
             )
             .await?;
         }
-        let user_idx = messages.len();
+        let user_idx = messages.len()
+            + self
+                .persist_idx_delta
+                .load(std::sync::atomic::Ordering::Relaxed);
         messages.push(Message::User {
             content: goal.to_string(),
             images: Vec::new(),
@@ -4868,6 +4958,10 @@ impl AgentRunner {
                 checkpoint: None,
                 verify: None,
                 verify_config: None,
+                persist_idx_delta: std::sync::atomic::AtomicUsize::new(0),
+                region_summary_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
             }
         })
     }
@@ -5161,8 +5255,12 @@ impl AgentRunner {
         // G2+G10:发给 LLM 前裁剪 messages(不修改原 messages,只影响本次请求)
         // 被裁剪的消息仍保留在 `messages` 中(进审计链/replay),不影响 evorule payload
         // G10:如果有 summarizer,裁剪掉的消息会送给摘要 LLM 生成摘要,替换 hint
+        // 压缩视图落账对齐守卫:发送副本与权威历史下标一致时才允许紧急裁剪产物
+        // 回写持久化;被动裁剪换区后下标失真,不落账=等同现行为
+        let send_view_pending;
         let mut messages_to_send = if let Some(ctx) = &self.context_window {
             let mut trim_result = ctx.trim_detailed(messages);
+            send_view_pending = trim_result.dropped.is_empty();
             if !trim_result.dropped.is_empty() {
                 info!(
                     dropped = trim_result.dropped.len(),
@@ -5190,6 +5288,7 @@ impl AgentRunner {
             }
             trim_result.messages
         } else {
+            send_view_pending = true;
             messages.clone()
         };
 
@@ -5295,6 +5394,10 @@ impl AgentRunner {
                     elided_images = tr.elided_images,
                     "payload byte gate: proactive emergency trim applied (2MB)"
                 );
+                // 紧急裁剪产物回写持久化(压缩视图):对齐守卫成立时落账,失败仅 warn
+                if send_view_pending {
+                    self.persist_emergency_trim_view(session_id, tr).await;
+                }
             }
         }
 
@@ -5407,7 +5510,10 @@ impl AgentRunner {
                     let retry_count = self.output_format_retries;
 
                     // 推送原始(未清洗)assistant 消息到审计链(带思考留痕)
-                    let assistant_idx = messages.len();
+                    let assistant_idx = messages.len()
+                        + self
+                            .persist_idx_delta
+                            .load(std::sync::atomic::Ordering::Relaxed);
                     let assistant_msg = Message::Assistant {
                         content: llm_response.content.clone(),
                         tool_calls: llm_response.tool_calls.clone(),
@@ -5422,7 +5528,10 @@ impl AgentRunner {
                     .await?;
 
                     // 推送 System 校正消息
-                    let correction_idx = messages.len();
+                    let correction_idx = messages.len()
+                        + self
+                            .persist_idx_delta
+                            .load(std::sync::atomic::Ordering::Relaxed);
                     let correction_msg = Message::System {
                         content: format!(
                             "你的上一次输出不符合要求的格式。校验错误:\n{}\n\n\
@@ -5493,7 +5602,10 @@ impl AgentRunner {
             final_content.push_str("\n\n[输出因达到生成长度上限被截断,内容可能不完整]");
         }
 
-        let assistant_idx = messages.len();
+        let assistant_idx = messages.len()
+            + self
+                .persist_idx_delta
+                .load(std::sync::atomic::Ordering::Relaxed);
         let assistant_msg = Message::Assistant {
             content: final_content.clone(),
             tool_calls: effective_tool_calls.clone(),
@@ -5611,7 +5723,10 @@ impl AgentRunner {
         let stagnation_verdict =
             self.stagnation
                 .observe(tool_name, &args.to_string(), &tool_result.to_string());
-        let tool_idx = messages.len();
+        let tool_idx = messages.len()
+            + self
+                .persist_idx_delta
+                .load(std::sync::atomic::Ordering::Relaxed);
         // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文(事实记录)
         // B1:先提取旁路图片+瘦身(指纹替换 base64),回喂/持久化两面统一用
         // 瘦身后文本(审计链存指纹不存 base64;图片本体内容寻址落盘)
@@ -7282,7 +7397,10 @@ impl AgentRunner {
                 tool_name: name,
                 images: repair_images,
             };
-            let idx = messages.len();
+            let idx = messages.len()
+                + self
+                    .persist_idx_delta
+                    .load(std::sync::atomic::Ordering::Relaxed);
             // 回喂消息带旁路图;persist 面存瘦身后文本+空图(审计链存指纹不存 base64)
             let mut persist_msg = msg.clone();
             if let Message::Tool { images, .. } = &mut persist_msg {
@@ -7379,11 +7497,51 @@ impl AgentRunner {
 
         // 按 idx 排序,确保消息顺序正确
         records.sort_by_key(|r| r.idx);
+        let max_record_idx = records.last().map(|r| r.idx).unwrap_or(0);
 
-        let messages: Vec<Message> = records
+        let mut messages: Vec<Message> = records
             .into_iter()
             .filter_map(|rec| rec_to_message(&rec, runner.tool_result_max_chars))
             .collect();
+
+        // 压缩视图回读(fail-soft):账面带压缩视图时应用折叠复原发送视图,
+        // 并记录账面与重建序列的下标差(后续消息持久化按下标差对齐账面,
+        // 避免覆盖既有记录)。校验失败仅 warn,回退原始序列(fail-visible)。
+        if let Some(view) = crate::agent::memory::MemoryManager::compaction_view_from_state(
+            &state, &namespace, session_id,
+        ) {
+            match apply_compaction_view(&messages, &view) {
+                Some(applied) => {
+                    let delta = (max_record_idx + 1).saturating_sub(applied.len());
+                    runner
+                        .persist_idx_delta
+                        .store(delta, std::sync::atomic::Ordering::Relaxed);
+                    // 摘要缓存种子:主动压缩视图携带的摘要文本按区哈希回填
+                    // (重建零 LLM;与运行期缓存同源)
+                    if view.kind == "active_compaction" && !view.region_hash.is_empty() {
+                        if let Some(Message::System { content }) = view.replacement.first() {
+                            if content.starts_with("[earlier conversation summary]") {
+                                if let Ok(mut cache) = runner.region_summary_cache.lock() {
+                                    cache.insert(view.region_hash.clone(), content.clone());
+                                }
+                            }
+                        }
+                    }
+                    info!(
+                        %session_id,
+                        region_start = view.region_start_idx,
+                        region_end = view.region_end_idx,
+                        delta,
+                        "compaction view applied on rebuild"
+                    );
+                    messages = applied;
+                }
+                None => warn!(
+                    %session_id,
+                    "compaction view failed validation on rebuild; raw history restored (fail-visible)"
+                ),
+            }
+        }
 
         // R3/G-3：回读滚动摘要种子——continuation/重启后缓存从账上恢复，
         // 不触发 LLM 重算（重建读账不重算；G-3 关闭）
@@ -8248,7 +8406,7 @@ impl AgentRunner {
                            }
                            // 崩溃恢复不注入新 user 输入:悬挂处置完毕后 LLM 自然续完当前 turn
                            if recovery != RecoveryMode::CrashResume {
-                               let user_idx = messages.len();
+                               let user_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
                                // S4-b:用户轮图片旁路提取(fail-soft;空 refs 零行为变化)
                                // ——内容 JSON 化带指纹留痕,回喂旁路带 base64(仅发送面)
                                let (turn_content, turn_images) = build_user_turn_images(
@@ -8724,7 +8882,11 @@ impl AgentRunner {
                                                // G1:流式调用 LLM
                                                // G2+G10:裁剪 messages(同 handle_call_external)
                                                // G10:如果有 summarizer,裁剪掉的消息生成摘要替换 hint
-                                                   let messages_to_send = if let Some(ctx) = &runner.context_window {
+                                               // 压缩视图落账对齐守卫(流式):主动压缩换区或被动裁剪
+                                               // 使发送副本下标失真时不落账(等同现行为);发送副本与
+                                               // 权威历史一致时才允许紧急裁剪产物回写持久化
+                                               let mut send_view_pending;
+                                               let messages_to_send = if let Some(ctx) = &runner.context_window {
                                                    // B21 D3:主动 compaction(阈值触发,先于被动 trim;
                                                    // None=未启用/未触发/无 summarizer——原消息直接走被动 trim)
                                                    let mut compaction_note: Option<(usize, usize, bool)> = None;
@@ -8794,8 +8956,12 @@ impl AgentRunner {
                                                            }
                                                        }
                                                    }
+                                                   // 压缩视图落账对齐守卫:主动压缩换区/被动裁剪后的
+                                                   // 发送副本下标失真,不落账;发送副本≡权威历史时才落
+                                                   send_view_pending = compaction_note.is_none() && trim_result.dropped.is_empty();
                                                    trim_result.messages
                                                } else {
+                                                   send_view_pending = true;
                                                    messages.clone()
                                                };
 
@@ -8962,6 +9128,12 @@ impl AgentRunner {
                                                                elided_images = tr.elided_images,
                                                                "payload byte gate: proactive emergency trim applied (2MB)"
                                                            );
+                                                           // 紧急裁剪产物回写持久化(压缩视图):对齐守卫成立且本轮未落过账
+                                                           // (二次裁剪作用在已裁副本上,下标失真不落);失败仅 warn
+                                                           if send_view_pending {
+                                                               send_view_pending = false;
+                                                               runner.persist_emergency_trim_view(&session_id, tr).await;
+                                                           }
                                                        }
                                                    }
                                                let serde_messages = match serde_json::to_value(&messages_to_send) {
@@ -9156,6 +9328,12 @@ impl AgentRunner {
                                                                    history_compacted = report.history_compacted,
                                                                    "payload limit hit: emergency trim applied, retrying once"
                                                                );
+                                                               // 紧急裁剪产物回写持久化(压缩视图):对齐守卫成立且本轮未落过账
+                                                               // (若主动门已落账则 pending=false,此处跳过);失败仅 warn
+                                                               if send_view_pending {
+                                                                   send_view_pending = false;
+                                                                   runner.persist_emergency_trim_view(&session_id, &report).await;
+                                                               }
                                                                if report.after_chars < report.before_chars {
                                                                    continue 'payload_attempt;
                                                                }
@@ -9404,7 +9582,7 @@ impl AgentRunner {
                                                                                                runner.output_format_retries += 1;
                                                                                                let retry_count = runner.output_format_retries;
                                                                                                // 推原始(未清洗) assistant 到审计链(带思考留痕)
-                                                                                               let a_idx = messages.len();
+                                                                                               let a_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
                                                                                                let a_msg = Message::Assistant {
                                                                                                    content: full_content.clone(),
                                                                                                    tool_calls: None,
@@ -9434,7 +9612,7 @@ impl AgentRunner {
                                                                                                    return;
                                                                                                }
                                                                                                // 推 System 校正消息(同 run() 模板)
-                                                                                               let c_idx = messages.len();
+                                                                                               let c_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
                                                                                                let c_msg = Message::System {
                                                                                                    content: format!(
                                                                                                        "你的上一次输出不符合要求的格式。校验错误:\n{}\n\n\
@@ -9482,7 +9660,7 @@ impl AgentRunner {
                                                                                };
                                                                                let mut full_content = g11_validated_content;
 
-                                                                               let assistant_idx = messages.len();
+                                                                               let assistant_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
                                                                                let assistant_msg = Message::Assistant {
                                                                                    content: full_content.clone(),
                                                                                    tool_calls: full_tool_calls.clone(),
@@ -9760,7 +9938,7 @@ impl AgentRunner {
                                                        // (回喂轮 LLM 需要它;tool_call_id 配对由 LlmHandler
                                                        // 按 tool_name FIFO 匹配最近 assistant)
                                                        tool_calls.push(tc.name.clone());
-                                                       let tool_idx = messages.len();
+                                                       let tool_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
                                                        // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
                                                        let mut raw_content = outcome.final_result.to_string();
                                                        if let Some(adv) = write_advisory {
@@ -10159,7 +10337,7 @@ impl AgentRunner {
                                                            }
                                                        }
                                                        tool_calls.push(tool_name.clone());
-                                                       let tool_idx = messages.len();
+                                                       let tool_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
                                                        messages.push(Message::Tool {
                                                            content: format!(
                                                                "{{\"status\":\"rejected_by_acceptance_gate\",\"detail\":\"{detail}\"}}"
@@ -10402,7 +10580,7 @@ impl AgentRunner {
 
                                                // 3. 记录 tool_calls + 持久化 tool 消息(同 handle_call_service)
                                                tool_calls.push(tool_name.clone());
-                                               let tool_idx = messages.len();
+                                               let tool_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
                                                // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
                                                let mut raw_content = extracted_raw;
                                                if let Some(adv) = gate_note_advisory.take() {
@@ -11540,6 +11718,158 @@ pub(crate) const PAYLOAD_LIMIT_FAIL_VISIBLE_HINT: &str =
 /// 紧急裁剪兜底保留轮数(近程工作记忆保真:最近 2 轮完整 ReAct 往返)
 const EMERGENCY_TRIM_KEEP_ROUNDS: usize = 2;
 
+/// 压缩视图记录结构版本(结构演进锚)
+const COMPACTION_VIEW_VERSION: &str = "compaction_view/v1";
+
+/// 压缩视图单项覆盖(原历史下标 → 替换后 content 全文)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub(crate) struct ViewOverride {
+    /// 原历史中该消息的下标
+    pub idx: usize,
+    /// 替换后的 content 全文
+    pub content: String,
+}
+
+/// 压缩视图记录(压缩/裁剪产物的回写持久化载体)。
+///
+/// 重建读账时应用本视图即可确定性复原发送视图,无需 LLM 重算。
+/// 重建侧不复核 `region_hash`(跨进程序列化必然漂移),有效性仅靠版本+区间边界。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub(crate) struct CompactionViewRecord {
+    /// 视图结构版本
+    pub view_version: String,
+    /// 视图类别:`active_compaction`(阈值驱动主动压缩)或 `emergency_trim`(请求体超限紧急裁剪)
+    pub kind: String,
+    /// 被替换区间 [start, end)(原历史下标,不含端)
+    pub region_start_idx: usize,
+    pub region_end_idx: usize,
+    /// 区间内容哈希(主动压缩侧作摘要缓存键;应用侧不复核)
+    pub region_hash: String,
+    /// 区间替换序列(占位/摘要 + 清引用后的区内消息)
+    pub replacement: Vec<Message>,
+    /// 区外就地覆盖
+    pub overrides: Vec<ViewOverride>,
+    /// 摘要代次(主动压缩侧=滚动摘要 gen;其余 0)
+    pub generation: u64,
+    /// 落账时刻(epoch ms)
+    pub at_epoch_ms: u64,
+}
+
+/// 当前时间戳(epoch ms, 系统时钟回退时回落 0)
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 区内容哈希(摘要缓存键):blake3 对区切片序列化字节;
+/// 序列化失败=空串(该切片不可缓存)。
+fn region_hash_of(messages: &[Message]) -> String {
+    serde_json::to_vec(messages)
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .unwrap_or_default()
+}
+
+/// 压缩视图应用(纯函数):把视图所载折叠/覆盖确定性作用于历史序列。
+///
+/// 校验失败(版本不符/未知类别/区间越界)返回 `None`;
+/// 区内覆盖已被 replacement 吸收、越界覆盖一律跳过不报错(fail-soft,不阻断重建)。
+pub(crate) fn apply_compaction_view(
+    messages: &[Message],
+    view: &CompactionViewRecord,
+) -> Option<Vec<Message>> {
+    if view.view_version != COMPACTION_VIEW_VERSION {
+        return None;
+    }
+    if view.kind != "active_compaction" && view.kind != "emergency_trim" {
+        return None;
+    }
+    let (start, end) = (view.region_start_idx, view.region_end_idx);
+    if start > end || end > messages.len() {
+        return None;
+    }
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len() + view.replacement.len());
+    out.extend_from_slice(&messages[..start]);
+    out.extend(view.replacement.iter().cloned());
+    out.extend_from_slice(&messages[end..]);
+    for ov in &view.overrides {
+        // 区内覆盖已被 replacement 吸收;其余按下标平移映射,越界跳过
+        let mapped = if ov.idx < start {
+            ov.idx
+        } else if ov.idx < end {
+            continue;
+        } else {
+            (ov.idx + view.replacement.len()).saturating_sub(end - start)
+        };
+        if mapped >= out.len() {
+            continue;
+        }
+        match &mut out[mapped] {
+            Message::User { content, images } => {
+                *content = ov.content.clone();
+                images.clear();
+            }
+            Message::Tool {
+                content, images, ..
+            } => {
+                *content = ov.content.clone();
+                images.clear();
+            }
+            // System/Assistant 无覆盖来源(①/②层只作用于 Tool/User),跳过
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+/// 紧急裁剪报告 → 压缩视图记录(纯函数,与落账路径解耦便于单测)。
+pub(crate) fn emergency_trim_view_from_report(
+    report: &EmergencyTrimReport,
+) -> CompactionViewRecord {
+    let (region, replacement, overrides, region_hash) =
+        if let (Some((start, end)), Some(placeholder)) =
+            (report.region, report.placeholder.as_deref())
+        {
+            // 整段压缩命中:区间替换为占位,区外编辑经 override 保留(区内已被占位吸收)
+            (
+                (start, end),
+                vec![Message::System {
+                    content: placeholder.to_owned(),
+                }],
+                report
+                    .edits
+                    .iter()
+                    .filter(|(i, _)| *i >= end)
+                    .cloned()
+                    .collect(),
+                report.region_hash.clone(),
+            )
+        } else {
+            // 未触发整段压缩:空区间 + 全部就地编辑
+            (
+                (0usize, 0usize),
+                Vec::new(),
+                report.edits.clone(),
+                String::new(),
+            )
+        };
+    CompactionViewRecord {
+        view_version: COMPACTION_VIEW_VERSION.to_string(),
+        kind: "emergency_trim".to_string(),
+        region_start_idx: region.0,
+        region_end_idx: region.1,
+        region_hash,
+        replacement,
+        overrides: overrides
+            .into_iter()
+            .map(|(idx, content)| ViewOverride { idx, content })
+            .collect(),
+        generation: 0,
+        at_epoch_ms: now_epoch_ms(),
+    }
+}
+
 /// 紧急裁剪报告(落账口径)
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct EmergencyTrimReport {
@@ -11555,6 +11885,14 @@ pub(crate) struct EmergencyTrimReport {
     pub history_compacted: bool,
     /// 被清空旁路的图片张数(指纹引用已随折叠标记/压缩占位留痕可回取)
     pub elided_images: usize,
+    /// 整段压缩兜底层的区间(原消息下标 [start, end),不含端);未触发=None
+    pub region: Option<(usize, usize)>,
+    /// 整段压缩占位符全文(region 触发时非空)
+    pub placeholder: Option<String>,
+    /// ①/②层就地编辑(原消息下标 → 替换后 content 全文)
+    pub edits: Vec<(usize, String)>,
+    /// 整段压缩区内容哈希(region 触发时=drain 前对当前区切片计;未触发=空串)
+    pub region_hash: String,
 }
 
 /// ③层压缩占位符携带的图片指纹引用条数上限(超出收敛为 +N more)
@@ -11651,7 +11989,7 @@ pub(crate) fn emergency_trim_for_payload_limit(messages: &mut Vec<Message>) -> E
     };
 
     // ①折叠近程边界之前的大体积工具结果(空结果不动,零收益)
-    for m in messages.iter_mut().take(recent_start) {
+    for (i, m) in messages.iter_mut().enumerate().take(recent_start) {
         if let Message::Tool {
             content,
             tool_name: _,
@@ -11670,11 +12008,12 @@ pub(crate) fn emergency_trim_for_payload_limit(messages: &mut Vec<Message>) -> E
             *content = format!("[tool result elided: {n} bytes]{note}");
             *images = Vec::new();
             report.elided_tool_results += 1;
+            report.edits.push((i, content.clone()));
         }
     }
 
     // ②审批往返收敛为单行决策记录
-    for m in messages.iter_mut() {
+    for (i, m) in messages.iter_mut().enumerate() {
         if let Message::User { content, images } = m {
             if is_approval_roundtrip(content) {
                 let n = content.len();
@@ -11694,6 +12033,7 @@ pub(crate) fn emergency_trim_for_payload_limit(messages: &mut Vec<Message>) -> E
                     format!("[approval roundtrip elided: {n} bytes; decision: {decision}]{note}");
                 *images = Vec::new();
                 report.folded_approvals += 1;
+                report.edits.push((i, content.clone()));
             }
         }
     }
@@ -11730,13 +12070,18 @@ pub(crate) fn emergency_trim_for_payload_limit(messages: &mut Vec<Message>) -> E
                 }
                 s
             };
+            // 区内容哈希(drain 前对当前区切片计;与摘要缓存键同源)
+            report.region_hash = region_hash_of(&messages[sys_end..split]);
+            let placeholder = format!(
+                "[history compacted due to request body limit: {elided} messages removed]{note}"
+            );
+            report.region = Some((sys_end, split));
+            report.placeholder = Some(placeholder.clone());
             messages.drain(sys_end..split);
             messages.insert(
                 sys_end,
                 Message::System {
-                    content: format!(
-                        "[history compacted due to request body limit: {elided} messages removed]{note}"
-                    ),
+                    content: placeholder,
                 },
             );
             report.history_compacted = true;
