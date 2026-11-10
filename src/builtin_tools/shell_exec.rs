@@ -3208,16 +3208,22 @@ mod tests {
             .unwrap_or(false)
     }
 
-    /// 存活 PING.EXE 计数(Windows 进程树断言基线)
+    /// 本机 PING.EXE 进程 PID 集（CSV 第二列）。进程树断言用 PID 差集锚定
+    /// 自家孙进程——全局计数会把本机无关瞬时 PING.EXE 计进基线，回收后
+    /// 计数≠基线造成环境性假红。
     #[cfg(windows)]
-    fn count_ping_processes() -> usize {
+    fn ping_pids() -> std::collections::HashSet<u32> {
         let out = Command::new("tasklist")
             .args(["/FO", "CSV", "/NH", "/FI", "IMAGENAME eq PING.EXE"])
             .output()
             .expect("tasklist must run");
         String::from_utf8_lossy(&out.stdout)
-            .matches("PING.EXE")
-            .count()
+            .lines()
+            .filter_map(|l| {
+                // CSV 形态: "PING.EXE","1234","Console","1","..."
+                l.split(',').nth(1)?.trim_matches('"').parse::<u32>().ok()
+            })
+            .collect()
     }
 
     /// 同进程组存活成员数(Unix 进程树断言;spawn 侧 process_group(0) 使
@@ -3324,7 +3330,7 @@ mod tests {
         );
 
         #[cfg(windows)]
-        let baseline = count_ping_processes();
+        let baseline = ping_pids();
 
         let tool = ShellExecTool::new().with_timeout(1);
         let result = tool.execute(&parts, cmd_str);
@@ -3335,20 +3341,28 @@ mod tests {
         assert!(!process_alive(pid), "main pid {pid} must be reaped");
 
         // 进程树断言:孙进程同样回收(taskkill /T 树终止 / Unix 组级 SIGKILL);
-        // 终止异步生效,轮询等待内核回收完成
+        // 终止异步生效,轮询等待内核回收完成。孙进程锚定=基线快照之外的
+        // PID 差集(自家 cmd 树新出现的 PING.EXE),与全机无关 PING.EXE 零耦合
         #[cfg(windows)]
         {
+            let ours: Vec<u32> = {
+                let now = ping_pids();
+                let diff: std::collections::HashSet<u32> =
+                    now.difference(&baseline).copied().collect();
+                diff.into_iter().collect()
+            };
+            if ours.is_empty() {
+                // 孙进程在首次快照前已被内核回收完毕——树内无存活即达标
+                return;
+            }
             for _ in 0..40 {
-                if count_ping_processes() == baseline {
+                let now = ping_pids();
+                if ours.iter().all(|p| !now.contains(p)) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            panic!(
-                "grandchild PING.EXE must be reaped with the family: {} vs baseline {}",
-                count_ping_processes(),
-                baseline
-            );
+            panic!("grandchild PING.EXE must be reaped with the family: still alive pids {ours:?}");
         }
         #[cfg(unix)]
         {
