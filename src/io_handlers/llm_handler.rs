@@ -136,6 +136,13 @@ pub(crate) fn emergency_trim_body(body: &mut serde_json::Value, target_bytes: us
         let mut cut = false;
         if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
             for msg in msgs.iter_mut() {
+                // 四轮审计 G3(B-291):system role 豁免——system prompt 被
+                // 砍头尾会破坏指令完整性与前缀缓存;仅削非 system 内容峰值。
+                // 代价:体限主因是 system 时裁剪失效(413 可能不可解),这是
+                // "削内容峰值、不删消息条数"纪律下的正确取舍。
+                if msg.get("role").and_then(|r| r.as_str()) == Some("system") {
+                    continue;
+                }
                 cut |= _trim_content_strings(msg, threshold, head, tail);
             }
         }
@@ -1343,6 +1350,8 @@ fn to_openai_wire_messages(messages: serde_json::Value) -> serde_json::Value {
         };
         let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
         let mut converted = obj.clone();
+        // 四轮审计 G7(B-291):孤儿 tool 消息弃发标记(见 "tool" 臂)
+        let mut skip = false;
         match role {
             "assistant" => {
                 pending.clear();
@@ -1385,13 +1394,29 @@ fn to_openai_wire_messages(messages: serde_json::Value) -> serde_json::Value {
             }
             "tool" => {
                 if let Some(name) = obj.get("tool_name").and_then(|v| v.as_str()) {
-                    let id = pending
+                    let matched = pending
                         .iter()
                         .position(|(n, _)| n == name)
-                        .map(|pos| pending.remove(pos).1)
-                        .unwrap_or_else(|| format!("call_{}", name));
-                    converted.insert("tool_call_id".to_string(), serde_json::Value::String(id));
-                    converted.remove("tool_name");
+                        .map(|pos| pending.remove(pos).1);
+                    match matched {
+                        Some(id) => {
+                            converted
+                                .insert("tool_call_id".to_string(), serde_json::Value::String(id));
+                            converted.remove("tool_name");
+                        }
+                        None => {
+                            // 四轮审计 G7(B-291):孤儿 tool 消息——无同名待配
+                            // 对 tool_calls。合成 call_{name} 静默上行必 400
+                            // (tool 消息必须跟随对应 tool_calls),且同名牌孤
+                            // 儿必撞 id。fail-visible:丢弃+warn 留痕,请求
+                            // 保持可活(账面原文仍在,可查可重建)。
+                            tracing::warn!(
+                                tool_name = %name,
+                                "orphan tool result dropped from wire payload (no pending tool_calls to pair)"
+                            );
+                            skip = true;
+                        }
+                    }
                 }
                 // B1 多模态上行:旁路 images 非空时 content 升级为多 part 数组
                 // [{type:"text"},{type:"image_url",image_url:{url:"data:<mime>;base64,<data>"}}];
@@ -1472,6 +1497,9 @@ fn to_openai_wire_messages(messages: serde_json::Value) -> serde_json::Value {
                 }
             }
             _ => {}
+        }
+        if skip {
+            continue;
         }
         out.push(serde_json::Value::Object(converted));
     }
@@ -1823,14 +1851,20 @@ mod tests {
         assert_eq!(arr[2]["tool_call_id"], "call_x");
     }
 
-    /// 出站转换:tool 消息无前置 assistant tool_call 可配对时回退 call_{tool_name}
+    /// 出站转换:tool 消息无前置 assistant tool_call 可配对时——B-291 G7
+    /// 修正后不再合成 call_{tool_name} 静默上行(上游 400:tool 消息必须
+    /// 跟随对应 tool_calls),改丢弃+warn 留痕(账面原文仍在)。
     #[test]
     fn test_wire_messages_tool_fallback_id() {
         let messages = serde_json::json!([
             {"role": "tool", "content": "r", "tool_name": "orphan"}
         ]);
         let wire = to_openai_wire_messages(messages);
-        assert_eq!(wire[0]["tool_call_id"], "call_orphan");
+        let arr = wire.as_array().unwrap();
+        assert!(
+            arr.is_empty(),
+            "孤儿 tool 消息必须被丢弃而非合成 id 上行: {arr:?}"
+        );
     }
 
     /// tool_call 真 id 保真:执行体响应归一时 id 键原样透传;无 id 项不合成
@@ -1888,15 +1922,22 @@ mod tests {
     /// 非 images 键形态不触碰
     #[test]
     fn test_wire_messages_images_empty_keeps_string_content() {
+        // B-291 G7 修正后配对前置:tool 消息必须有同名待配对 tool_calls 才
+        // 上行(原测钉了孤儿合成 id 的缺陷旧行为,补 assistant 前驱保测意)。
         let messages = serde_json::json!([
+            {"role": "assistant", "tool_calls": [
+                {"tool_name": "echo", "args": {}},
+                {"tool_name": "echo2", "args": {}}
+            ]},
             {"role": "tool", "content": "ok", "tool_name": "echo", "images": []},
             {"role": "tool", "content": "ok2", "tool_name": "echo2"}
         ]);
         let wire = to_openai_wire_messages(messages);
         let arr = wire.as_array().unwrap();
-        assert_eq!(arr[0]["content"], "ok");
-        assert_eq!(arr[0]["tool_call_id"], "call_echo");
-        assert_eq!(arr[1]["content"], "ok2");
+        assert_eq!(arr[1]["content"], "ok");
+        assert_eq!(arr[1]["tool_call_id"], "call_0_echo");
+        assert_eq!(arr[2]["content"], "ok2");
+        assert_eq!(arr[2]["tool_call_id"], "call_1_echo2");
     }
 
     /// B1 多模态上行:images 非空 → content 升级多 part 数组
@@ -3390,5 +3431,60 @@ mod config_max_tokens_tests {
         let mut b2 = body.clone();
         let trimmed = emergency_trim_body(&mut b2, 0);
         println!("trim returned {}", trimmed);
+    }
+
+    // ===== B-291 四轮审计缝缺陷红测(G3/G7) =====
+
+    /// G3: system role 豁免紧急裁剪——system prompt 被字节级砍头尾会破坏
+    /// 指令完整性与前缀缓存;大 system + 大 user 同场,只准裁 user。
+    #[test]
+    fn emergency_trim_exempts_system_role() {
+        let big = "X".repeat(150 * 1024);
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": big},
+                {"role": "user", "content": "Y".repeat(150 * 1024)}
+            ]
+        });
+        let before = body["messages"][0]["content"].as_str().unwrap().len();
+        let trimmed = emergency_trim_body(&mut body, 100 * 1024);
+        assert!(trimmed, "应发生裁剪");
+        assert_eq!(
+            body["messages"][0]["content"].as_str().unwrap().len(),
+            before,
+            "system 内容不得被紧急裁剪"
+        );
+        assert!(
+            body["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[TRIMMED"),
+            "user 内容应被裁剪"
+        );
+    }
+
+    /// G7: 孤儿 tool 消息(无同名待配对 tool_calls)不得合成 id 静默上行——
+    /// 上游 400(tool 消息必须跟随对应 tool_calls),同名牌孤儿必撞 id。
+    #[test]
+    fn orphan_tool_message_dropped_from_wire() {
+        let msgs = serde_json::json!([
+            {"role": "user", "content": "q"},
+            {"role": "tool", "tool_name": "ghost", "content": "orphan"},
+            {"role": "assistant", "tool_calls": [{"tool_name": "t1", "args": {"k": 1}}]},
+            {"role": "tool", "tool_name": "t1", "content": "paired"}
+        ]);
+        let out = to_openai_wire_messages(msgs);
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr.len(), 3, "孤儿 tool 消息必须被丢弃: {arr:?}");
+        assert!(
+            !arr.iter()
+                .any(|m| m["tool_call_id"].as_str() == Some("call_ghost")),
+            "不得合成孤儿 id"
+        );
+        assert_eq!(
+            arr[2]["tool_call_id"].as_str(),
+            Some("call_0_t1"),
+            "配对消息仍带确定性 id"
+        );
     }
 }

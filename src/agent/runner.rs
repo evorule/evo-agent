@@ -3042,6 +3042,7 @@ impl AgentRunner {
                     "frozen_len_after": meta.frozen_len_after,
                     "strategy_fingerprint": meta.strategy_fingerprint,
                     "parent_gen": meta.parent_gen,
+                    "content_digest": meta.content_digest,
                     "summary_text": meta.summary_text,
                 });
                 match memory.save_rolling_summary(session_id, &entry).await {
@@ -7699,12 +7700,12 @@ impl AgentRunner {
         // R3/G-3：回读滚动摘要种子——continuation/重启后缓存从账上恢复，
         // 不触发 LLM 重算（重建读账不重算；G-3 关闭）
         if let Some(summarizer) = runner.summarizer.as_ref() {
-            if let Some((frozen, text, gen)) =
+            if let Some((frozen, text, gen, digest)) =
                 crate::agent::memory::MemoryManager::rolling_summary_from_state(
                     &state, &namespace, session_id,
                 )
             {
-                summarizer.seed_cache(frozen, text, gen);
+                summarizer.seed_cache(frozen, text, gen, digest);
                 info!(%session_id, gen, frozen, "R3: rolling summary seeded from payload");
             }
         }
@@ -12005,6 +12006,7 @@ pub async fn compact_session_now(
             "frozen_len_after": meta.frozen_len_after,
             "strategy_fingerprint": meta.strategy_fingerprint,
             "parent_gen": meta.parent_gen,
+            "content_digest": meta.content_digest,
             "summary_text": meta.summary_text,
         });
         let mem = crate::agent::memory::MemoryManager::new(namespace, client.clone())

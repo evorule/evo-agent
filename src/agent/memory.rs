@@ -2740,13 +2740,15 @@ impl MemoryManager {
         state: &serde_json::Value,
         namespace: &str,
         session_id: &str,
-    ) -> Option<(usize, String, u64)> {
+    ) -> Option<(usize, String, u64, String)> {
         let node = &state["payload"]["__memory__"][namespace][&format!("session_{}", session_id)]
             ["rolling_summary"];
         let frozen = node["frozen_len_after"].as_u64()?;
         let text = node["summary_text"].as_str()?.to_owned();
         let gen = node["gen"].as_u64()?;
-        Some((frozen as usize, text, gen))
+        // G9:内容指纹随账回读;旧账无此键→空串(种子只可作增量基底)
+        let content_digest = node["content_digest"].as_str().unwrap_or("").to_owned();
+        Some((frozen as usize, text, gen, content_digest))
     }
 
     /// 压缩视图落链（PayloadUpdate 专用路径）。
