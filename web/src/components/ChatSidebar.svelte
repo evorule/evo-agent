@@ -176,6 +176,11 @@
     el.style.height = `${Math.min(el.scrollHeight, DRAFT_MAX_H)}px`;
   });
 
+  // ---- 工具条低频芯片显示开关(组件与逻辑全保留,仅不在工具条露出;置 true 即恢复) ----
+  const SHOW_MODE_SEG = false; // 构建/计划/对话模式签
+  const SHOW_APPROVAL_PICK = false; // 审批档位入口(档位语义不动:agent 定义显式指定仍生效)
+  const SHOW_MCP_ENTRY = false; // MCP 服务管理入口(设置面板仍可达)
+
   // ---- S3 构建/计划/对话模式(前端姿态+提示语;审批链语义不动) ----
   // 构建=默认,agent 执行任务;计划(交互批)=agent 只读探查后经 plan_submit
   // 提交计划,批准后按计划执行;对话=仅问答咨询,提示块引导先确认后变更。
@@ -2062,6 +2067,7 @@
     <input type="file" multiple bind:this={fileInputEl} onchange={onFilesChosen} hidden />
     <div class="composer-toolbar">
       <div class="tb-left">
+        {#if SHOW_MODE_SEG}
         <div class="mode-seg" role="group" aria-label="会话模式">
           <button
             class:active={chatMode === 'build'}
@@ -2088,6 +2094,7 @@
             对话
           </button>
         </div>
+        {/if}
         <div class="model-pick" bind:this={skillPickEl}>
           <button
             class="tb-btn model-btn"
@@ -2180,6 +2187,7 @@
             </div>
           {/if}
         </div>
+        {#if SHOW_APPROVAL_PICK}
         <div class="approval-pick" bind:this={approvalPickEl}>
           <button
             class="tb-btn approval-btn"
@@ -2236,6 +2244,7 @@
             </div>
           {/if}
         </div>
+        {/if}
         <button class="tb-btn" onclick={openMentionPopup} title="插入 @ 上下文引用">@</button>
         <button class="tb-btn" onclick={pickFiles} title="上传图片/附件(存入工作区 .evo-agent/uploads,agent 可读)">
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
@@ -2248,7 +2257,9 @@
             />
           </svg>
         </button>
+        {#if SHOW_MCP_ENTRY}
         <button class="tb-btn" onclick={openSettingsTab} title="MCP 服务管理(打开设置)">MCP</button>
+        {/if}
       </div>
       <div class="tb-right">
         <span class="token-est {tokenLevel(estimateComposerTokens(draft, $composerMentions))}">
