@@ -1270,10 +1270,18 @@ fn normalize_executor_response(json: Value) -> Result<Value, String> {
             // prompt_tokens_details.cached_tokens)——归一时展平入
             // TokenUsage.cached_tokens,随 io_response/审计链/指标面可见
             if usage.cached_tokens.is_none() {
+                // OpenAI 兼容指针优先;取不到时回落 嵌套族原生 usage 命中
+                // 字段 cache_read_input_tokens(cache_creation_input_tokens 是
+                // 缓存写入非命中,明确不映射)
                 usage.cached_tokens = v
                     .pointer("/prompt_tokens_details/cached_tokens")
                     .and_then(Value::as_u64)
-                    .map(|n| n as usize);
+                    .map(|n| n as usize)
+                    .or_else(|| {
+                        v.pointer("/cache_read_input_tokens")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize)
+                    });
             }
             Some(usage)
         });
@@ -2995,6 +3003,46 @@ mod tests {
             usage.cached_tokens, None,
             "嵌套对象缺 cached_tokens 亦 None"
         );
+    }
+
+    /// 缓存命中回落:OpenAI 嵌套指针取不到时回落 嵌套族原生 usage 命中
+    /// 字段 cache_read_input_tokens;缓存写入字段 cache_creation_input_tokens
+    /// 是缓存写入非命中,明确不映射;双形状并存时 OpenAI 指针优先
+    #[test]
+    fn test_normalize_executor_response_cache_read_fallback() {
+        let out = normalize_executor_response(serde_json::json!({
+            "content": "ok", "tool_calls": null, "finish_reason": "stop",
+            "token_usage": {
+                "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+                "cache_read_input_tokens": 70
+            }
+        }))
+        .unwrap();
+        let usage: TokenUsage = serde_json::from_value(out["token_usage"].clone()).unwrap();
+        assert_eq!(usage.cached_tokens, Some(70), "嵌套族命中字段回落展平");
+
+        let out = normalize_executor_response(serde_json::json!({
+            "content": "ok", "tool_calls": null, "finish_reason": "stop",
+            "token_usage": {
+                "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+                "cache_creation_input_tokens": 90
+            }
+        }))
+        .unwrap();
+        let usage: TokenUsage = serde_json::from_value(out["token_usage"].clone()).unwrap();
+        assert!(usage.cached_tokens.is_none(), "缓存写入字段不得计入命中");
+
+        let out = normalize_executor_response(serde_json::json!({
+            "content": "ok", "tool_calls": null, "finish_reason": "stop",
+            "token_usage": {
+                "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+                "prompt_tokens_details": { "cached_tokens": 80 },
+                "cache_read_input_tokens": 70
+            }
+        }))
+        .unwrap();
+        let usage: TokenUsage = serde_json::from_value(out["token_usage"].clone()).unwrap();
+        assert_eq!(usage.cached_tokens, Some(80), "OpenAI 指针优先于回落指针");
     }
 }
 

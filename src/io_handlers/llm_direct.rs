@@ -30,7 +30,8 @@
 //!   id 透传**——relay 档执行体四键不含 id，direct 档保真是本档能力差异）
 //! - `choices[0].finish_reason` → `finish_reason`
 //! - `usage` → `token_usage`（try-parse，`prompt_tokens_details.cached_tokens`
-//!   展平，形状不符降级 null）
+//!   展平；取不到时回落 嵌套族命中字段 `cache_read_input_tokens`，形状
+//!   不符降级 null）
 //! - `choices[0].message.reasoning_content` → `reasoning`（第五键，非空携带）
 //! - MiniMax 业务错误面（HTTP 200 + `base_resp.status_code != 0`）显式转 Err
 //! - 缺 `choices` / 非 JSON → Err（错误字符串形态与执行体路径一致）
@@ -271,16 +272,24 @@ pub(crate) fn normalize_provider_response(json: Value) -> Result<Value, String> 
     Ok(out)
 }
 
-/// provider raw usage → `TokenUsage`（try-parse 同口径;cached_tokens 展平;
+/// provider raw usage → `TokenUsage`（try-parse 同口径;cached_tokens 展平,
+/// OpenAI 指针优先,取不到回落 嵌套族命中字段 cache_read_input_tokens;
 /// 形状不符 → None,防 usage 缺字段导致整响应失败）
 fn parse_token_usage(usage: Option<&Value>) -> Option<Value> {
     let usage = usage.filter(|v| !v.is_null())?;
     let mut parsed: TokenUsage = serde_json::from_value(usage.clone()).ok()?;
     if parsed.cached_tokens.is_none() {
+        // cache_creation_input_tokens 是缓存写入非命中,明确不映射
         parsed.cached_tokens = usage
             .pointer("/prompt_tokens_details/cached_tokens")
             .and_then(Value::as_u64)
-            .map(|n| n as usize);
+            .map(|n| n as usize)
+            .or_else(|| {
+                usage
+                    .pointer("/cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize)
+            });
     }
     serde_json::to_value(parsed).ok()
 }
@@ -576,10 +585,18 @@ pub(crate) fn execute_stream(
         let token_usage = acc_usage.as_ref().and_then(|u| {
             let mut parsed: TokenUsage = serde_json::from_value(u.clone()).ok()?;
             if parsed.cached_tokens.is_none() {
+                // OpenAI 兼容指针优先;取不到时回落 嵌套族命中字段
+                // cache_read_input_tokens(cache_creation_input_tokens 是缓存
+                // 写入非命中,明确不映射)
                 parsed.cached_tokens = u
                     .pointer("/prompt_tokens_details/cached_tokens")
                     .and_then(Value::as_u64)
-                    .map(|n| n as usize);
+                    .map(|n| n as usize)
+                    .or_else(|| {
+                        u.pointer("/cache_read_input_tokens")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize)
+                    });
             }
             Some(parsed)
         });
@@ -623,6 +640,52 @@ mod tests {
         assert_eq!(out["token_usage"]["cached_tokens"], 4);
         // 非思考模型:四键形状,无第五键
         assert!(out.get("reasoning").is_none());
+    }
+
+    /// 缓存命中回落:OpenAI 嵌套指针取不到时回落 嵌套族原生 usage 命中
+    /// 字段 cache_read_input_tokens;缓存写入字段 cache_creation_input_tokens
+    /// 是缓存写入非命中,明确不映射;双形状并存时 OpenAI 指针优先
+    #[test]
+    fn test_normalize_cache_read_input_tokens_fallback() {
+        let raw = json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+                "cache_read_input_tokens": 6
+            }
+        });
+        let out = normalize_provider_response(raw).unwrap();
+        assert_eq!(
+            out["token_usage"]["cached_tokens"], 6,
+            "嵌套族命中字段回落展平"
+        );
+
+        let raw = json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+                "cache_creation_input_tokens": 9
+            }
+        });
+        let out = normalize_provider_response(raw).unwrap();
+        assert!(
+            out["token_usage"]["cached_tokens"].is_null(),
+            "缓存写入字段不得计入命中"
+        );
+
+        let raw = json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+                "prompt_tokens_details": {"cached_tokens": 4},
+                "cache_read_input_tokens": 6
+            }
+        });
+        let out = normalize_provider_response(raw).unwrap();
+        assert_eq!(
+            out["token_usage"]["cached_tokens"], 4,
+            "OpenAI 指针优先于回落指针"
+        );
     }
 
     #[test]
@@ -1046,6 +1109,46 @@ mod tests {
         assert_eq!(r.finish_reason.as_deref(), Some("stop"));
         assert_eq!(r.tool_calls, None);
         assert_eq!(r.token_usage.map(|u| u.total_tokens), Some(2));
+    }
+
+    /// direct 流式剧本:usage 为 嵌套族命中形状(cache_read_input_tokens)
+    /// → Done 帧 cached_tokens 回落展平
+    #[tokio::test]
+    async fn test_direct_stream_sse_cache_read_fallback() {
+        let mut server = mockito::Server::new_async().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"答\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6,\"cache_read_input_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let _m = server
+            .mock("POST", "/")
+            .match_header("authorization", "Bearer sk-stream")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse_body)
+            .create_async()
+            .await;
+
+        let cfg = DirectLlmConfig {
+            api_key: "sk-stream".into(),
+            api_base: server.url(),
+        };
+        let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
+        use futures_util::StreamExt;
+        let mut stream = execute_stream(body, cfg, direct_retry_params_for_test());
+        let mut done: Option<LlmResponse> = None;
+        while let Some(item) = stream.next().await {
+            if let StreamChunk::Done(r) = item.unwrap() {
+                done = Some(r);
+            }
+        }
+        let r = done.expect("Done 帧必达");
+        assert_eq!(
+            r.token_usage.as_ref().unwrap().cached_tokens,
+            Some(3),
+            "嵌套族命中字段回落展平"
+        );
     }
 
     /// 等价性双跑(本批灵魂判据):同一 goal 经 relay(mock 执行体)与

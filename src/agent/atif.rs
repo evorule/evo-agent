@@ -1373,6 +1373,7 @@ mod tests {
             prompt: p,
             completion: c,
             total: p + c,
+            cached: None,
         })
     }
 

@@ -8318,6 +8318,7 @@ impl AgentRunner {
                                                            prompt: t.prompt_tokens as u64,
                                                            completion: t.completion_tokens as u64,
                                                            total: t.total_tokens as u64,
+                                                           cached: t.cached_tokens.map(|v| v as u64),
                                                        });
                                                    Ok((content, tokens))
                                                }
@@ -9530,6 +9531,7 @@ impl AgentRunner {
                                                            prompt: u.prompt_tokens as u64,
                                                            completion: u.completion_tokens as u64,
                                                            total: u.total_tokens as u64,
+                                                           cached: u.cached_tokens.map(|v| v as u64),
                                                        }
                                                    });
                                                    // tokens_est:近似计数器估算 prompt+completion 总量
