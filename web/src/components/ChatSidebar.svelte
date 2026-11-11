@@ -275,6 +275,14 @@
   let modelErr = $state('');
   let modelBusy = $state(false);
   let modelPickEl = $state(null);
+  let modelSearch = $state('');
+  let modelNavIdx = $state(-1);
+  let modelSearchEl = $state(null);
+  let filteredModels = $derived(
+    modelSearch.trim()
+      ? modelList.filter((m) => m.toLowerCase().includes(modelSearch.trim().toLowerCase()))
+      : modelList,
+  );
 
   async function refreshModels() {
     try {
@@ -292,7 +300,32 @@
 
   function toggleModelMenu() {
     modelMenuOpen = !modelMenuOpen;
-    if (modelMenuOpen) refreshModels();
+    if (modelMenuOpen) {
+      modelSearch = '';
+      modelNavIdx = -1;
+      refreshModels().then(() => {
+        modelNavIdx = modelList.indexOf(currentModel);
+      });
+      tick().then(() => modelSearchEl?.focus());
+    }
+  }
+
+  // 键盘导航:↑↓ 在过滤结果间循环,Enter 选用,Esc 关闭(前沿选择器标配)
+  function modelMenuKeydown(e) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const n = filteredModels.length;
+      if (!n) return;
+      modelNavIdx = e.key === 'ArrowDown' ? (modelNavIdx + 1) % n : (modelNavIdx - 1 + n) % n;
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const m = filteredModels[modelNavIdx];
+      if (m) pickModel(m);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      modelMenuOpen = false;
+    }
   }
 
   async function pickModel(m) {
@@ -2152,6 +2185,8 @@
             class:active={modelMenuOpen}
             onclick={toggleModelMenu}
             disabled={$turnActive}
+            aria-haspopup="listbox"
+            aria-expanded={modelMenuOpen}
             title="会话模型(点击切换;准入白名单由执行体执法)"
           >
             <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
@@ -2167,14 +2202,33 @@
           </button>
           {#if modelMenuOpen}
             <div class="model-menu" role="listbox" aria-label="会话模型">
+              <input
+                class="model-search"
+                type="text"
+                placeholder="搜索模型…"
+                bind:this={modelSearchEl}
+                bind:value={modelSearch}
+                onkeydown={modelMenuKeydown}
+                aria-label="搜索模型"
+              />
               {#if modelErr}<div class="model-menu-note err">{modelErr}</div>{/if}
               {#if !modelReady}
-                <div class="model-menu-note">{modelNote || '模型清单不可用'}</div>
+                <div class="model-menu-note">
+                  {modelNote || '模型清单不可用'
+                  }<button class="model-retry" onclick={refreshModels}>重试</button>
+                </div>
               {:else}
-                {#each modelList as m (m)}
+                {#if currentModel && !modelList.includes(currentModel)}
+                  <div class="model-menu-note warn">
+                    当前模型 {currentModel} 已不在可用清单（服务端配置已变更），切换后将无法选回
+                  </div>
+                {/if}
+                {#if modelNote}<div class="model-menu-note">{modelNote}</div>{/if}
+                {#each filteredModels as m, i (m)}
                   <button
                     class="model-item"
                     class:active={m === currentModel}
+                    class:nav={i === modelNavIdx}
                     role="option"
                     aria-selected={m === currentModel}
                     onclick={() => pickModel(m)}
@@ -2183,9 +2237,14 @@
                     <span class="mono">{m}</span>
                     {#if m === currentModel}<span class="model-check">✓</span>{/if}
                   </button>
+                {:else}
+                  <div class="model-menu-note">无匹配模型</div>
                 {/each}
+                {#if modelBusy}<div class="model-menu-note">切换中…</div>{/if}
+                <button class="model-item ap-manage" onclick={openSettingsTab}>
+                  模型服务设置… →
+                </button>
               {/if}
-              {#if modelBusy}<div class="model-menu-note">切换中…</div>{/if}
             </div>
           {/if}
         </div>
@@ -3940,6 +3999,42 @@
   }
   .model-menu-note.err {
     color: var(--danger);
+  }
+  .model-menu-note.warn {
+    color: var(--warning);
+  }
+  .model-search {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px 10px;
+    margin-bottom: 4px;
+    border: none;
+    border-bottom: 1px solid var(--border);
+    border-radius: 0;
+    background: transparent;
+    color: var(--text-primary);
+    font-size: var(--fs-xs);
+    outline: none;
+  }
+  .model-search::placeholder {
+    color: var(--text-secondary);
+  }
+  .model-item.nav:not(:disabled) {
+    background: var(--bg-hover);
+  }
+  .model-retry {
+    margin-left: 8px;
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: var(--fs-2xs);
+    cursor: pointer;
+  }
+  .model-retry:hover {
+    color: var(--text-primary);
+    border-color: var(--text-secondary);
   }
   .mode-seg button:disabled {
     opacity: 0.45;
