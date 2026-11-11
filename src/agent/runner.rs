@@ -5280,7 +5280,9 @@ impl AgentRunner {
         // (内容寻址:同配方同 hash,改配方即变)。同协议下配方数据可独立演进(不改码),
         // 指纹保证回放/审计可锚定实际生效的配方内容。
         let recipe = self.assembly.recipe();
-        let recipe_version = recipe.recipe_version.as_str();
+        // γ-4 升版纪律:机制消息开启态有效版本 = 声明版本次版本 +1(落账
+        // 版本戳反映实际生效形态;指纹仍是配方内容哈希,改配方即变)
+        let recipe_version = self.assembly.effective_recipe_version();
         let recipe_json = serde_json::to_string(recipe).unwrap_or_default();
         let recipe_hash = format!("blake3:{}", blake3::hash(recipe_json.as_bytes()).to_hex());
         params["effective_params"] = serde_json::json!({
