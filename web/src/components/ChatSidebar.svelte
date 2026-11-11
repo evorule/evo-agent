@@ -176,10 +176,12 @@
     el.style.height = `${Math.min(el.scrollHeight, DRAFT_MAX_H)}px`;
   });
 
-  // ---- 工具条低频芯片显示开关(组件与逻辑全保留,仅不在工具条露出;置 true 即恢复) ----
-  const SHOW_MODE_SEG = false; // 构建/计划/对话模式签
-  const SHOW_APPROVAL_PICK = false; // 审批档位入口(档位语义不动:agent 定义显式指定仍生效)
-  const SHOW_MCP_ENTRY = false; // MCP 服务管理入口(设置面板仍可达)
+  // ---- 工具条低频芯片显示开关(设置页「显示低频工具」栏,缺省=隐藏=现行为;组件与逻辑全保留) ----
+  const showModeSeg = $derived($settingsState.settings['workbench.toolbar.modeSegment'] === true);
+  const showApprovalPick = $derived(
+    $settingsState.settings['workbench.toolbar.approvalPicker'] === true,
+  );
+  const showMcpEntry = $derived($settingsState.settings['workbench.toolbar.mcpEntry'] === true);
 
   // ---- S3 构建/计划/对话模式(前端姿态+提示语;审批链语义不动) ----
   // 构建=默认,agent 执行任务;计划(交互批)=agent 只读探查后经 plan_submit
@@ -2067,7 +2069,7 @@
     <input type="file" multiple bind:this={fileInputEl} onchange={onFilesChosen} hidden />
     <div class="composer-toolbar">
       <div class="tb-left">
-        {#if SHOW_MODE_SEG}
+        {#if showModeSeg}
         <div class="mode-seg" role="group" aria-label="会话模式">
           <button
             class:active={chatMode === 'build'}
@@ -2187,7 +2189,7 @@
             </div>
           {/if}
         </div>
-        {#if SHOW_APPROVAL_PICK}
+        {#if showApprovalPick}
         <div class="approval-pick" bind:this={approvalPickEl}>
           <button
             class="tb-btn approval-btn"
@@ -2257,7 +2259,7 @@
             />
           </svg>
         </button>
-        {#if SHOW_MCP_ENTRY}
+        {#if showMcpEntry}
         <button class="tb-btn" onclick={openSettingsTab} title="MCP 服务管理(打开设置)">MCP</button>
         {/if}
       </div>

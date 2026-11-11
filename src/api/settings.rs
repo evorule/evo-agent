@@ -159,6 +159,36 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "window",
         },
         SettingEntry {
+            key: "workbench.toolbar.modeSegment",
+            kind: SettingType::Boolean,
+            default: json!(false),
+            enum_values: None,
+            range: None,
+            category: "显示低频工具",
+            description: "在对话输入框工具条显示构建/计划/对话模式签（缺省隐藏；隐藏时模式沿用上次选择，计划模式的批准/拒绝流转不受影响）",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "workbench.toolbar.approvalPicker",
+            kind: SettingType::Boolean,
+            default: json!(false),
+            enum_values: None,
+            range: None,
+            category: "显示低频工具",
+            description: "在对话输入框工具条显示审批档位入口（缺省隐藏；审批卡照常弹出，agent 定义显式指定档位时以其为准）",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "workbench.toolbar.mcpEntry",
+            kind: SettingType::Boolean,
+            default: json!(false),
+            enum_values: None,
+            range: None,
+            category: "显示低频工具",
+            description: "在对话输入框工具条显示 MCP 服务管理入口（缺省隐藏；设置面板仍可达）",
+            scope: "window",
+        },
+        SettingEntry {
             key: "keybindings.overrides",
             kind: SettingType::Array,
             default: json!([]),
@@ -1111,7 +1141,7 @@ mod tests {
         let (settings, sources) = store.merged();
         // 计数锁=单源纪律执法面：新增 SettingEntry 时同步此数（当前含
         // storage.retention.sharedServer）
-        assert_eq!(settings.len(), 69); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键;审计摘要卡 audit_summary 开关键;存储保留期与硬配额三键:封闭枚举+缺省=现行为(永久/压缩/不限,零回归)+服务端共享账压实调度档)
+        assert_eq!(settings.len(), 72); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键;审计摘要卡 audit_summary 开关键;存储保留期与硬配额三键:封闭枚举+缺省=现行为(永久/压缩/不限,零回归)+服务端共享账压实调度档;工具条低频芯片三键 workbench.toolbar.modeSegment/approvalPicker/mcpEntry:缺省=隐藏=现行为零回归)
         assert_eq!(settings["storage.retention.period"], json!("forever"));
         assert_eq!(settings["storage.retention.action"], json!("compact"));
         assert_eq!(settings["storage.quota.maxBytes"], json!("unlimited"));
