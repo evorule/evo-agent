@@ -2059,3 +2059,84 @@ async fn test_zero_step_timeout_does_not_kill_the_step() {
         "step_timeout=0 must not impose a step deadline, got {err:?}"
     );
 }
+
+/// 入场券（中断失效缺陷）：run_streaming 在本地工具执行等待期收到 cancel，
+/// 必须立刻收束回合（Done(cancelled)），而不是等工具跑完才在下一事件边界
+/// 响应。修复前工具执行/审批解决四处 select 无 cancelled 臂——长工具静默
+/// 运行期点「中断」，cancel token 被置位但无人监听，用户可见症状=中断按钮
+/// 失效、LLM 行为持续到工具自然结束。
+#[tokio::test]
+async fn test_streaming_cancel_during_tool_wait_ends_turn_promptly() {
+    let mut server = Server::new_async().await;
+    // 只喂一个 call_service（本地慢工具），不发 Stable：取消须直接收束回合
+    let sse = sse_line(&io_request(
+        1,
+        "call_service",
+        json!({"tool_name": "slow_tool", "args": {}}),
+    ));
+    mock_evorule_base(&mut server, "777", sse).await;
+
+    struct SlowTool {
+        started: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl ToolFunction for SlowTool {
+        async fn call(&self, _args: &Value) -> IoResult {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // 30s 静默工具：远超测试断言窗（8s），修复前回合只能等它跑完
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok(Value::from("slow done"))
+        }
+    }
+
+    let client = EvoruleApiClient::new(&server.url());
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tools: BTreeMap<String, Arc<dyn ToolFunction>> = BTreeMap::new();
+    tools.insert(
+        "slow_tool".to_string(),
+        Arc::new(SlowTool {
+            started: started.clone(),
+        }),
+    );
+    let runner = AgentRunner::new(AgentConfig::default(), client)
+        .with_tool_handler(evo_agent::io_handlers::ToolHandler::with_functions(tools));
+
+    // 与 serve 同手法：move 前提取 cancel token 克隆（ws_handler Interrupt 分支同源）
+    let cancel = runner.cancel_token().clone();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        let mut stream = runner.run_streaming("Do the task".to_string(), Vec::new());
+        while let Some(item) = stream.next().await {
+            if let Ok(evo_agent::agent::runner::AgentEvent::Done(r)) = item {
+                let _ = tx.send(r).await;
+                break;
+            }
+        }
+    });
+
+    // 等工具真正开跑（流式循环被测试任务驱动推进）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !started.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "slow tool never started within 5s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // 工具执行等待期发起中断（经 token 克隆，与 serve interrupt 同语义）
+    cancel.cancel();
+
+    // 修复前：回合要等 30s 工具自然结束才出 Done —— 本断言窗（8s）必红
+    let result = tokio::time::timeout(std::time::Duration::from_secs(8), rx.recv())
+        .await
+        .expect("cancel during tool wait must end the turn promptly (8s)")
+        .expect("consumer task must deliver a Done");
+    assert!(
+        !result.success,
+        "cancelled turn must be non-success: {result:?}"
+    );
+}

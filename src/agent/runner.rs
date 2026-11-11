@@ -9972,6 +9972,12 @@ impl AgentRunner {
                                                            loop {
                                                                tokio::select! {
                                                                    biased;
+                                                                   _ = cancel_token.cancelled() => {
+                                                                       // 中断于工具执行/审批等待:break Err 哨兵,规范收尾在块外
+                                                                       // is_cancelled() 拦截(stage_fut/resolve_fut 借用未结束,禁 runner 可变操作)
+                                                                       break Err(AgentError::Internal("cancelled by user".to_string()))
+                                                                   }
+
                                                                    res = &mut stage_fut => break res,
                                                                    seg = tap_rx.recv(), if tap_open => {
                                                                        match seg {
@@ -10052,6 +10058,12 @@ impl AgentRunner {
                                                                    loop {
                                                                        tokio::select! {
                                                                            biased;
+                                                                           _ = cancel_token.cancelled() => {
+                                                                               // 中断于工具执行/审批等待:break Err 哨兵,规范收尾在块外
+                                                                               // is_cancelled() 拦截(stage_fut/resolve_fut 借用未结束,禁 runner 可变操作)
+                                                                               break Err(AgentError::Internal("cancelled by user".to_string()))
+                                                                           }
+
                                                                            r = &mut resolve_fut => break r,
                                                                            seg = tap_rx.recv(), if tap_open => {
                                                                                match seg {
@@ -10296,6 +10308,27 @@ impl AgentRunner {
                                                            images: tool_images,
                                                        };
                                                        messages.push(tool_msg);
+                                                       if cancel_token.is_cancelled() {
+                                                           // 中断于工具执行/审批等待:规范取消收尾(future 借用已随块结束释放)
+                                                           info!(%session_id, "Cancelled during tool execution, cleaning up");
+                                                           if let Err(e) = runner.flush_messages(&session_id).await {
+                                                               tracing::warn!(%session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                           }
+                                                           runner.submit_tool_traces(&session_id).await;
+                                                           let duration = start_time.elapsed().as_millis() as u64;
+                                                           if let Some(g) = turn_guard.take() {
+                                                               g.end("cancelled", step_count as u64, duration);
+                                                           }
+                                                           yield Ok(AgentEvent::Error(AgentError::Internal(
+                                                               "cancelled by user".to_string(),
+                                                           )));
+                                                           yield Ok(AgentEvent::Done(AgentResult::cancelled_result(
+                                                               tool_calls.clone(),
+                                                               step_count,
+                                                               duration,
+                                                           )));
+                                                           return;
+                                                       }
                                                        if let Err(e) = runner
                                                            .persist_message(
                                                                &session_id,
@@ -10749,6 +10782,12 @@ impl AgentRunner {
                                                    loop {
                                                        tokio::select! {
                                                            biased;
+                                                           _ = cancel_token.cancelled() => {
+                                                               // 中断于工具执行/审批等待:break Err 哨兵,规范收尾在块外
+                                                               // is_cancelled() 拦截(stage_fut/resolve_fut 借用未结束,禁 runner 可变操作)
+                                                               break Err(AgentError::Internal("cancelled by user".to_string()))
+                                                           }
+
                                                            res = &mut stage_fut => break res,
                                                            seg = tap_rx.recv(), if tap_open => {
                                                                match seg {
@@ -10819,6 +10858,12 @@ impl AgentRunner {
                                                            loop {
                                                                tokio::select! {
                                                                    biased;
+                                                                   _ = cancel_token.cancelled() => {
+                                                                       // 中断于工具执行/审批等待:break Err 哨兵,规范收尾在块外
+                                                                       // is_cancelled() 拦截(stage_fut/resolve_fut 借用未结束,禁 runner 可变操作)
+                                                                       break Err(AgentError::Internal("cancelled by user".to_string()))
+                                                                   }
+
                                                                    r = &mut resolve_fut => break r,
                                                                    seg = tap_rx.recv(), if tap_open => {
                                                                        match seg {
@@ -10943,6 +10988,22 @@ impl AgentRunner {
                                            tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
                                        }
                                                        runner.submit_tool_traces(&session_id).await;
+                                                       if cancel_token.is_cancelled() {
+                                                           // 中断于工具等待:走 cancelled 收尾分支(而非 error 语义)
+                                                           let duration = start_time.elapsed().as_millis() as u64;
+                                                           if let Some(g) = turn_guard.take() {
+                                                               g.end("cancelled", step_count as u64, duration);
+                                                           }
+                                                           yield Ok(AgentEvent::Error(AgentError::Internal(
+                                                               "cancelled by user".to_string(),
+                                                           )));
+                                                           yield Ok(AgentEvent::Done(AgentResult::cancelled_result(
+                                                               Vec::new(),
+                                                               step_count,
+                                                               duration,
+                                                           )));
+                                                           return;
+                                                       }
                                                        // B21:turn_ended(error,优雅终止路径显式收尾)
                                                        if let Some(g) = turn_guard.take() {
                                                            g.end("error", step_count as u64, duration);
