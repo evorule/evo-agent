@@ -278,16 +278,37 @@
   let modelSearch = $state('');
   let modelNavIdx = $state(-1);
   let modelSearchEl = $state(null);
+  let modelProviders = $state({});
   let filteredModels = $derived(
     modelSearch.trim()
       ? modelList.filter((m) => m.toLowerCase().includes(modelSearch.trim().toLowerCase()))
       : modelList,
   );
+  // 分组渲染:providers 映射在位且归属多于一家→渲染组头;单端点遗留模式
+  // (无映射/单归属)退化为平铺。行序=filteredModels 既有序,键盘导航索引
+  // (modelNavIdx)仍按模型平铺序计,组头不占索引。
+  let displayRows = $derived.by(() => {
+    const groups = new Map();
+    for (const m of filteredModels) {
+      const p = String(modelProviders[m] || '');
+      if (!groups.has(p)) groups.set(p, []);
+      groups.get(p).push(m);
+    }
+    const multi = groups.size > 1;
+    const rows = [];
+    let nav = 0;
+    for (const [p, items] of groups) {
+      if (multi) rows.push({ kind: 'head', label: p || '其他' });
+      for (const m of items) rows.push({ kind: 'model', model: m, nav: nav++ });
+    }
+    return rows;
+  });
 
   async function refreshModels() {
     try {
       const s = await getLlmModels();
       modelList = Array.isArray(s.models) ? s.models : [];
+      modelProviders = s.providers && typeof s.providers === 'object' ? s.providers : {};
       modelReady = !!s.ready;
       modelNote = s.note || '';
       if (s.current) currentModel = s.current;
@@ -2224,19 +2245,23 @@
                   </div>
                 {/if}
                 {#if modelNote}<div class="model-menu-note">{modelNote}</div>{/if}
-                {#each filteredModels as m, i (m)}
-                  <button
-                    class="model-item"
-                    class:active={m === currentModel}
-                    class:nav={i === modelNavIdx}
-                    role="option"
-                    aria-selected={m === currentModel}
-                    onclick={() => pickModel(m)}
-                    disabled={modelBusy}
-                  >
-                    <span class="mono">{m}</span>
-                    {#if m === currentModel}<span class="model-check">✓</span>{/if}
-                  </button>
+                {#each displayRows as row (row.kind === 'model' ? row.model : `head:${row.label}`)}
+                  {#if row.kind === 'head'}
+                    <div class="model-group-head">{row.label}</div>
+                  {:else}
+                    <button
+                      class="model-item"
+                      class:active={row.model === currentModel}
+                      class:nav={row.nav === modelNavIdx}
+                      role="option"
+                      aria-selected={row.model === currentModel}
+                      onclick={() => pickModel(row.model)}
+                      disabled={modelBusy}
+                    >
+                      <span class="mono">{row.model}</span>
+                      {#if row.model === currentModel}<span class="model-check">✓</span>{/if}
+                    </button>
+                  {/if}
                 {:else}
                   <div class="model-menu-note">无匹配模型</div>
                 {/each}
@@ -4021,6 +4046,12 @@
   }
   .model-item.nav:not(:disabled) {
     background: var(--bg-hover);
+  }
+  .model-group-head {
+    padding: 7px 10px 3px;
+    font-size: var(--fs-2xs);
+    color: var(--text-secondary);
+    letter-spacing: 0.04em;
   }
   .model-retry {
     margin-left: 8px;
