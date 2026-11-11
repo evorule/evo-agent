@@ -184,6 +184,17 @@ fn stale_min_bytes_is_default(v: &usize) -> bool {
     *v == default_stale_min_bytes()
 }
 
+/// 配方版本次版本号 +1("recipe-v1.3" → "recipe-v1.4";解析失败原样返回)
+fn bump_recipe_version(v: &str) -> String {
+    let Some((prefix, minor)) = v.rsplit_once('.') else {
+        return v.to_string();
+    };
+    match minor.parse::<u32>() {
+        Ok(n) => format!("{prefix}.{}", n + 1),
+        Err(_) => v.to_string(),
+    }
+}
+
 /// 陈旧工具结果发送视图降级声明（确定性纯函数,三条件全部满足才降级:
 /// ①结果已被消费——其后存在 Assistant 消息;②距当前 ≥ min_turns 个
 /// assistant 轮;③结果字节数 > min_bytes）
@@ -805,6 +816,17 @@ impl AssemblyExecutor {
     /// 组装与现行为逐字节一致)
     pub fn mechanism_messages(&self) -> Option<&MechanismMessagesSpec> {
         self.recipe.budget.mechanism_messages.as_ref()
+    }
+
+    /// 有效配方版本(γ-4 升版纪律):机制消息开启态改变 system prompt 形态——
+    /// 升版动作绑定开启态首次生效(声明版本次版本号 +1),默认关闭态原样
+    /// 返回声明版本(默认配方 = recipe-v1.3 不升版)。F-302 落账版本戳消费。
+    pub fn effective_recipe_version(&self) -> String {
+        if self.recipe.budget.mechanism_messages.is_some() {
+            bump_recipe_version(&self.recipe.recipe_version)
+        } else {
+            self.recipe.recipe_version.clone()
+        }
     }
 
     /// S7 裁剪参数(策略名/buffer%/hint token,供 ContextWindowManager 构造)
@@ -2858,5 +2880,84 @@ mod tests {
             serde_json::to_string(&on).unwrap(),
             r#"{"mechanism_messages":{}}"#
         );
+    }
+
+    // ===== 批 B-268 γ-4:开启态升版绑定 + 五件验收 =====
+
+    /// 升版绑定开启态:默认配方(关闭)沿用声明版本不升版;开启态次版本
+    /// 号 +1;用户声明版同样按 +1 升(版本面反映实际生效形态)
+    #[test]
+    fn test_effective_recipe_version_binds_to_enabled_state() {
+        let off = AssemblyExecutor::default_executor();
+        assert_eq!(off.effective_recipe_version(), "recipe-v1.3");
+        let mut on_recipe = mechanism_on_recipe();
+        on_recipe.recipe_version = "recipe-v1.3".to_string();
+        let on = AssemblyExecutor::new(on_recipe);
+        assert_eq!(on.effective_recipe_version(), "recipe-v1.4");
+        let mut declared = mechanism_on_recipe();
+        declared.recipe_version = "recipe-v1.0".to_string();
+        let d = AssemblyExecutor::new(declared);
+        assert_eq!(d.effective_recipe_version(), "recipe-v1.1");
+    }
+
+    /// 开启态相邻轮静态区字节级稳定:动态内容物(记忆分区)变化只进机制段,
+    /// 静态区逐字节一致 = 被动前缀缓存命中前提(五件验收②)
+    #[test]
+    fn test_assemble_split_static_region_stable_across_dynamic_changes() {
+        use crate::agent::memory::{MemoryManager, MemoryRecord};
+        let exec = AssemblyExecutor::new(mechanism_on_recipe());
+        let mem1 = MemoryManager::new(
+            "b268-turn1",
+            crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080"),
+        );
+        let mut recall1 = RecallContext::default();
+        recall1.stable.push(MemoryRecord::new("k", "事实一", 1000));
+        let (static1, mech1) = exec
+            .assemble_split(
+                "base",
+                None,
+                None,
+                Some(&mem1),
+                &recall1,
+                8192,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let mem2 = MemoryManager::new(
+            "b268-turn2",
+            crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080"),
+        );
+        let mut recall2 = RecallContext::default();
+        recall2.stable.push(MemoryRecord::new("k", "事实一", 1000));
+        recall2.stable.push(MemoryRecord::new("k2", "事实二", 2000));
+        let (static2, mech2) = exec
+            .assemble_split(
+                "base",
+                None,
+                None,
+                Some(&mem2),
+                &recall2,
+                8192,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(static1, static2, "静态区跨轮字节级稳定");
+        assert_ne!(mech1, mech2, "机制段承载动态变化");
     }
 }
