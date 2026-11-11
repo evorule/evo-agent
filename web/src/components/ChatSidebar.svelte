@@ -711,9 +711,14 @@
     if ($turnActive) return groups;
     return groups.map((g) => (g.type === 'process' && !g.closed ? { ...g, closed: true } : g));
   });
-  /** 折叠单行的最新动作摘要:取末条工具名+命令头(思考块/回执聚合出工具名) */
+  /** 折叠单行的最新动作摘要:工具条目走 toolCallSummary(命令/路径头 64 字),
+  // 回执族(agg/approval_receipt)字段族为 toolName/command;思考块不出摘要 */
   function processPreviewLabel(m) {
     if (!m) return '';
+    if (m.kind === 'tool' && m.name) {
+      const head = toolCallSummary(m.name, m.args);
+      return head ? `${m.name} ${head}` : m.name;
+    }
     if (m.kind === 'assistant') return '';
     if (m.toolName) {
       const extra = m.command ? String(m.command).slice(0, 60) : '';
