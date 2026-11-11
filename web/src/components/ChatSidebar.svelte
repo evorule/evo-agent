@@ -1630,17 +1630,6 @@
                    流式中未出字的段只留紧凑光标线 -->
               <div class="bubble assistant-bubble md-body" class:pending={!m.text && m.streaming} onclick={onMdCopyClick}>
                 {@html renderChatHtml(m.text, m.id)}<span class="cursor" class:on={m.streaming}></span>
-                {#if m.text}
-                  <button
-                    type="button"
-                    class="msg-copy"
-                    title="复制全文"
-                    onclick={(e) => {
-                      e.stopPropagation();
-                      copyPlainText(m.text, e.currentTarget);
-                    }}
-                  >复制</button>
-                {/if}
                 {#if m.text || m.streaming}
                   <span class="audit-chip">
                     <AuditBadge
@@ -1650,13 +1639,25 @@
                     />
                   </span>
                 {/if}
-                {#if meta && meta.steps > 0}
-                  <div class="msg-meta mono">
-                    {meta.steps} 步{meta.tookMs ? ` · ${formatTook(meta.tookMs)}` : ''}
+                {#if m.text}
+                  <!-- 底部元行:复制按钮常驻左下(取代原右上隐藏形态),步数/耗时/时间戳随行 -->
+                  <div class="msg-foot">
+                    <button
+                      type="button"
+                      class="msg-copy"
+                      title="复制全文"
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        copyPlainText(m.text, e.currentTarget);
+                      }}
+                    >复制</button>
+                    {#if meta && meta.steps > 0}
+                      <span class="msg-meta mono">{meta.steps} 步{meta.tookMs ? ` · ${formatTook(meta.tookMs)}` : ''}</span>
+                    {/if}
+                    {#if showTimestamps && m.ts}
+                      <span class="msg-ts mono">{formatClock(m.ts)}</span>
+                    {/if}
                   </div>
-                {/if}
-                {#if showTimestamps && m.ts}
-                  <div class="msg-ts mono">{formatClock(m.ts)}</div>
                 {/if}
               </div>
             {/if}
@@ -2913,7 +2914,6 @@
   }
   /* 答案气泡 meta 行:本回合步数与工具耗时合计(数据来自回合布局段) */
   .msg-meta {
-    margin-top: 4px;
     font-size: 10px;
     color: var(--text-muted);
     opacity: 0.85;
@@ -2927,9 +2927,7 @@
     opacity: 0.85;
   }
   .assistant-bubble .msg-ts {
-    display: block;
     margin-left: 0;
-    margin-top: 2px;
   }
   /* 回执汇总行:同工具同结局连续回执 ≥阈值收敛为一行,点击展开逐条 */
   .receipt-agg {
@@ -3407,27 +3405,29 @@
   .bubble {
     position: relative;
   }
+  /* 底部元行:复制按钮(左下常驻)+步数/耗时+时间戳 */
+  .msg-foot {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 6px;
+  }
   .msg-copy {
-    position: absolute;
-    top: 2px;
-    right: 2px;
-    padding: 1px 6px;
+    padding: 1px 8px;
     font-size: 11px;
     color: var(--text-secondary);
-    background: var(--bg-card);
+    background: transparent;
     border: 1px solid var(--border-muted);
     border-radius: var(--r-sm);
-    opacity: 0;
-    transition: opacity var(--tr-fast);
     cursor: pointer;
+    opacity: 0.85;
+    transition: color var(--tr-fast), border-color var(--tr-fast);
   }
-  .bubble:hover .msg-copy,
+  .msg-copy:hover,
   .msg-copy:focus-visible {
-    opacity: 1;
-  }
-  .msg-copy:hover {
     color: var(--text-primary);
     border-color: var(--border-strong);
+    opacity: 1;
   }
   /* M2:新消息浮条(msg-list 内 sticky 底部居中) */
   .fresh-pill {
