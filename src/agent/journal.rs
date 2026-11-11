@@ -24,12 +24,66 @@
 //!   `evorule_request_id = None`,全文内容源 = transcript payload;call_service
 //!   路径 `evorule_request_id = Some(IoRequest.id)`(审计链 join 键)
 
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// o32 残余收口:panic 原因捕获面
+//
+// TurnEndGuard 的 panic drop 发生在 unwind 途中,drop 无法直接访问 panic
+// payload——以「链式 panic hook + 线程局部」捕获:hook 把 payload 消息与
+// 位点写入 panicking 线程的 TLS;guard drop 同线程读走并带因补写 aborted。
+// hook 经 take_hook 链式保留原 hook(零替换语义,仅旁路记录);OnceLock 保证
+// 全进程只装一次。无 panic 的 drop(如 yield Err 早退)读不到 TLS 残值
+// (take_panic_reason_if_panicking 仅在 panicking 线程取值),照旧无因补写。
+// ---------------------------------------------------------------------------
+static PANIC_REASON_HOOK: OnceLock<()> = OnceLock::new();
+
+thread_local! {
+    /// 最近一次 panic 的「消息 + 位点」(hook 写入;guard drop 取走;按线程隔离)
+    static LAST_PANIC: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// 安装链式 panic hook(幂等;begin_turn 首次调用即装,生产路径覆盖)
+fn install_panic_reason_hook() {
+    PANIC_REASON_HOOK.get_or_init(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "non-string panic payload".to_string()
+            };
+            let loc = info
+                .location()
+                .map(|l| format!(" (at {}:{}:{})", l.file(), l.line(), l.column()))
+                .unwrap_or_default();
+            LAST_PANIC.with(|slot| {
+                *slot.borrow_mut() = Some(format!("{msg}{loc}"));
+            });
+            prev(info);
+        }));
+    });
+}
+
+/// unwind 中取走最近一次 panic 原因(仅 panicking 线程;其余路径恒 None)
+fn take_panic_reason_if_panicking() -> Option<String> {
+    if std::thread::panicking() {
+        LAST_PANIC
+            .with(|slot| slot.borrow_mut().take())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    }
+}
 
 /// digest 口径:evorule-hash(`"blake3:"+64hex`;E 族 B 约束,与生态哈希纪律一致)
 pub fn evorule_digest(s: &str) -> String {
@@ -1364,6 +1418,8 @@ impl JournalWriter {
 
     /// turn 开始:写 turn_started,返回轮守卫(drop 未显式 end 时补写 aborted)
     pub fn begin_turn(&self, goal: &str) -> Result<TurnEndGuard, JournalError> {
+        // o32 残余收口:首次开轮即装链式 panic hook(幂等),panic drop 带因补写
+        install_panic_reason_hook();
         let turn_seq;
         {
             let mut g = self.core.lock().unwrap_or_else(|p| p.into_inner());
@@ -2222,8 +2278,15 @@ impl TurnEndGuard {
 
 impl Drop for TurnEndGuard {
     fn drop(&mut self) {
-        // end_turn 幂等:显式 end 后此处为 no-op
-        let _ = self.writer.end_turn("aborted", 0, 0);
+        // end_turn 幂等:显式 end 后此处为 no-op;panic unwind 中带因补写
+        // (o32 残余收口:原因含 panic 消息与位点,会话面可直读,免翻 serve.log)
+        if let Some(reason) = take_panic_reason_if_panicking() {
+            let _ = self
+                .writer
+                .end_turn_with_reason("aborted", 0, 0, Some(&reason));
+        } else {
+            let _ = self.writer.end_turn("aborted", 0, 0);
+        }
     }
 }
 
@@ -4004,6 +4067,37 @@ mod tests {
                 reason: None,
             }
         );
+    }
+
+    /// o32 残余收口:panic unwind 中的 guard drop 带因补写 aborted——
+    /// reason 含 panic 消息与位点,会话面可直接定位,不必翻 serve.log
+    #[test]
+    fn turn_guard_panic_drop_writes_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let sid = "s-panic-drop";
+        let handle = std::thread::spawn({
+            let dir = dir.path().to_path_buf();
+            move || {
+                let w = JournalWriter::open(&dir, sid).unwrap();
+                let _g = w.begin_turn("goal").unwrap();
+                panic!("boom: end byte index 82 is not a char boundary");
+            }
+        });
+        assert!(handle.join().is_err(), "panic 须如实外抛");
+        let lines = read_all(&JournalWriter::path_for(dir.path(), sid)).unwrap();
+        assert_eq!(lines.len(), 2);
+        match &lines[1].event {
+            JE::TurnEnded { status, reason, .. } => {
+                assert_eq!(status, "aborted");
+                let r = reason.as_deref().expect("panic drop 须带因补写");
+                assert!(
+                    r.contains("not a char boundary"),
+                    "reason 须含 panic 消息: {r}"
+                );
+                assert!(r.contains("journal.rs"), "reason 须含 panic 位点: {r}");
+            }
+            other => panic!("期望 TurnEnded: {other:?}"),
+        }
     }
 
     #[test]
