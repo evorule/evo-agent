@@ -170,8 +170,22 @@ pub struct ContextSummarizer {
 #[derive(Debug, Clone)]
 struct RollingCache {
     frozen_len: usize,
+    /// 四轮审计 G9(B-291):生成时 dropped 集合的内容指纹——命中判据从
+    /// "只比长度"升级为"长度+指纹",防内容变而长度巧合相等时复用陈旧摘要。
+    /// 回读种子面无原文,置空串(只可作增量基底,不可整段命中)。
+    content_digest: String,
     summary_text: String,
     gen: u64,
+}
+
+/// 四轮审计 G9(B-291):dropped 集合内容指纹。
+fn dropped_fingerprint(dropped: &[Message]) -> String {
+    let mut buf = String::with_capacity(1024);
+    for m in dropped {
+        buf.push_str(m.content());
+        buf.push('\u{1}');
+    }
+    crate::agent::journal::evorule_digest(&buf)
 }
 
 /// 一次新生成摘要的落链元数据（R3 方案 B：PayloadUpdate 专用命名空间，
@@ -188,6 +202,8 @@ pub struct SummaryGenMetadata {
     pub strategy_fingerprint: String,
     /// 上一代代数（首代 None）
     pub parent_gen: Option<u64>,
+    /// dropped 集合内容指纹（G9：缓存命中判据"长度+指纹"；旧账回读缺省空串）
+    pub content_digest: String,
     /// 摘要正文（不含 [earlier conversation summary] 头缀）
     pub summary_text: String,
     /// 含头缀的完整 hint 替换文本（与既有 wire 形态一致）
@@ -453,11 +469,13 @@ impl ContextSummarizer {
             return Ok(SummarizeOutcome::Empty);
         }
 
-        // 滚动缓存快照(锁内仅取快照,不做 await)。长度命中时直接复用,零 LLM 调用
+        // 滚动缓存快照(锁内仅取快照,不做 await)。长度+内容指纹双命中时
+        // 直接复用,零 LLM 调用(G9:只比长度会复用内容已变的陈旧摘要)
+        let fp = dropped_fingerprint(dropped);
         let (frozen, rolling, prev_gen) = {
             let guard = self.summary_cache.lock().unwrap_or_else(|p| p.into_inner());
             match guard.as_ref() {
-                Some(c) if c.frozen_len == dropped.len() => {
+                Some(c) if c.frozen_len == dropped.len() && c.content_digest == fp => {
                     tracing::debug!(dropped = dropped.len(), "G10: summary cache hit");
                     let formatted = format!("[earlier conversation summary]\n{}", c.summary_text);
                     return Ok(SummarizeOutcome::CacheHit(formatted));
@@ -543,6 +561,7 @@ impl ContextSummarizer {
             let mut guard = self.summary_cache.lock().unwrap_or_else(|p| p.into_inner());
             *guard = Some(RollingCache {
                 frozen_len: dropped.len(),
+                content_digest: dropped_fingerprint(dropped),
                 summary_text: summary.to_string(),
                 gen,
             });
@@ -554,6 +573,7 @@ impl ContextSummarizer {
             frozen_len_after: dropped.len(),
             strategy_fingerprint: self.strategy_fingerprint(),
             parent_gen: prev_gen,
+            content_digest: dropped_fingerprint(dropped),
             summary_text: summary.to_string(),
             formatted: format!("[earlier conversation summary]\n{}", summary),
         };
@@ -571,12 +591,21 @@ impl ContextSummarizer {
 
     /// R3/G-3：从落链 payload 回读种子滚动缓存（continuation/重启后
     /// 不触发 LLM 重算——重建读账，不重算）。
-    pub fn seed_cache(&self, frozen_len: usize, summary_text: String, gen: u64) {
+    /// G9：回读链透传内容指纹；旧账无指纹（空串）时种子只可作增量基底，
+    /// 整段命中需一次再生成补齐指纹。
+    pub fn seed_cache(
+        &self,
+        frozen_len: usize,
+        summary_text: String,
+        gen: u64,
+        content_digest: String,
+    ) {
         let mut guard = self.summary_cache.lock().unwrap_or_else(|p| p.into_inner());
         // 只在回读代数更新时覆盖（防旧账回灌）
         if guard.as_ref().map(|c| c.gen).unwrap_or(0) < gen {
             *guard = Some(RollingCache {
                 frozen_len,
+                content_digest,
                 summary_text,
                 gen,
             });
@@ -1626,8 +1655,13 @@ mod tests {
         // G-3 关闭证明：payload 回读种子后，同 frozen 长度调用零 LLM 直接命中
         let llm = LlmHandler::new("m", "http://127.0.0.1:9").with_max_retries(0);
         let s = ContextSummarizer::new(llm, None).with_threshold(2);
-        // 模拟从 payload 回读（gen=2，frozen=5）
-        s.seed_cache(5, "SEEDED-FROM-PAYLOAD".to_string(), 2);
+        // 模拟从 payload 回读（gen=2，frozen=5，指纹=同构 dropped 集合）
+        s.seed_cache(
+            5,
+            "SEEDED-FROM-PAYLOAD".to_string(),
+            2,
+            dropped_fingerprint(&make_dropped(5)),
+        );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -1653,11 +1687,46 @@ mod tests {
     fn test_r3_seed_ignores_stale_gen() {
         let llm = LlmHandler::new("m", "http://127.0.0.1:9").with_max_retries(0);
         let s = ContextSummarizer::new(llm, None).with_threshold(2);
-        s.seed_cache(5, "NEWER".to_string(), 3);
-        s.seed_cache(2, "STALE".to_string(), 2); // 旧账回灌防御
+        s.seed_cache(
+            5,
+            "NEWER".to_string(),
+            3,
+            dropped_fingerprint(&make_dropped(5)),
+        );
+        s.seed_cache(2, "STALE".to_string(), 2, String::new()); // 旧账回灌防御
         let guard = s.summary_cache.lock().unwrap();
         let c = guard.as_ref().unwrap();
         assert_eq!(c.summary_text, "NEWER");
         assert_eq!(c.gen, 3);
+    }
+
+    // ===== B-291 四轮审计缝缺陷红测(G9) =====
+
+    /// G9: dropped 集合内容指纹——缓存命中判据从"只比长度"升级为
+    /// "长度+指纹";内容变而长度巧合相等必须区分。
+    #[test]
+    fn dropped_fingerprint_distinguishes_same_length_content() {
+        let a = vec![
+            Message::User {
+                content: "hello world alpha".into(),
+                images: vec![],
+            },
+            Message::User {
+                content: "second line".into(),
+                images: vec![],
+            },
+        ];
+        let b = vec![
+            Message::User {
+                content: "hello world omega".into(),
+                images: vec![],
+            },
+            Message::User {
+                content: "second line".into(),
+                images: vec![],
+            },
+        ];
+        assert_ne!(dropped_fingerprint(&a), dropped_fingerprint(&b));
+        assert_eq!(dropped_fingerprint(&a), dropped_fingerprint(&a));
     }
 }
