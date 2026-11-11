@@ -1404,6 +1404,14 @@
   }
 </script>
 
+<svelte:window
+  onkeydown={(e) => {
+    if (e.key === 'Escape' && showHistory) {
+      e.stopPropagation();
+      showHistory = false;
+    }
+  }}
+/>
 <aside class="chat" class:history-open={showHistory} data-zone="chat" style:width={`${$chatWidth}px`}>
   <div class="chat-header">
     <span class="title">对话</span>
@@ -1460,6 +1468,13 @@
 
   {#if showHistory}
     <div class="session-list">
+      <!-- 面板头部:铺满形态下的显式返回入口(原关闭路径=「历史」按钮被本面板物理遮蔽) -->
+      <div class="session-list-head">
+        <button type="button" class="session-back" onclick={toggleHistory} title="返回对话(Esc)">
+          ← 返回对话
+        </button>
+        <span class="session-head-title">历史会话</span>
+      </div>
       {#if $sessions.length === 0}
         <div class="session-empty">暂无历史会话</div>
       {:else}
@@ -2493,6 +2508,32 @@
   .header-actions {
     display: flex;
     gap: var(--sp-xs);
+  }
+  .session-list-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 4px 8px;
+    border-bottom: 1px solid var(--border-muted);
+    margin-bottom: 4px;
+  }
+  .session-back {
+    padding: 3px 10px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--border-muted);
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .session-back:hover {
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+    background: var(--bg-hover);
+  }
+  .session-head-title {
+    font-size: 12px;
+    color: var(--text-secondary);
   }
   .session-list {
     /* 互斥布局:历史打开时浮层独占对话栏,不挤压对话内容;关闭即恢复 */
