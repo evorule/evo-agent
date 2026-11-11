@@ -162,6 +162,7 @@ fn build_tool_result_reference(
          ref_id: {ref_id}\n\
          tool: {tool_name}\n\
          bytes: {}\n\
+         chars: {total_chars}\n\
          digest: {digest}\n\
          path: {rel_path}\n\
          head:\n{head}\n...[head/tail elided {} chars]...\ntail:\n{tail}\n\
@@ -2538,6 +2539,27 @@ impl AgentRunner {
         let Ok(raw) = std::fs::read_to_string(&canon) else {
             return serde_json::json!({"error": "ref unreadable", "ref_id": ref_id});
         };
+        // 四轮审计 G15(B-285):内容寻址 ref(stale-/mech- 前缀)的后缀即
+        // 落盘时的原文指纹——取回必须复验;不一致=offload 文件被篡改/损坏,
+        // fail-visible 拒绝,不得静默返回被改内容。出站 call-id 形 ref 不
+        // 承载指纹契约,照旧放行(digest 仅作对账元数据返回)。
+        if let Some(hex) = ref_id
+            .strip_prefix("stale-")
+            .or_else(|| ref_id.strip_prefix("mech-"))
+        {
+            if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                let actual = crate::agent::journal::evorule_digest(&raw);
+                let actual_hex = actual.rsplit(':').next().unwrap_or(&actual);
+                if actual_hex != hex {
+                    return serde_json::json!({
+                        "error": "ref digest mismatch (content altered)",
+                        "ref_id": ref_id,
+                        "expected_digest": hex,
+                        "actual_digest": actual,
+                    });
+                }
+            }
+        }
         let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let max_chars = args
             .get("max_chars")
@@ -2552,6 +2574,7 @@ impl AgentRunner {
         serde_json::json!({
             "ref_id": ref_id,
             "total_bytes": raw.len(),
+            "total_chars": total_chars,
             "digest": crate::agent::journal::evorule_digest(&raw),
             "offset": start,
             "max_chars": max_chars,
@@ -3061,10 +3084,34 @@ impl AgentRunner {
                 }
             }
         }
+        // 四轮审计 G13(B-285):摘要回填前按当前窗口预算收顶。trim 只为
+        // hint 预留 15 token,摘要不限长回填会把刚 fit 的发送视图重新撑爆。
+        // base_view=摘除 hint 槽位后的视图;context_window 不在场(缺省)
+        // 则不收顶(行为不变)。role 迁移(摘要降 User/机制消息)留后续批,
+        // 本批只收口预算超窗。
+        let capped_summary = match &self.context_window {
+            Some(ctx) => {
+                let fallback = trim_messages
+                    .iter()
+                    .find_map(|m| match m {
+                        Message::System { content } if content.starts_with("[earlier") => {
+                            Some(content.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| formatted.clone());
+                let mut base_view: Vec<Message> = trim_messages.to_vec();
+                base_view.retain(|m| {
+                    !matches!(m, Message::System { content } if content.starts_with("[earlier"))
+                });
+                ctx.cap_summary_for_budget(&formatted, &fallback, &base_view)
+            }
+            None => formatted.clone(),
+        };
         for msg in trim_messages {
             if let Message::System { content } = msg {
                 if content.starts_with("[earlier") {
-                    *content = formatted;
+                    *content = capped_summary;
                     break;
                 }
             }

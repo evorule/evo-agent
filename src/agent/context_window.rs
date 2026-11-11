@@ -489,7 +489,75 @@ impl ContextWindowManager {
             .saturating_sub(buffer);
 
         if available_for_recent == 0 {
-            // 极端情况:常驻面本身已占满 budget,只能保留常驻面
+            // 极端情况:常驻面本身已占满 budget。
+            // 四轮审计 G16(B-285):不得把末条 User 一起丢。分层保底:
+            // ① base+latest_mech+末条 User 都放得下 → 全保(γ 契约不破);
+            // ② 否则 latest_mech 让位,保底 base+末条 User+hint;
+            // ③ base+末条 User 仍超预算(系统提示本身超大)或无 User → 原行为。
+            let last_user = pool
+                .iter()
+                .rev()
+                .find(|(_, m)| matches!(m, Message::User { .. }))
+                .cloned();
+            if let Some((user_idx, last_user_msg)) = last_user {
+                let mut base_only: Vec<Message> = Vec::new();
+                if let Some(b) = &base_system {
+                    base_only.push(b.clone());
+                }
+                let base_tokens = self.counter.count_messages(&base_only);
+                let user_tokens = self
+                    .counter
+                    .count_messages(std::slice::from_ref(&last_user_msg));
+                let mech_tokens = latest_mech
+                    .as_ref()
+                    .map(|(_, m)| self.counter.count_messages(std::slice::from_ref(m)))
+                    .unwrap_or(0);
+                // ① γ 契约优先:三者都放得下就全保
+                if base_tokens + mech_tokens + user_tokens <= budget {
+                    let dropped: Vec<Message> = pool
+                        .into_iter()
+                        .filter(|(idx, _)| *idx != user_idx)
+                        .map(|(_, m)| m)
+                        .collect();
+                    let dropped_count = dropped.len();
+                    let mut result = always;
+                    if dropped_count > 0 {
+                        result.push(Message::System {
+                            content: format!(
+                                "[earlier {dropped_count} messages trimmed due to context window limit]"
+                            ),
+                        });
+                    }
+                    result.push(last_user_msg);
+                    return TrimResult {
+                        messages: result,
+                        dropped,
+                    };
+                }
+                // ② latest_mech 让位,保底末条 User
+                if base_tokens + user_tokens <= budget {
+                    let dropped: Vec<Message> = pool
+                        .into_iter()
+                        .filter(|(idx, _)| *idx != user_idx)
+                        .map(|(_, m)| m)
+                        .collect();
+                    let dropped_count = dropped.len();
+                    let mut result = base_only;
+                    if dropped_count > 0 {
+                        result.push(Message::System {
+                            content: format!(
+                                "[earlier {dropped_count} messages trimmed due to context window limit]"
+                            ),
+                        });
+                    }
+                    result.push(last_user_msg);
+                    return TrimResult {
+                        messages: result,
+                        dropped,
+                    };
+                }
+            }
+            // ③ 原行为兜底:只能保留常驻面
             let dropped: Vec<Message> = pool.into_iter().map(|(_, m)| m).collect();
             let dropped_count = dropped.len();
             let mut result = always;
@@ -526,13 +594,21 @@ impl ContextWindowManager {
                     i -= 1;
                 }
                 // 段前紧邻的 Assistant(含 tool_calls)一并成组
+                let mut has_caller = false;
                 if i > 0 {
                     if let Message::Assistant { tool_calls, .. } = &pool[i - 1].1 {
                         if tool_calls.as_ref().map(|c| !c.is_empty()).unwrap_or(false) {
                             group.insert(0, pool[i - 1].clone());
                             i -= 1; // 跳过已合并的 assistant
+                            has_caller = true;
                         }
                     }
+                }
+                if !has_caller {
+                    // 四轮审计 G17(B-285):孤儿 Tool 段(前邻非 Assistant
+                    // (tool_calls))整组放弃——发出即 wire 孤儿(tool_call_id
+                    // 无配对),上游 400。段留在可淘汰池,自然落入 dropped。
+                    continue;
                 }
             }
             // 估算 group 的 token
@@ -578,6 +654,47 @@ impl ContextWindowManager {
             messages: result,
             dropped,
         }
+    }
+}
+
+impl ContextWindowManager {
+    /// 四轮审计 G13(B-285):摘要回填前的预算收顶。
+    ///
+    /// trim 只为 hint 预留 `hint_overhead=15` token,摘要回填若不限长,
+    /// 刚 fit 的发送视图会被重新撑爆。本方法按当前预算对摘要文本收顶:
+    ///
+    /// - 本就放得下 → 原样放行;
+    /// - 超限 → 按 1/4 步长收缩字符数直到放得下;
+    /// - 收缩到 64 字符仍放不下 → 返回 fallback(调用方以原 hint 兜底)。
+    ///
+    /// `base_view` 为不含摘要槽位的发送视图(调用方先摘除 hint)。
+    pub fn cap_summary_for_budget(
+        &self,
+        formatted: &str,
+        fallback: &str,
+        base_view: &[Message],
+    ) -> String {
+        let budget = self.max_tokens.saturating_sub(self.reserve_for_response);
+        let fits = |summary: &str| {
+            let mut probe = base_view.to_vec();
+            probe.push(Message::System {
+                content: summary.to_string(),
+            });
+            self.counter.count_messages(&probe) <= budget
+        };
+        if fits(formatted) {
+            return formatted.to_string();
+        }
+        let mut candidate = formatted.to_string();
+        while candidate.chars().count() > 64 {
+            let len = candidate.chars().count();
+            let keep = len - (len / 4).max(1);
+            candidate = candidate.chars().take(keep).collect();
+            if fits(&candidate) {
+                return candidate;
+            }
+        }
+        fallback.to_string()
     }
 }
 
@@ -1466,5 +1583,87 @@ mod tests {
             "旧机制消息保留"
         );
         assert_eq!(trimmed[2].content(), "mech latest");
+    }
+
+    // ========== B-285 四轮审计缝缺陷红测(G13/G16/G17) ==========
+
+    /// G13: 摘要回填前的预算收顶——回填超预算时必须收缩;本就够小原样
+    /// 放行;连最小摘要都容不下时回落 fallback(即不回填)。
+    #[test]
+    fn test_cap_summary_shrinks_to_budget() {
+        let mgr =
+            ContextWindowManager::with_approx_counter(100, 0, TrimStrategy::KeepSystemKeepLast);
+        let base_view = vec![system("sys"), user("recent question")];
+        let huge = "S".repeat(4000); // ≈1000 tokens,远超剩余空间
+        let capped = mgr.cap_summary_for_budget(&huge, "[fallback]", &base_view);
+        let mut probe = base_view.clone();
+        probe.push(system(&capped));
+        let used = ApproxTokenCounter::new().count_messages(&probe);
+        assert!(used <= 100, "回填后必须仍在预算内: used={used}");
+        assert!(capped.chars().count() < huge.chars().count(), "必须收顶");
+        // 本就够小 → 原样放行
+        let small = "SUMMARY text";
+        assert_eq!(
+            mgr.cap_summary_for_budget(small, "[fallback]", &base_view),
+            small
+        );
+        // 极小预算:任何摘要都容不下 → fallback
+        let tiny =
+            ContextWindowManager::with_approx_counter(20, 0, TrimStrategy::KeepSystemKeepLast);
+        assert_eq!(
+            tiny.cap_summary_for_budget(&huge, "[fallback]", &base_view),
+            "[fallback]"
+        );
+    }
+
+    /// G16: 常驻面(base+latest_mech)占满预算的极档,不得把末条 User 一起
+    /// 丢——latest_mech 让位,保底 base_system+末条 User+hint。
+    #[test]
+    fn test_trim_extreme_keeps_last_user() {
+        let mgr =
+            ContextWindowManager::with_approx_counter(60, 0, TrimStrategy::KeepSystemKeepLast);
+        // budget=60;base "BASE"×20=80 ASCII→27 token;mech 同 27;
+        // always=54,available=60-54-15-5→0 → 极档分支
+        let msgs = vec![
+            system(&"BASE".repeat(20)),
+            system(&"MECH".repeat(20)),
+            user("old task"),
+            user("final task"),
+        ];
+        let (trimmed, _dropped) = mgr.trim(&msgs);
+        assert!(
+            trimmed
+                .iter()
+                .any(|m| matches!(m, Message::User { content, .. } if content == "final task")),
+            "极档必须保底末条 User: {trimmed:?}"
+        );
+        assert!(
+            !trimmed
+                .iter()
+                .any(|m| matches!(m, Message::System { content } if content.starts_with("MECH"))),
+            "极档让位的 latest_mech 不得常驻"
+        );
+    }
+
+    /// G17: Tool 段前邻不是 Assistant(tool_calls) → 孤儿段不得入发送视图
+    /// (发出即 wire 孤儿,上游 400;原子组纪律须覆盖非紧邻形态)。
+    #[test]
+    fn test_trim_never_sends_orphan_tool_segment() {
+        let mgr =
+            ContextWindowManager::with_approx_counter(40, 0, TrimStrategy::KeepSystemKeepLast);
+        // budget=40;sys 8;available=40-8-15-5=12;
+        // 尾组孤儿 tool≈19 token>12,现行为 kept 空时照加 → 修复后整组放弃
+        let orphan = "orphan result without any assistant call. ".repeat(6);
+        let msgs = vec![
+            system("sys"),
+            user("q1"),
+            user("q2"),
+            tool_result(&orphan, "ghost"),
+        ];
+        let (trimmed, _dropped) = mgr.trim(&msgs);
+        assert!(
+            !trimmed.iter().any(|m| matches!(m, Message::Tool { .. })),
+            "孤儿 Tool 段不得入发送视图: {trimmed:?}"
+        );
     }
 }

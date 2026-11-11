@@ -8176,3 +8176,77 @@ async fn rebuild_delta_aligns_subsequent_persist_index() {
     assert_eq!(report.observed, 1, "非幂等悬挂走崩溃观察");
     // mock 命中即证明持久化落点为 messages.6(下标差对齐生效)
 }
+
+// ===== B-285 四轮审计缝缺陷红测(G14/G15) =====
+
+/// G14: 引用占位块承诺 bytes、fetch 只支持 chars——单位契约缝。修复后
+/// 两侧 chars 口径齐备(bytes 字段保留兼容),CJK 场景 offset 可对账。
+#[test]
+fn tool_result_fetch_exposes_chars_unit() {
+    let dir = gate_temp_dir("chars");
+    let runner = gate_test_runner(&dir);
+    let tr = dir.join("tool_results");
+    std::fs::create_dir_all(&tr).unwrap();
+    let raw = "中文内容abc"; // 6 chars / 15 bytes
+    std::fs::write(tr.join("call-cjk.txt"), raw).unwrap();
+    let v = runner.execute_tool_result_fetch(&serde_json::json!({
+        "ref_id": "call-cjk", "offset": 0u64, "max_chars": 4u64
+    }));
+    assert!(v.get("error").is_none(), "unexpected error: {v}");
+    assert_eq!(
+        v["total_chars"],
+        raw.chars().count(),
+        "fetch 元数据须暴露 chars 口径"
+    );
+    assert_eq!(v["total_bytes"], raw.len(), "bytes 字段保留兼容");
+    assert_eq!(v["returned"], 4);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// G14 伴生:引用占位块同样暴露 chars 行,LLM 才能按 chars 推 offset。
+#[test]
+fn build_tool_result_reference_placeholder_exposes_chars() {
+    let raw = "中文结果";
+    let block = build_tool_result_reference(
+        raw,
+        "call-9",
+        "toolx",
+        "tool_results/call-9.txt",
+        "blake3:ff",
+    );
+    assert!(
+        block.contains(&format!("chars: {}", raw.chars().count())),
+        "占位块须含 chars 行:\n{block}"
+    );
+}
+
+/// G15: stale-/mech- 内容寻址 ref 的后缀即落盘指纹——取回必须复验,
+/// 被篡改/损坏的 offload 文件须 fail-visible,不得静默返回被改内容。
+#[test]
+fn fetch_verifies_digest_for_content_addressed_refs() {
+    let dir = gate_temp_dir("digest");
+    let runner = gate_test_runner(&dir);
+    let tr = dir.join("tool_results");
+    std::fs::create_dir_all(&tr).unwrap();
+    // 1) 指纹一致 → 正常取回
+    let good = "original content";
+    let hex = crate::agent::journal::evorule_digest(good)
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .to_string();
+    std::fs::write(tr.join(format!("stale-{hex}.txt")), good).unwrap();
+    let v =
+        runner.execute_tool_result_fetch(&serde_json::json!({"ref_id": format!("stale-{hex}")}));
+    assert!(v.get("error").is_none(), "指纹一致应放行: {v}");
+    assert_eq!(v["content"], good);
+    // 2) 同 ref 文件被篡改 → fail-visible
+    std::fs::write(tr.join(format!("stale-{hex}.txt")), "tampered!!").unwrap();
+    let v =
+        runner.execute_tool_result_fetch(&serde_json::json!({"ref_id": format!("stale-{hex}")}));
+    assert!(
+        v["error"].as_str().unwrap_or("").contains("digest"),
+        "篡改须 fail-visible: {v}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
