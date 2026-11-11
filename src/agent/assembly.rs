@@ -141,6 +141,47 @@ pub struct BudgetSpec {
     /// 发送视图与现行为逐字节一致——additive 扩展,不升配方版本）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_result_demotion: Option<StaleDemotionSpec>,
+    /// 机制消息开关声明（可选段;缺省/缺键 = None = 关闭 = 动态区仍嵌
+    /// system prompt 内,组装与现行为逐字节一致——additive 扩展,关闭态
+    /// 不升配方版本;开启态首次生效时升版,γ-4 联调）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mechanism_messages: Option<MechanismMessagesSpec>,
+}
+
+/// 机制消息开关声明（γ 批 B-268:动态区[记忆分区/Handoff Base/todo]外移为
+/// 独立机制消息,静态区跨轮字节级稳定 = 被动前缀缓存命中前提）。降级参数
+/// 与 β 陈旧降级同参(复用 4/2000,不另立调参面)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MechanismMessagesSpec {
+    /// 机制消息发送视图降级:距当前最小 assistant 轮数（默认 4 = β 同参;
+    /// γ-3 消费,γ-1 仅声明面）
+    #[serde(
+        default = "default_stale_min_turns",
+        skip_serializing_if = "stale_min_turns_is_default"
+    )]
+    pub stale_min_turns: usize,
+    /// 机制消息发送视图降级:字节阈值（默认 2000 = β 同参;γ-3 消费,γ-1 仅声明面）
+    #[serde(
+        default = "default_stale_min_bytes",
+        skip_serializing_if = "stale_min_bytes_is_default"
+    )]
+    pub stale_min_bytes: usize,
+}
+
+impl Default for MechanismMessagesSpec {
+    fn default() -> Self {
+        Self {
+            stale_min_turns: default_stale_min_turns(),
+            stale_min_bytes: default_stale_min_bytes(),
+        }
+    }
+}
+
+fn stale_min_turns_is_default(v: &usize) -> bool {
+    *v == default_stale_min_turns()
+}
+fn stale_min_bytes_is_default(v: &usize) -> bool {
+    *v == default_stale_min_bytes()
 }
 
 /// 陈旧工具结果发送视图降级声明（确定性纯函数,三条件全部满足才降级:
@@ -226,6 +267,7 @@ impl Default for BudgetSpec {
             reserve_for_response_pct: default_reserve_pct(),
             tool_result_max_chars: default_tool_result_max_chars(),
             stale_result_demotion: None,
+            mechanism_messages: None,
         }
     }
 }
@@ -759,6 +801,12 @@ impl AssemblyExecutor {
         self.recipe.budget.stale_result_demotion.as_ref()
     }
 
+    /// 机制消息开关声明(None = 默认关闭——动态区仍嵌 system prompt 内,
+    /// 组装与现行为逐字节一致)
+    pub fn mechanism_messages(&self) -> Option<&MechanismMessagesSpec> {
+        self.recipe.budget.mechanism_messages.as_ref()
+    }
+
     /// S7 裁剪参数(策略名/buffer%/hint token,供 ContextWindowManager 构造)
     pub fn trim_params(&self) -> Option<(&str, u32, usize)> {
         self.slot("S7_history")
@@ -828,7 +876,104 @@ impl AssemblyExecutor {
         todo_summary: Option<&str>,
         service_catalog: Option<&str>,
     ) -> Result<String, String> {
+        self.assemble_inner(
+            base_prompt,
+            identity_segment,
+            north_star,
+            memory,
+            recall,
+            total_window,
+            boundary_segment,
+            skills,
+            skills_notice,
+            handoff,
+            governance_segment,
+            knowledge_segment,
+            agents_md,
+            todo_summary,
+            service_catalog,
+            None,
+        )
+    }
+
+    /// 组装分叉版(γ 批 B-268):配方开启 `mechanism_messages` 时,动态区
+    /// (S3_memory 记忆分区/Handoff Base、S3c_todo)改渲染进独立机制段返回,
+    /// 静态区不含任何机制分区标记(跨轮字节级稳定 = 被动前缀缓存命中前提);
+    /// 关闭态/无动态内容物时与 [`Self::assemble`] 逐字节一致且机制段 None。
+    /// 机制段内序 = 槽位序(记忆分区 → Handoff Base → todo)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble_split(
+        &self,
+        base_prompt: &str,
+        identity_segment: Option<&str>,
+        north_star: Option<&str>,
+        memory: Option<&crate::agent::memory::MemoryManager>,
+        recall: &crate::agent::memory::RecallContext,
+        total_window: usize,
+        boundary_segment: Option<&str>,
+        skills: Option<&[crate::agent::definition::SkillManifestEntry]>,
+        skills_notice: Option<&str>,
+        handoff: Option<&crate::agent::definition::HandoffPackage>,
+        governance_segment: Option<&str>,
+        knowledge_segment: Option<&str>,
+        agents_md: Option<&str>,
+        todo_summary: Option<&str>,
+        service_catalog: Option<&str>,
+    ) -> Result<(String, Option<String>), String> {
+        let mut mechanism = String::new();
+        let prompt = self.assemble_inner(
+            base_prompt,
+            identity_segment,
+            north_star,
+            memory,
+            recall,
+            total_window,
+            boundary_segment,
+            skills,
+            skills_notice,
+            handoff,
+            governance_segment,
+            knowledge_segment,
+            agents_md,
+            todo_summary,
+            service_catalog,
+            Some(&mut mechanism),
+        )?;
+        let mechanism = if mechanism.is_empty() {
+            None
+        } else {
+            Some(mechanism.trim().to_string())
+        };
+        Ok((prompt, mechanism))
+    }
+
+    /// 组装内核:`mechanism_out = Some` 且配方开启 `mechanism_messages` 时,
+    /// 动态区槽位改渲染进机制段;`None` 或关闭态 = 全量嵌入(现行为)。
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_inner(
+        &self,
+        base_prompt: &str,
+        identity_segment: Option<&str>,
+        north_star: Option<&str>,
+        memory: Option<&crate::agent::memory::MemoryManager>,
+        recall: &crate::agent::memory::RecallContext,
+        total_window: usize,
+        boundary_segment: Option<&str>,
+        skills: Option<&[crate::agent::definition::SkillManifestEntry]>,
+        skills_notice: Option<&str>,
+        handoff: Option<&crate::agent::definition::HandoffPackage>,
+        governance_segment: Option<&str>,
+        knowledge_segment: Option<&str>,
+        agents_md: Option<&str>,
+        todo_summary: Option<&str>,
+        service_catalog: Option<&str>,
+        mut mechanism_out: Option<&mut String>,
+    ) -> Result<String, String> {
         let mut prompt = String::new();
+        // γ 批 B-268:机制段外移模式 = 分叉调用在场 且 配方声明开启。
+        // 两者缺一(默认配方/直调 assemble) = 全量嵌入,逐字节现行为。
+        let mechanism_mode =
+            mechanism_out.is_some() && self.recipe.budget.mechanism_messages.is_some();
         for slot in &self.recipe.slots {
             if !slot.enabled {
                 continue; // 开关停用(如 S4b_skills 预留位)
@@ -904,31 +1049,70 @@ impl AssemblyExecutor {
                 // memory None 而 handoff 在场时照常渲染)。底座块不占记忆
                 // 预算(结构字段完整性优先,体量小;与降级通知同口径)。
                 "recall" => {
-                    if let Some(mem) = memory {
-                        let budget = match slot.budget.as_ref() {
-                            Some(b) => {
-                                let base_tokens = self.budget_base_tokens(&b.base, total_window)?;
-                                crate::agent::memory::ContextBudget::new(base_tokens, b.ratio)
+                    if mechanism_mode {
+                        // γ 批 B-268:动态区外移——记忆分区/Handoff Base 渲染进
+                        // 机制段(渲染器以 base="" 调用得纯记忆区,首段 "\n\n"
+                        // 前缀去除;静态区不改写 = 跨轮字节级稳定)。底座块
+                        // 不占记忆预算的口径与嵌入态一致。
+                        let mech = mechanism_out.as_mut().expect("mechanism_mode implies Some");
+                        if let Some(mem) = memory {
+                            let budget = match slot.budget.as_ref() {
+                                Some(b) => {
+                                    let base_tokens =
+                                        self.budget_base_tokens(&b.base, total_window)?;
+                                    crate::agent::memory::ContextBudget::new(base_tokens, b.ratio)
+                                }
+                                // 槽位未声明 budget:默认口径(input 基×0.25,与默认配方一致)
+                                None => crate::agent::memory::ContextBudget::new(
+                                    self.budget_base_tokens("input", total_window)?,
+                                    0.25,
+                                ),
+                            };
+                            let region = mem.build_system_prompt_with_recall("", recall, &budget);
+                            mech.push_str(region.trim_start());
+                        }
+                        if let Some(h) = handoff {
+                            if !mech.is_empty() {
+                                mech.push_str("\n\n");
                             }
-                            // 槽位未声明 budget:默认口径(input 基×0.25,与默认配方一致)
-                            None => crate::agent::memory::ContextBudget::new(
-                                self.budget_base_tokens("input", total_window)?,
-                                0.25,
-                            ),
-                        };
-                        prompt = mem.build_system_prompt_with_recall(&prompt, recall, &budget);
-                    }
-                    if let Some(h) = handoff {
-                        prompt.push_str("\n\n");
-                        prompt.push_str(&render_handoff_base(h));
-                    } else if !recall.summaries.is_empty() {
-                        // 配对完整性断言(松弛实现):前会话语义面摘要注入中
-                        // 而底座包缺位=上下文延续单腿行走。warn 降级可见
-                        // (缺任一层不阻塞);反向(纯底座无摘要)合法不告警。
-                        tracing::warn!(
-                            summaries = recall.summaries.len(),
-                            "handoff pairing: session summaries present but no handoff base package declared; continuing degraded"
-                        );
+                            mech.push_str(&render_handoff_base(h));
+                        } else if !recall.summaries.is_empty() {
+                            // 配对完整性断言(松弛实现):前会话语义面摘要注入中
+                            // 而底座包缺位=上下文延续单腿行走。warn 降级可见
+                            // (缺任一层不阻塞);反向(纯底座无摘要)合法不告警。
+                            tracing::warn!(
+                                summaries = recall.summaries.len(),
+                                "handoff pairing: session summaries present but no handoff base package declared; continuing degraded"
+                            );
+                        }
+                    } else {
+                        if let Some(mem) = memory {
+                            let budget = match slot.budget.as_ref() {
+                                Some(b) => {
+                                    let base_tokens =
+                                        self.budget_base_tokens(&b.base, total_window)?;
+                                    crate::agent::memory::ContextBudget::new(base_tokens, b.ratio)
+                                }
+                                // 槽位未声明 budget:默认口径(input 基×0.25,与默认配方一致)
+                                None => crate::agent::memory::ContextBudget::new(
+                                    self.budget_base_tokens("input", total_window)?,
+                                    0.25,
+                                ),
+                            };
+                            prompt = mem.build_system_prompt_with_recall(&prompt, recall, &budget);
+                        }
+                        if let Some(h) = handoff {
+                            prompt.push_str("\n\n");
+                            prompt.push_str(&render_handoff_base(h));
+                        } else if !recall.summaries.is_empty() {
+                            // 配对完整性断言(松弛实现):前会话语义面摘要注入中
+                            // 而底座包缺位=上下文延续单腿行走。warn 降级可见
+                            // (缺任一层不阻塞);反向(纯底座无摘要)合法不告警。
+                            tracing::warn!(
+                                summaries = recall.summaries.len(),
+                                "handoff pairing: session summaries present but no handoff base package declared; continuing degraded"
+                            );
+                        }
                     }
                 }
                 // S3c_todo:todo 清单摘要(批K 段4)——LLM 自管理任务状态的
@@ -937,7 +1121,21 @@ impl AssemblyExecutor {
                 // 无清单/开关关,槽位静默跳过;不占记忆预算(结构字段完整性
                 // 优先,Handoff Base 底座块同口径)
                 "todo_summary" => {
-                    if let Some(seg) = todo_summary {
+                    if mechanism_mode {
+                        // γ 批 B-268:动态区外移——todo 段渲染进机制段(机制段
+                        // 为空时不带分隔前缀,段内容与嵌入态逐字节一致)
+                        if let Some(seg) = todo_summary {
+                            if !seg.trim().is_empty() {
+                                let mech =
+                                    mechanism_out.as_mut().expect("mechanism_mode implies Some");
+                                let sep = slot.separator.as_deref().unwrap_or("\n\n");
+                                if !mech.is_empty() {
+                                    mech.push_str(sep);
+                                }
+                                mech.push_str(seg);
+                            }
+                        }
+                    } else if let Some(seg) = todo_summary {
                         if !seg.trim().is_empty() {
                             let sep = slot.separator.as_deref().unwrap_or("\n\n");
                             prompt.push_str(sep);
@@ -2485,5 +2683,180 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out, "base\n\nAGENTSMD");
+    }
+
+    // ===== 批 B-268 γ-1:机制消息开关与动态区外移分叉 =====
+
+    /// 开启态配方夹具(mechanism_messages 声明 = Some)
+    fn mechanism_on_recipe() -> AssemblyRecipe {
+        let mut r = AssemblyRecipe::default();
+        r.budget.mechanism_messages = Some(MechanismMessagesSpec::default());
+        r
+    }
+
+    /// 缺省不变式:默认配方不带 mechanism_messages(关闭),关闭态
+    /// assemble_split 与 assemble 逐字节一致且机制段 None(动态区仍嵌
+    /// system prompt 内 = 现行为)
+    #[test]
+    fn test_mechanism_messages_default_off_and_split_disabled_byte_identical() {
+        use crate::agent::memory::{MemoryManager, MemoryRecord};
+        assert!(AssemblyRecipe::default()
+            .budget
+            .mechanism_messages
+            .is_none());
+        let exec = AssemblyExecutor::default_executor();
+        let mem = MemoryManager::new(
+            "b268-off",
+            crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080"),
+        );
+        let mut recall = RecallContext::default();
+        recall
+            .stable
+            .push(MemoryRecord::new("k", "稳定事实内容", 1000));
+        let args = (
+            "base",
+            None,
+            None,
+            Some(&mem),
+            &recall,
+            8192usize,
+            None,
+            None,
+            None, // skills_notice
+            None,
+            None,
+            None,
+            None,
+            Some("TODO_SEG"),
+            None,
+        );
+        let embedded = exec
+            .assemble(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, args.13, args.14,
+            )
+            .unwrap();
+        let (static_prompt, mechanism) = exec
+            .assemble_split(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, args.13, args.14,
+            )
+            .unwrap();
+        assert!(mechanism.is_none(), "关闭态机制段必须为 None");
+        assert_eq!(static_prompt, embedded, "关闭态静态区 = 全量组装逐字节一致");
+    }
+
+    /// 开启态:动态区(记忆分区/handoff/todo)外移为机制段;静态区不含任何
+    /// 机制分区标记;机制段内序 = 记忆分区 → Handoff Base → todo(槽位序)
+    #[test]
+    fn test_assemble_split_enabled_moves_dynamic_region_out() {
+        use crate::agent::definition::HandoffPackage;
+        use crate::agent::memory::{MemoryManager, MemoryRecord};
+        let exec = AssemblyExecutor::new(mechanism_on_recipe());
+        let mem = MemoryManager::new(
+            "b268-on",
+            crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080"),
+        );
+        let mut recall = RecallContext::default();
+        recall
+            .stable
+            .push(MemoryRecord::new("k", "稳定事实内容", 1000));
+        let handoff = HandoffPackage {
+            goal: "跨会话接续".to_string(),
+            milestone_current: None,
+            next_step: None,
+            verified_facts: Vec::new(),
+            dead_ends: Vec::new(),
+        };
+        let (static_prompt, mechanism) = exec
+            .assemble_split(
+                "base",
+                None,
+                None,
+                Some(&mem),
+                &recall,
+                8192,
+                None,
+                None,
+                None, // skills_notice
+                Some(&handoff),
+                None,
+                None,
+                None,
+                Some("## Current TODO\n- t1"),
+                None,
+            )
+            .unwrap();
+        assert!(static_prompt.starts_with("base"), "静态区保留头部基底");
+        assert!(
+            !static_prompt.contains("## Stable Facts")
+                && !static_prompt.contains("## Handoff Base")
+                && !static_prompt.contains("Current TODO"),
+            "开启态静态区不含任何机制分区标记: {static_prompt}"
+        );
+        let seg = mechanism.expect("开启态机制段在场");
+        let stable_pos = seg.find("## Stable Facts").expect("记忆分区在机制段");
+        let handoff_pos = seg.find("## Handoff Base").expect("底座块在机制段");
+        let todo_pos = seg.find("## Current TODO").expect("todo 在机制段");
+        assert!(
+            stable_pos < handoff_pos && handoff_pos < todo_pos,
+            "机制段内序 = 槽位序"
+        );
+    }
+
+    /// 开启态无动态内容物(memory/handoff/todo 全 None)→ 机制段 None,
+    /// 静态区 = 全量组装(无机制消息可追加)
+    #[test]
+    fn test_assemble_split_enabled_no_dynamic_sources_yields_none() {
+        let exec = AssemblyExecutor::new(mechanism_on_recipe());
+        let (static_prompt, mechanism) = exec
+            .assemble_split(
+                "base",
+                None,
+                None,
+                None,
+                &RecallContext::default(),
+                8192,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(mechanism.is_none());
+        assert_eq!(static_prompt, "base");
+    }
+
+    /// 机制消息降级同参声明(spec 预留字段,γ-3 消费):缺省 = β 同参 4/2000
+    #[test]
+    fn test_mechanism_messages_spec_defaults_reuse_beta_params() {
+        let spec = MechanismMessagesSpec::default();
+        assert_eq!(spec.stale_min_turns, 4);
+        assert_eq!(spec.stale_min_bytes, 2_000);
+    }
+
+    /// JSON 形态:缺键 = None(关闭);显式声明 = Some;关闭态序列化不出现
+    /// 该键(形状与 β 段同款:Option+skip_serializing_if)
+    #[test]
+    fn test_mechanism_messages_spec_json_roundtrip() {
+        #[derive(Serialize, Deserialize)]
+        struct Probe {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            mechanism_messages: Option<MechanismMessagesSpec>,
+        }
+        let off: Probe = serde_json::from_str("{}").unwrap();
+        assert!(off.mechanism_messages.is_none());
+        assert_eq!(serde_json::to_string(&off).unwrap(), "{}");
+        let on: Probe = serde_json::from_str(r#"{"mechanism_messages":{}}"#).unwrap();
+        assert!(on.mechanism_messages.is_some());
+        assert_eq!(
+            serde_json::to_string(&on).unwrap(),
+            r#"{"mechanism_messages":{}}"#
+        );
     }
 }

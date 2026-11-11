@@ -3723,9 +3723,12 @@ impl AgentRunner {
         };
         // S2d 服务目录段(service_tools 注册面渲染;None=零注册静默跳过)
         let service_catalog_segment = crate::service_tools::render_service_catalog();
-        let system_prompt = self
+        // γ 批 B-268:动态区外移分叉(配方 mechanism_messages 开启时,记忆分区/
+        // Handoff Base/todo 渲染进独立机制消息,静态区跨轮字节级稳定;关闭态
+        // 机制消息 None,system_prompt 与现行为逐字节一致)
+        let (system_prompt, mechanism_message) = self
             .assembly
-            .assemble(
+            .assemble_split(
                 &self.config.system_prompt,
                 self.config.identity_segment.as_deref(),
                 self.config.north_star.as_deref(),
@@ -3882,6 +3885,24 @@ impl AgentRunner {
                 Message::System {
                     content: system_prompt,
                 },
+            )
+            .await?;
+        }
+        // γ 批 B-268:机制消息推送+持久化(机制消息为 System role;idx 口径与
+        // user_idx 同族 = 推送前 messages.len()+persist_idx_delta。关闭态
+        // 机制消息 None = 零行为变化)
+        if let Some(mechanism) = mechanism_message {
+            let mech_idx = messages.len()
+                + self
+                    .persist_idx_delta
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            messages.push(Message::System {
+                content: mechanism.clone(),
+            });
+            self.persist_message(
+                &session_id,
+                mech_idx,
+                Message::System { content: mechanism },
             )
             .await?;
         }
@@ -7947,7 +7968,10 @@ impl AgentRunner {
                            // S2d 服务目录段(同 run() 组装点口径)
                            let service_catalog_segment =
                                crate::service_tools::render_service_catalog();
-                           let system_prompt = match runner.assembly.assemble(
+                           // γ 批 B-268:动态区外移分叉(同 run() 组装点口径——
+                           // 配方 mechanism_messages 开启时动态区渲染进独立机制
+                           // 消息;关闭态机制消息 None,system_prompt 逐字节现行为)
+                           let (system_prompt, mechanism_message) = match runner.assembly.assemble_split(
                                &runner.config.system_prompt,
                                runner.config.identity_segment.as_deref(),
                                runner.config.north_star.as_deref(),
@@ -7968,7 +7992,7 @@ impl AgentRunner {
                                runner.todo_summary_segment().as_deref(),
                                service_catalog_segment.as_deref(),
                            ) {
-                               Ok(p) => p,
+                               Ok((p, m)) => (p, m),
                                Err(e) => {
                                    yield Err(AgentError::Internal(e));
                                    return;
@@ -8485,6 +8509,24 @@ impl AgentRunner {
                                    messages.push(Message::System { content: system_prompt.clone() });
                                    if let Err(e) = runner
                                        .persist_message(&session_id, 0, Message::System { content: system_prompt.clone() })
+                                       .await
+                                   {
+                                       yield Err(e);
+                                       return;
+                                   }
+                               }
+                               // γ 批 B-268:机制消息推送+持久化(机制消息为 System role;
+                               // 仅新 session 初始化时注入,continuation 不重注入——
+                               // 与 system 同口径;idx 口径 = 推送前 messages.len()+
+                               // persist_idx_delta,与 run() 路径同族)
+                               if let Some(mechanism) = mechanism_message {
+                                   let mech_idx = messages.len()
+                                       + runner
+                                           .persist_idx_delta
+                                           .load(std::sync::atomic::Ordering::Relaxed);
+                                   messages.push(Message::System { content: mechanism.clone() });
+                                   if let Err(e) = runner
+                                       .persist_message(&session_id, mech_idx, Message::System { content: mechanism })
                                        .await
                                    {
                                        yield Err(e);
