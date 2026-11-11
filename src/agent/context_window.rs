@@ -145,6 +145,70 @@ pub fn demote_stale_tool_results(
     (view, offloads)
 }
 
+/// 陈旧机制消息发送视图降级(γ 批 B-268,β 同构三条件;确定性纯函数):
+/// 目标 = 首条 System(头部原 system)与最后一条 System(常驻最新机制
+/// 消息)之外的 System 消息。三条件全部满足才降级:①已消费——其后存在
+/// Assistant 消息;②距当前 ≥ `min_turns` 个 assistant 轮;③字节数 >
+/// `min_bytes`。降级为 digest 引用块(`mech-` 前缀内容寻址,Tool 消息
+/// stale- 前缀同族),原文落盘由调用方执行(fail-soft);禁写 journal
+/// (与 β 同纪律)。已降级占位块跳过不二次降级;消息条数不变。
+pub fn demote_stale_mechanism_messages(
+    messages: &[Message],
+    min_turns: usize,
+    min_bytes: usize,
+) -> (Vec<Message>, Vec<StaleOffload>) {
+    let system_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m, Message::System { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    let first_sys = system_indices.first().copied();
+    let last_sys = system_indices.last().copied();
+    let mut view = messages.to_vec();
+    let mut offloads: Vec<StaleOffload> = Vec::new();
+    for (i, msg) in view.iter_mut().enumerate() {
+        let Message::System { content, .. } = msg else {
+            continue;
+        };
+        // 两端排除:首条 = 头部原 system,末条 = 常驻最新机制消息
+        if Some(i) == first_sys || Some(i) == last_sys {
+            continue;
+        }
+        // 条件①②:其后 Assistant 消息数(0 = 尚未消费,永不降级)
+        let assistants_after = messages[i + 1..]
+            .iter()
+            .filter(|m| matches!(m, Message::Assistant { .. }))
+            .count();
+        if assistants_after == 0 || assistants_after < min_turns {
+            continue;
+        }
+        // 条件③:字节数须严格超过阈值(引用块自身头尾比原文还小则降级无收益)
+        if content.len() <= min_bytes {
+            continue;
+        }
+        // 已降级占位块跳过(不二次降级)
+        if content.starts_with("[STALE_MECHANISM_MESSAGE]") {
+            continue;
+        }
+        let digest = crate::agent::journal::evorule_digest(content);
+        let hex_segment = digest.rsplit(':').next().unwrap_or(&digest);
+        let ref_id = format!("mech-{}", sanitize_ref_segment(hex_segment));
+        let placeholder = format!(
+            "[STALE_MECHANISM_MESSAGE]\nref_id: {ref_id}\ntool: mechanism\nbytes: {}\ndigest: {digest}\n(陈旧机制消息已降级。需要原文时调用 tool_result_fetch 工具,按 ref_id 分页读取。)",
+            content.len()
+        );
+        offloads.push(StaleOffload {
+            ref_id,
+            tool_name: "mechanism".to_string(),
+            content: content.clone(),
+            digest,
+        });
+        *content = placeholder;
+    }
+    (view, offloads)
+}
+
 /// Token 计数器 trait
 pub trait TokenCounter: Send + Sync + std::fmt::Debug {
     /// 估算 messages 数组的总 token 数(含 role 开销 + 结尾标记)
@@ -375,41 +439,60 @@ impl ContextWindowManager {
     }
 
     /// 实现策略:保留 system + 最近若干轮(tool_call/tool_result 原子对)
+    /// γ 批 B-268:机制消息独立原子组——头部原 system(首条 System)全保;
+    /// 机制消息(首条之后的 System 消息)只保最新一条常驻,其余进入可淘汰面
+    /// (发送视图已先行按 β 同构三条件降级为 digest 引用块;此处作为普通
+    /// 池成员参与尾部累加,预算不足时丢弃)
     fn trim_keep_system_keep_last(&self, messages: &[Message], budget: usize) -> TrimResult {
-        // 1. 拆分 system / non-system
-        let mut system_msgs: Vec<Message> = Vec::new();
-        let mut non_system: Vec<(usize, Message)> = Vec::new(); // (原 idx, msg)
+        // 1. 拆分:头部原 system / 机制消息 / 可淘汰池(保原序)
+        let mut base_system: Option<Message> = None;
+        let mut mech: Vec<(usize, Message)> = Vec::new();
+        let mut pool: Vec<(usize, Message)> = Vec::new(); // (原 idx, msg)
         for (i, msg) in messages.iter().enumerate() {
-            if matches!(msg, Message::System { .. }) {
-                system_msgs.push(msg.clone());
-            } else {
-                non_system.push((i, msg.clone()));
+            match msg {
+                Message::System { .. } if base_system.is_none() => {
+                    base_system = Some(msg.clone());
+                }
+                Message::System { .. } => mech.push((i, msg.clone())),
+                _ => pool.push((i, msg.clone())),
             }
         }
+        // 最新一条机制消息常驻(与头部原 system 同待遇);其余机制消息进池
+        let latest_mech = mech.pop();
+        pool.extend(mech);
+        pool.sort_by_key(|(i, _)| *i);
 
-        if non_system.is_empty() {
+        let mut always: Vec<Message> = Vec::new();
+        if let Some(b) = &base_system {
+            always.push(b.clone());
+        }
+        if let Some((_, m)) = &latest_mech {
+            always.push(m.clone());
+        }
+
+        if pool.is_empty() {
             return TrimResult {
-                messages: system_msgs,
+                messages: always,
                 dropped: Vec::new(),
             };
         }
 
-        // 2. 计算 system 消息占用的 token
-        let system_tokens = self.counter.count_messages(&system_msgs);
+        // 2. 计算常驻面占用的 token
+        let always_tokens = self.counter.count_messages(&always);
         // hint 消息约 13 token("[earlier N messages trimmed due to context window limit]")
         // buffer 按 budget 的 5% 预留,最低 5 token,应对计数误差
         let hint_overhead = 15usize;
         let buffer = (budget / 20).max(5);
         let available_for_recent = budget
-            .saturating_sub(system_tokens)
+            .saturating_sub(always_tokens)
             .saturating_sub(hint_overhead)
             .saturating_sub(buffer);
 
         if available_for_recent == 0 {
-            // 极端情况:system 消息本身已占满 budget,只能保留 system
-            let dropped: Vec<Message> = non_system.into_iter().map(|(_, m)| m).collect();
+            // 极端情况:常驻面本身已占满 budget,只能保留常驻面
+            let dropped: Vec<Message> = pool.into_iter().map(|(_, m)| m).collect();
             let dropped_count = dropped.len();
-            let mut result = system_msgs.clone();
+            let mut result = always;
             if dropped_count > 0 {
                 result.push(Message::System {
                     content: format!(
@@ -427,26 +510,26 @@ impl ContextWindowManager {
         // 3. 从尾部往前累加,tool_call/tool_result 视为原子组
         let mut kept: Vec<(usize, Message)> = Vec::new();
         let mut kept_tokens = 0usize;
-        let mut i = non_system.len();
+        let mut i = pool.len();
         while i > 0 {
             i -= 1;
-            let (_, msg) = &non_system[i];
+            let (_, msg) = &pool[i];
             // 如果是 tool_result(Message::Tool),它所属的连续 Tool 结果段必须与
             // 发起 tool_calls 的 assistant 整体成组:并行 tool_calls 会产生多条
             // 连续 Tool 消息,只合并紧邻 assistant 会在段中间切开,留下孤立的
             // tool_result(LLM 收到无配对 tool_call_id 的 tool 消息会报错)
-            let mut group: Vec<(usize, Message)> = vec![non_system[i].clone()];
+            let mut group: Vec<(usize, Message)> = vec![pool[i].clone()];
             if let Message::Tool { .. } = msg {
                 // 向前收集连续 Tool 段(多并行 tool_calls 的结果队列)
-                while i > 0 && matches!(non_system[i - 1].1, Message::Tool { .. }) {
-                    group.insert(0, non_system[i - 1].clone());
+                while i > 0 && matches!(pool[i - 1].1, Message::Tool { .. }) {
+                    group.insert(0, pool[i - 1].clone());
                     i -= 1;
                 }
                 // 段前紧邻的 Assistant(含 tool_calls)一并成组
                 if i > 0 {
-                    if let Message::Assistant { tool_calls, .. } = &non_system[i - 1].1 {
+                    if let Message::Assistant { tool_calls, .. } = &pool[i - 1].1 {
                         if tool_calls.as_ref().map(|c| !c.is_empty()).unwrap_or(false) {
-                            group.insert(0, non_system[i - 1].clone());
+                            group.insert(0, pool[i - 1].clone());
                             i -= 1; // 跳过已合并的 assistant
                         }
                     }
@@ -466,19 +549,19 @@ impl ContextWindowManager {
             kept = new_kept;
         }
 
-        // 4. 收集被丢弃的消息(非 system 且不在 kept 中的)
+        // 4. 收集被丢弃的消息(可淘汰池中不在 kept 中的)
         let kept_indices: std::collections::HashSet<usize> =
             kept.iter().map(|(idx, _)| *idx).collect();
-        let dropped: Vec<Message> = non_system
+        let dropped: Vec<Message> = pool
             .iter()
             .filter(|(idx, _)| !kept_indices.contains(idx))
             .map(|(_, m)| m.clone())
             .collect();
         let dropped_count = dropped.len();
 
-        // 5. 组装结果:system + (可选 hint) + kept(按原顺序)
-        // 注意:hint 插在 system 和 kept 之间,kept 的最后一条是最近的消息
-        let mut result = system_msgs.clone();
+        // 5. 组装结果:常驻面 + (可选 hint) + kept(按原顺序)
+        // 注意:hint 插在常驻面和 kept 之间,kept 的最后一条是最近的消息
+        let mut result = always;
         if dropped_count > 0 {
             result.push(Message::System {
                 content: format!(
@@ -1154,5 +1237,234 @@ mod tests {
         // 权威历史入参零改动;消息条数不变(下标对齐保持)
         assert_eq!(serde_json::to_string(&msgs).unwrap(), snapshot);
         assert_eq!(view.len(), msgs.len());
+    }
+
+    // ===== 批 B-268 γ-3:机制消息独立原子组 + β 同构降级变换 =====
+
+    /// 机制消息降级目标 = 首条(头部原 system)与最后一条(常驻最新机制消息)
+    /// 之外的 System 消息:中间旧机制消息满足三条件降级,两端零改动
+    #[test]
+    fn test_demote_mechanism_targets_inner_systems_only() {
+        let old_mech = "O".repeat(500);
+        let msgs = vec![
+            system("base system prompt"),
+            system(&old_mech),
+            system("latest mechanism"),
+            user("q"),
+            Message::Assistant {
+                content: "a1".to_string(),
+                tool_calls: None,
+            },
+            Message::Assistant {
+                content: "a2".to_string(),
+                tool_calls: None,
+            },
+        ];
+        let (view, offs) = demote_stale_mechanism_messages(&msgs, 2, 100);
+        assert_eq!(offs.len(), 1, "仅中间旧机制消息降级: {offs:?}");
+        assert_eq!(offs[0].tool_name, "mechanism");
+        assert_eq!(offs[0].content, old_mech, "offload 携带原文全文");
+        assert_eq!(
+            view[0].content(),
+            "base system prompt",
+            "头部原 system 零改动"
+        );
+        assert_eq!(
+            view[2].content(),
+            "latest mechanism",
+            "常驻最新机制消息零改动"
+        );
+        assert!(view[1].content().starts_with("[STALE_MECHANISM_MESSAGE]"));
+    }
+
+    /// 无中间旧机制消息 = 零降级:仅 [base] 或 [base, latest] 形态原样返回
+    #[test]
+    fn test_demote_mechanism_no_inner_systems_is_noop() {
+        let msgs = vec![system("base"), system("latest"), user("q")];
+        let (view, offs) = demote_stale_mechanism_messages(&msgs, 1, 10);
+        assert!(offs.is_empty());
+        assert_eq!(view, msgs);
+        let msgs = vec![system("base only"), user("q")];
+        let (view, offs) = demote_stale_mechanism_messages(&msgs, 1, 10);
+        assert!(offs.is_empty());
+        assert_eq!(view, msgs);
+    }
+
+    /// β 同构三条件:①已消费+②距当前 ≥ min_turns 个 assistant 轮+③字节
+    /// 严格大于 min_bytes——任一不满足不降级
+    #[test]
+    fn test_demote_mechanism_conditions_turns_and_bytes() {
+        let content = "C".repeat(500);
+        // 轮数边界:其后 1 个 assistant,min_turns=2 → 不降级;min_turns=1 → 降级
+        let msgs = vec![
+            system("base"),
+            system(&content),
+            system("latest"),
+            user("q"),
+            Message::Assistant {
+                content: "a".to_string(),
+                tool_calls: None,
+            },
+        ];
+        let (view, offs) = demote_stale_mechanism_messages(&msgs, 2, 100);
+        assert!(offs.is_empty(), "不足 min_turns 不降级");
+        assert_eq!(view[1].content(), &content);
+        let (view, offs) = demote_stale_mechanism_messages(&msgs, 1, 100);
+        assert_eq!(offs.len(), 1);
+        assert!(view[1].content().starts_with("[STALE_MECHANISM_MESSAGE]"));
+        // 字节边界:T=500 不降级(严格大于),501 降级
+        let msgs = vec![
+            system("base"),
+            system(&"D".repeat(500)),
+            system("latest"),
+            user("q"),
+            Message::Assistant {
+                content: "a".to_string(),
+                tool_calls: None,
+            },
+            Message::Assistant {
+                content: "a".to_string(),
+                tool_calls: None,
+            },
+        ];
+        let (_, offs) = demote_stale_mechanism_messages(&msgs, 1, 500);
+        assert!(offs.is_empty(), "恰 T 字节不降级");
+        let msgs = vec![
+            system("base"),
+            system(&"D".repeat(501)),
+            system("latest"),
+            user("q"),
+            Message::Assistant {
+                content: "a".to_string(),
+                tool_calls: None,
+            },
+            Message::Assistant {
+                content: "a".to_string(),
+                tool_calls: None,
+            },
+        ];
+        let (view, offs) = demote_stale_mechanism_messages(&msgs, 1, 500);
+        assert_eq!(offs.len(), 1);
+        assert!(view[1].content().starts_with("[STALE_MECHANISM_MESSAGE]"));
+    }
+
+    /// 占位块形态:ref_id = mech-{digest hex 段};含 digest/bytes/取回指引;
+    /// 条数不变;入参零改动;已降级内容跳过不二次降级
+    #[test]
+    fn test_demote_mechanism_placeholder_shape_and_idempotent() {
+        let content = "P".repeat(500);
+        let snapshot = content.clone();
+        let msgs = vec![
+            system("base"),
+            system(&content),
+            system("latest"),
+            user("q"),
+            Message::Assistant {
+                content: "a".to_string(),
+                tool_calls: None,
+            },
+        ];
+        let (view, offs) = demote_stale_mechanism_messages(&msgs, 1, 100);
+        assert_eq!(offs.len(), 1);
+        let digest = evorule_digest(&content);
+        let hex = digest.rsplit(':').next().unwrap();
+        let ph = view[1].content();
+        assert!(ph.starts_with("[STALE_MECHANISM_MESSAGE]"));
+        assert!(ph.contains(&format!("ref_id: mech-{}", sanitize_ref_segment(hex))));
+        assert!(ph.contains(&format!("digest: {digest}")));
+        assert!(ph.contains(&format!("bytes: {}", content.len())));
+        assert!(ph.contains("tool_result_fetch"), "取回指引在场");
+        assert_eq!(offs[0].content, snapshot);
+        assert_eq!(view.len(), msgs.len(), "条数不变");
+        assert_eq!(view[0].content(), "base");
+        assert_eq!(view[2].content(), "latest");
+        // 幂等:已降级占位块再过一遍零改动
+        let (view2, offs2) = demote_stale_mechanism_messages(&view, 1, 100);
+        assert!(offs2.is_empty(), "已引用化内容不二次降级");
+        assert_eq!(view2[1].content(), view[1].content());
+    }
+
+    /// trim 机制消息独立原子组:预算紧张时头部原 system + 最新机制消息
+    /// 常驻,旧机制消息与历史消息同入可淘汰面被丢弃
+    #[test]
+    fn test_trim_mechanism_group_only_latest_kept_under_tight_budget() {
+        let mgr =
+            ContextWindowManager::with_approx_counter(60, 10, TrimStrategy::KeepSystemKeepLast);
+        let msgs = vec![
+            system("sys base prompt"),
+            system(&format!("old mechanism payload {}", "X".repeat(200))),
+            system("mech latest"),
+            user("hello"),
+            user("hello"),
+            user("hello"),
+        ];
+        let (trimmed, dropped) = mgr.trim(&msgs);
+        assert!(dropped > 0);
+        assert_eq!(
+            trimmed[0].content(),
+            "sys base prompt",
+            "头部原 system 常驻"
+        );
+        assert_eq!(trimmed[1].content(), "mech latest", "最新机制消息常驻");
+        assert!(
+            !trimmed
+                .iter()
+                .any(|m| m.content().contains("old mechanism payload")),
+            "旧机制消息紧张预算下被丢弃"
+        );
+        assert!(matches!(trimmed.last(), Some(Message::User { .. })));
+    }
+
+    /// 单条机制消息 = 现行为等价:与头部 system 一同常驻(独立原子组仅一条
+    /// 时成员=该条,trim 行为与 γ-3 前逐字节一致)
+    #[test]
+    fn test_trim_single_mechanism_message_kept_as_before() {
+        let mgr =
+            ContextWindowManager::with_approx_counter(50, 10, TrimStrategy::KeepSystemKeepLast);
+        let msgs = vec![
+            system("sys prompt long enough"),
+            system("mech latest"),
+            user("hello"),
+            user("hello"),
+            user("hello"),
+            user("hello"),
+            user("hello"),
+            user("hello"),
+        ];
+        let (trimmed, dropped) = mgr.trim(&msgs);
+        assert!(dropped > 0);
+        assert!(matches!(trimmed[0], Message::System { .. }));
+        assert_eq!(
+            trimmed[1].content(),
+            "mech latest",
+            "单条机制消息=最新一条,常驻"
+        );
+        let has_hint = trimmed
+            .iter()
+            .any(|m| m.content().contains("[earlier") && m.content().contains("messages trimmed"));
+        assert!(has_hint, "should contain trim hint");
+    }
+
+    /// 预算充足:旧机制消息经可淘汰面照常保留,零丢弃
+    #[test]
+    fn test_trim_mechanism_pool_kept_when_budget_allows() {
+        let mgr =
+            ContextWindowManager::with_approx_counter(8192, 2048, TrimStrategy::KeepSystemKeepLast);
+        let msgs = vec![
+            system("sys base prompt"),
+            system("old mechanism payload"),
+            system("mech latest"),
+            user("q1"),
+            user("q2"),
+        ];
+        let (trimmed, dropped) = mgr.trim(&msgs);
+        assert_eq!(dropped, 0);
+        assert_eq!(trimmed.len(), 5, "全部保留");
+        assert_eq!(
+            trimmed[1].content(),
+            "old mechanism payload",
+            "旧机制消息保留"
+        );
+        assert_eq!(trimmed[2].content(), "mech latest");
     }
 }

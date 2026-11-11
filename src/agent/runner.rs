@@ -1405,6 +1405,10 @@ pub struct AgentRunner {
     /// 逐字节一致;Some = 历史中已消费的陈旧工具结果在发送视图降级为占位块,
     /// 原文落盘 tool_results 供 tool_result_fetch 取回,账本原文不动)
     stale_demotion: Option<crate::agent::assembly::StaleDemotionSpec>,
+    /// 机制消息开关声明(None = 默认关闭——动态区嵌 system prompt,行为零
+    /// 变化;Some = 动态区外移为独立机制消息,旧机制消息在发送视图按 β 同构
+    /// 三条件降级为 digest 引用块,原文落盘 tool_results 供取回,禁写 journal)
+    mechanism_demotion: Option<crate::agent::assembly::MechanismMessagesSpec>,
     /// plan-execute tokens 埋点累加器（纲领 §8 Phase 2 交付物 7，None = 不埋点）
     ///
     /// 由 [`DelegateContext::with_token_counter`] 注入并随每个子 runner 共享
@@ -1622,6 +1626,7 @@ impl AgentRunner {
             assembly: crate::agent::assembly::AssemblyExecutor::default_executor(),
             tool_result_max_chars: 48_000,
             stale_demotion: None,
+            mechanism_demotion: None,
             token_counter: None,
             adjudicator: tokio::sync::Mutex::new(
                 crate::agent::adjudicator::AdjudicationChannel::new(
@@ -2025,6 +2030,8 @@ impl AgentRunner {
         runner.tool_result_max_chars = runner.assembly.tool_result_max_chars();
         // 陈旧工具结果降级声明(配方可选段;缺省 None = 关闭,行为零变化)
         runner.stale_demotion = runner.assembly.stale_result_demotion().cloned();
+        // 机制消息开关声明(配方可选段;缺省 None = 关闭,行为零变化)
+        runner.mechanism_demotion = runner.assembly.mechanism_messages().cloned();
 
         // G11:从 def.output_format 构造 OutputValidator
         // schema 编译失败时早失败(可控),不让用户跑一半才发现配错
@@ -2583,6 +2590,40 @@ impl AgentRunner {
             let path = tool_results.join(format!("{}.txt", off.ref_id));
             if std::fs::write(&path, &off.content).is_err() {
                 tracing::warn!(ref_id = %off.ref_id, "stale result demotion aborted: offload write failed");
+                return messages.to_vec();
+            }
+        }
+        view
+    }
+
+    /// 陈旧机制消息发送视图降级(γ 批 B-268;β 同构接线形态):发送视图变换
+    /// ——权威历史不动,原文落盘 tool_results(mech- 前缀 ref_id)供
+    /// tool_result_fetch 取回,禁写 journal。目录不可用/写失败 = fail-soft
+    /// 原样返回(降级无收益也不损失上下文)。
+    fn apply_mechanism_demotion(&self, messages: &[Message]) -> Vec<Message> {
+        let Some(spec) = &self.mechanism_demotion else {
+            return messages.to_vec();
+        };
+        let Some(dir) = &self.journal_dir else {
+            return messages.to_vec();
+        };
+        let (view, offloads) = crate::agent::context_window::demote_stale_mechanism_messages(
+            messages,
+            spec.stale_min_turns,
+            spec.stale_min_bytes,
+        );
+        if offloads.is_empty() {
+            return view;
+        }
+        let tool_results = dir.join(TOOL_RESULTS_DIR);
+        if std::fs::create_dir_all(&tool_results).is_err() {
+            tracing::warn!("mechanism demotion aborted: tool_results dir unavailable");
+            return messages.to_vec();
+        }
+        for off in &offloads {
+            let path = tool_results.join(format!("{}.txt", off.ref_id));
+            if std::fs::write(&path, &off.content).is_err() {
+                tracing::warn!(ref_id = %off.ref_id, "mechanism demotion aborted: offload write failed");
                 return messages.to_vec();
             }
         }
@@ -5030,6 +5071,8 @@ impl AgentRunner {
                 // 陈旧工具结果降级声明沿链继承(与父 runner 同配方口径;
                 // None = 关闭,子代理行为零变化)
                 stale_demotion: assembly.stale_result_demotion().cloned(),
+                // 机制消息开关声明沿链继承(与父 runner 同配方口径;None = 关闭)
+                mechanism_demotion: assembly.mechanism_messages().cloned(),
                 token_counter: Some(chain_counter.clone()),
                 adjudicator: tokio::sync::Mutex::new(
                     crate::agent::adjudicator::AdjudicationChannel::new(
@@ -5364,8 +5407,8 @@ impl AgentRunner {
         // 回写持久化;被动裁剪换区后下标失真,不落账=等同现行为
         let send_view_pending;
         let mut messages_to_send = if let Some(ctx) = &self.context_window {
-            // 陈旧工具结果发送视图降级(发送视图变换;权威 messages 不动)
-            let demoted_view = self.apply_stale_demotion(messages);
+            // 发送视图降级链(β 陈旧工具结果 → γ 陈旧机制消息;权威 messages 不动)
+            let demoted_view = self.apply_mechanism_demotion(&self.apply_stale_demotion(messages));
             let mut trim_result = ctx.trim_detailed(&demoted_view);
             send_view_pending = trim_result.dropped.is_empty();
             if !trim_result.dropped.is_empty() {
@@ -5396,8 +5439,8 @@ impl AgentRunner {
             trim_result.messages
         } else {
             send_view_pending = true;
-            // 陈旧工具结果发送视图降级(发送视图变换;权威 messages 不动)
-            self.apply_stale_demotion(messages)
+            // 发送视图降级链(β 陈旧工具结果 → γ 陈旧机制消息;权威 messages 不动)
+            self.apply_mechanism_demotion(&self.apply_stale_demotion(messages))
         };
 
         // H1(自主交接设计):窗口余量信号行——每轮请求前按当前发送集计数,
@@ -9024,8 +9067,11 @@ impl AgentRunner {
                                                let messages_to_send = if let Some(ctx) = &runner.context_window {
                                                    // B21 D3:主动 compaction(阈值触发,先于被动 trim;
                                                    // None=未启用/未触发/无 summarizer——原消息直接走被动 trim)
-                                                   // 陈旧工具结果发送视图降级(发送视图变换;权威 messages 不动)
-                                                   let demoted_view = runner.apply_stale_demotion(&messages);
+                                                   // 发送视图降级链(β 陈旧工具结果 → γ 陈旧机制消息;
+                                                   // 发送视图变换;权威 messages 不动)
+                                                   let demoted_view = runner.apply_mechanism_demotion(
+                                                       &runner.apply_stale_demotion(&messages),
+                                                   );
                                                    let mut compaction_note: Option<(usize, usize, bool)> = None;
                                                    let mut trim_result = match runner
                                                        .active_compaction(
@@ -9042,7 +9088,10 @@ impl AgentRunner {
                                                                outcome.after_chars,
                                                                outcome.summary_generated,
                                                            ));
-                                                           let demoted_compacted = runner.apply_stale_demotion(&outcome.compacted);
+                                                           // 降级链同口径:β → γ(压缩产物同样两段变换)
+                                                           let demoted_compacted = runner.apply_mechanism_demotion(
+                                                               &runner.apply_stale_demotion(&outcome.compacted),
+                                                           );
                                                            ctx.trim_detailed(&demoted_compacted)
                                                        }
                                                        None => ctx.trim_detailed(&demoted_view),
