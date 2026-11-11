@@ -7074,6 +7074,193 @@ async fn tool_result_fetch_reaches_real_executor_via_service_pipeline() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---- 陈旧工具结果发送视图降级(发送视图变换,默认关闭) ----
+
+/// 降级测试历史(K=2/T=100 显式小值场景):
+/// 第一条工具结果(301 字节)其后有 3 条 Assistant(已消费+≥2 轮+超阈值)→ 应降级;
+/// 末尾近端工具结果(301 字节)其后无 Assistant(未消费)→ 同超阈值也不降级。
+fn stale_test_history() -> Vec<Message> {
+    use crate::agent::translator::ToolCall;
+    let long = "L".repeat(301);
+    vec![
+        Message::User {
+            content: "q".to_string(),
+            images: vec![],
+        },
+        Message::Assistant {
+            content: "thinking".to_string(),
+            tool_calls: Some(vec![ToolCall {
+                name: "grep_files".to_string(),
+                arguments: serde_json::json!({"q": "x"}),
+                id: None,
+            }]),
+        },
+        Message::Tool {
+            content: long,
+            tool_name: "grep_files".to_string(),
+            images: vec![],
+        },
+        Message::Assistant {
+            content: "a1".to_string(),
+            tool_calls: None,
+        },
+        Message::Assistant {
+            content: "a2".to_string(),
+            tool_calls: None,
+        },
+        Message::Assistant {
+            content: "fresh call".to_string(),
+            tool_calls: Some(vec![ToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({"p": "x"}),
+                id: None,
+            }]),
+        },
+        Message::Tool {
+            content: "F".repeat(301),
+            tool_name: "file_read".to_string(),
+            images: vec![],
+        },
+    ]
+}
+
+#[test]
+fn stale_demotion_disabled_view_is_byte_identical() {
+    // 默认关闭(None):发送视图与权威历史逐字节一致(序列化比对),不落任何文件
+    let dir = gate_temp_dir("stale-off");
+    let runner = gate_test_runner(&dir);
+    assert!(runner.stale_demotion.is_none(), "默认构造=未启用");
+    let msgs = stale_test_history();
+    let snapshot = serde_json::to_string(&msgs).unwrap();
+    let view = runner.apply_stale_demotion(&msgs);
+    assert_eq!(
+        serde_json::to_string(&view).unwrap(),
+        snapshot,
+        "未启用=逐字节一致"
+    );
+    assert!(!dir.join("tool_results").exists(), "未启用不落盘");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stale_demotion_without_journal_dir_returns_original() {
+    // journal 目录未注入:即使声明开启也无落盘面,fail-soft 返回原视图
+    let mut runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    runner.stale_demotion = Some(crate::agent::assembly::StaleDemotionSpec {
+        min_turns: 2,
+        min_bytes: 100,
+    });
+    let msgs = stale_test_history();
+    let snapshot = serde_json::to_string(&msgs).unwrap();
+    let view = runner.apply_stale_demotion(&msgs);
+    assert_eq!(serde_json::to_string(&view).unwrap(), snapshot);
+}
+
+#[test]
+fn stale_demotion_enabled_replaces_stale_and_persists_fetchable_file() {
+    // 开启:视图内陈旧结果替换为占位块,权威 messages 原文不变,文件落盘存在,
+    // 经 execute_tool_result_fetch 按 ref_id 取回 digest 与占位块一致,
+    // journal 事件流无新增 Offloaded/Truncated 事件(降级路径禁写 journal)
+    let dir = gate_temp_dir("stale-on");
+    let mut runner = gate_test_runner(&dir);
+    runner.stale_demotion = Some(crate::agent::assembly::StaleDemotionSpec {
+        min_turns: 2,
+        min_bytes: 100,
+    });
+    runner.active_journal = Some(std::sync::Arc::new(
+        crate::agent::journal::JournalWriter::open(&dir, "s-stale1").unwrap(),
+    ));
+    let msgs = stale_test_history();
+    let authoritative_snapshot = serde_json::to_string(&msgs).unwrap();
+    let view = runner.apply_stale_demotion(&msgs);
+    // 权威历史零改动(账本原文不动)
+    assert_eq!(
+        serde_json::to_string(&msgs).unwrap(),
+        authoritative_snapshot,
+        "权威 messages 原文不变"
+    );
+    // 视图:消息条数不变;第一条工具结果已替换为占位块,近端工具结果保持原文
+    assert_eq!(view.len(), msgs.len(), "下标对齐保持");
+    let stale_idx = view
+        .iter()
+        .position(|m| matches!(m, Message::Tool { .. }))
+        .unwrap();
+    let original = match &msgs[stale_idx] {
+        Message::Tool { content, .. } => content.clone(),
+        other => panic!("expected Tool, got {other:?}"),
+    };
+    let ph = view[stale_idx].content();
+    assert!(ph.starts_with("[STALE_TOOL_RESULT]"), "占位块形态: {ph}");
+    let digest = crate::agent::journal::evorule_digest(&original);
+    let hex = digest.rsplit(':').next().unwrap();
+    let ref_id = format!("stale-{hex}");
+    assert!(ph.contains(&format!("ref_id: {ref_id}")));
+    assert!(ph.contains(&format!("digest: {digest}")));
+    let fresh_idx = view
+        .iter()
+        .rposition(|m| matches!(m, Message::Tool { .. }))
+        .unwrap();
+    assert_eq!(
+        view[fresh_idx].content(),
+        msgs[fresh_idx].content(),
+        "近端未消费结果不降级"
+    );
+    // 其余消息(含配对 Assistant)逐字节零改动
+    for i in 0..view.len() {
+        if i == stale_idx {
+            continue;
+        }
+        assert_eq!(
+            serde_json::to_string(&view[i]).unwrap(),
+            serde_json::to_string(&msgs[i]).unwrap(),
+            "消息 {i} 应零改动"
+        );
+    }
+    // 文件落盘存在且原文逐字节一致
+    let path = dir.join("tool_results").join(format!("{ref_id}.txt"));
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(written, original, "引用文件与原文逐字节一致");
+    // 经 execute_tool_result_fetch 按 ref_id 取回:digest/内容对账一致
+    let v = runner.execute_tool_result_fetch(&serde_json::json!({"ref_id": ref_id}));
+    assert!(v.get("error").is_none(), "取回不应报错: {v}");
+    assert_eq!(v["digest"], digest);
+    assert_eq!(v["content"], original);
+    // journal 事件流无新增 Offloaded/Truncated 事件
+    let jpath = crate::agent::journal::JournalWriter::path_for(&dir, "s-stale1");
+    let lines = crate::agent::journal::read_all(&jpath).unwrap();
+    assert!(
+        lines.iter().all(|l| !matches!(
+            &l.event,
+            crate::agent::journal::JournalEvent::ToolResultOffloaded { .. }
+                | crate::agent::journal::JournalEvent::ToolResultTruncated { .. }
+        )),
+        "降级路径禁写 journal 事件"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stale_demotion_write_failure_falls_back_to_original_view() {
+    // 落盘失败 fail-soft:整次变换放弃,返回原视图副本(逐字节一致)
+    let dir = gate_temp_dir("stale-fail");
+    let mut runner = gate_test_runner(&dir);
+    runner.stale_demotion = Some(crate::agent::assembly::StaleDemotionSpec {
+        min_turns: 2,
+        min_bytes: 100,
+    });
+    // tool_results 位置放普通文件 → create_dir_all 失败
+    std::fs::write(dir.join("tool_results"), b"not-a-dir").unwrap();
+    let msgs = stale_test_history();
+    let snapshot = serde_json::to_string(&msgs).unwrap();
+    let view = runner.apply_stale_demotion(&msgs);
+    assert_eq!(
+        serde_json::to_string(&view).unwrap(),
+        snapshot,
+        "落盘失败应放弃整次变换"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 心跳弃轮必须终结会话内在途的悬挂 io_request:
 /// 引擎反应器对 pending io 门控(新命令只入队不执行),弃轮若不
 /// 收敛悬挂请求,后续每一轮都会以同样的心跳死法循环。
