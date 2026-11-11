@@ -2140,3 +2140,85 @@ async fn test_streaming_cancel_during_tool_wait_ends_turn_promptly() {
         "cancelled turn must be non-success: {result:?}"
     );
 }
+/// 入场券（run_streaming 在 ask_user 澄清等待期收到
+/// cancel，必须立刻收束回合——修复前 resolve_ask_user 直 await 无 cancel
+/// 臂，取消要等澄清窗超时才生效。
+#[tokio::test]
+async fn test_streaming_cancel_during_ask_user_wait_ends_turn_promptly() {
+    let mut server = Server::new_async().await;
+    let sse = sse_line(&io_request(
+        1,
+        "call_service",
+        json!({
+            "tool_name": "ask_user",
+            "args": {
+                "question": "which way?",
+                "options": ["a", "b"],
+                "multi_select": false,
+                "timeout_secs": 300
+            }
+        }),
+    ));
+    mock_evorule_base(&mut server, "777", sse).await;
+
+    // 阻塞 callback=真实等待形态(缺位会走「立即无人态」短路,红测失效)
+    struct BlockingAsk;
+    #[async_trait::async_trait]
+    impl evo_agent::builtin_tools::ask_user::AskUserCallback for BlockingAsk {
+        async fn request_answer(
+            &self,
+            _query: &evo_agent::builtin_tools::ask_user::AskUserQuery,
+        ) -> evo_agent::builtin_tools::ask_user::AskUserAnswer {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            evo_agent::builtin_tools::ask_user::AskUserAnswer {
+                answer: vec![],
+                answered_by: "auto".to_string(),
+                verified: true,
+                timed_out: true,
+            }
+        }
+    }
+
+    let client = EvoruleApiClient::new(&server.url());
+    let mut tools: BTreeMap<String, Arc<dyn ToolFunction>> = BTreeMap::new();
+    tools.insert(
+        "ask_user".to_string(),
+        Arc::new(evo_agent::builtin_tools::ask_user::AskUserTool::new()),
+    );
+    let runner = AgentRunner::new(AgentConfig::default(), client)
+        .with_tool_handler(evo_agent::io_handlers::ToolHandler::with_functions(tools))
+        .with_ask_user_callback(Arc::new(BlockingAsk));
+
+    // 与 serve 同手法：move 前提取 cancel token 克隆
+    let cancel = runner.cancel_token().clone();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        let mut stream = runner.run_streaming("Do the task".to_string(), Vec::new());
+        while let Some(item) = stream.next().await {
+            if let Ok(evo_agent::agent::runner::AgentEvent::Done(r)) = item {
+                let _ = tx.send(r).await;
+                break;
+            }
+        }
+    });
+
+    // 等澄清卡真正打开（AskUser 事件驱动；轮询窗口 5s）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let _ = deadline;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    // 澄清等待期发起中断
+    cancel.cancel();
+
+    // 修复前：回合要等 300s 澄清窗超时才出 Done —— 本断言窗（8s）必红
+    let result = tokio::time::timeout(std::time::Duration::from_secs(8), rx.recv())
+        .await
+        .expect("cancel during ask_user wait must end the turn promptly (8s)")
+        .expect("consumer task must deliver a Done");
+    assert!(
+        !result.success,
+        "cancelled turn must be non-success: {result:?}"
+    );
+}

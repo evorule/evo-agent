@@ -10945,9 +10945,18 @@ impl AgentRunner {
                                                                warn!(%session_id, error = %e, "question_requested journal failed");
                                                            }
                                                        }
-                                                       let res = runner
-                                                           .resolve_ask_user(&session_id, &args, query, journal.as_deref())
-                                                           .await;
+                                                       let res = tokio::select! {
+                                                           biased;
+                                                           r = runner
+                                                               .resolve_ask_user(&session_id, &args, query, journal.as_deref()) => r,
+                                                           _ = cancel_token.cancelled() => {
+                                                               // 取消路径:ask_user 等待同样挂 cancel——
+                                                               // 哨兵 Err 走既有 Err 臂 cancelled 分支收尾
+                                                               Err(AgentError::Internal(
+                                                                   "cancelled by user".to_string(),
+                                                               ))
+                                                           }
+                                                       };
                                                        if let Ok((_, label)) = &res {
                                                            yield Ok(AgentEvent::AskUserResult {
                                                                answered: label == "answered",

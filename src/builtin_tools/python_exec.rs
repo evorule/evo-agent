@@ -125,9 +125,13 @@ impl ToolFunction for PythonExecTool {
             // output() 全量形态字节一致(分段 read 只改读取节拍不改内容)
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
+            // 取消路径:future 被弃(回合取消)→杀子进程(缺省非 kill_on_drop
+            // 会把 python 留成脱管孤儿);绑定摘除由 guard 兜底(与显式 unbind 幂等)
+            cmd.kill_on_drop(true);
             let mut child = cmd.spawn().map_err(|e| format!("spawn python 失败: {e}"))?;
             let pid = child.id().unwrap_or(0);
             crate::builtin_tools::shell_exec::bind_pid(pid);
+            let _pid_guard = crate::builtin_tools::shell_exec::PidUnbindGuard(pid);
             let mut so = child.stdout.take();
             let mut se = child.stderr.take();
             let (stdout_buf, stderr_buf, status) = tokio::join!(
@@ -145,7 +149,7 @@ impl ToolFunction for PythonExecTool {
                 },
                 child.wait(),
             );
-            crate::builtin_tools::shell_exec::unbind_pid(pid);
+            // 显式 unbind 已由 _pid_guard 兜底承担(幂等)
             let status = status.map_err(|e| format!("wait python 失败: {e}"))?;
             std::process::Output {
                 status,
@@ -262,6 +266,63 @@ async fn drain_tapped<S: tokio::io::AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
+
+    /// 取消路径:future 被弃（回合取消）→ python 子进程必须被杀
+    /// （kill_on_drop）。started 标记证明 python 真跑起来了；done 标记在
+    /// 弃置后不得出现（修复前=脱管存活会写出）。
+    #[tokio::test]
+    async fn test_cancel_drop_kills_python_child() {
+        use serde_json::json;
+        let tool = PythonExecTool::new();
+        let dir = std::env::temp_dir();
+        let tag = format!("b286-{}", std::process::id());
+        let started = dir.join(format!("{}-started.marker", tag));
+        let done = dir.join(format!("{}-done.marker", tag));
+        let _ = std::fs::remove_file(&started);
+        let _ = std::fs::remove_file(&done);
+        let s = started.to_string_lossy().replace('\\', "/");
+        let d = done.to_string_lossy().replace('\\', "/");
+        let code = format!(
+            "import time
+open(r\"{}\", \"w\").write(\"on\")
+time.sleep(6)
+open(r\"{}\", \"w\").write(\"done\")
+",
+            s, d
+        );
+        let args = json!({"code": code});
+        // owned future 与 started 轮询赛跑(与生产形态同构:工具 future 挂在
+        // runner select 里,弃置=取消路径)
+        let mut fut = Box::pin(tool.call(&args));
+        let poll_started = async {
+            loop {
+                if started.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        };
+        tokio::pin!(poll_started);
+        tokio::select! {
+            r = &mut fut => {
+                panic!("tool returned before cancel-check: {r:?}");
+            }
+            _ = &mut poll_started => {
+                // python 真启动(started 标记在位)
+            }
+        }
+        // 弃置 future(=取消路径) → kill_on_drop 应杀子进程
+        drop(fut);
+        // python 原计划 6s 后写 done 标记；给足 10s 观察窗
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        assert!(
+            !done.exists(),
+            "python child must be killed when the tool future is dropped"
+        );
+        let _ = std::fs::remove_file(&started);
+        let _ = std::fs::remove_file(&done);
+    }
+
     use super::*;
 
     /// G1:Workbench 缺省出提案(candidate 全审批历史行为)

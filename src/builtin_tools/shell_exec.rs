@@ -739,6 +739,14 @@ pub fn bind_pid(pid: u32) {
     }
 }
 
+/// pid 绑定守卫:丢弃即摘除(取消/弃置路径兜底;与显式 unbind 幂等)
+pub struct PidUnbindGuard(pub u32);
+impl Drop for PidUnbindGuard {
+    fn drop(&mut self) {
+        unbind_pid(self.0);
+    }
+}
+
 /// 进程结束:摘除 pid 绑定(执行体自有的读循环收束后调用)
 pub fn unbind_pid(pid: u32) {
     if let Ok(mut active) = TAP_ACTIVE.lock() {
