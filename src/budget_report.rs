@@ -170,6 +170,7 @@ mod tests {
                 prompt: t,
                 completion: 0,
                 total: t,
+                cached: None,
             });
             w.llm_called_react("m", None, tokens, *est, 3, "r", None)
                 .unwrap();

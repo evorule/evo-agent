@@ -750,6 +750,7 @@ mod tests {
                         prompt: 10,
                         completion: 5,
                         total: 15,
+                        cached: None,
                     }),
                 ))
             }
@@ -805,6 +806,7 @@ mod tests {
                     prompt: 10,
                     completion: 5,
                     total: 15,
+                    cached: None,
                 }),
             ))
         };

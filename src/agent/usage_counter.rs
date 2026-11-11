@@ -12,7 +12,8 @@
 //! - 配对口径：`observe` 的真值为 prompt+completion 全量，而近似侧计数的是
 //!   发送前的消息列表（≈prompt），比率略有高估 → 裁剪偏保守（提前触发），
 //!   属安全方向偏差；
-//! - `snapshot` 输出累计三元组（journal `TokenRecord` 同型），供收尾输出面消费。
+//! - `snapshot` 输出累计四元组（journal `TokenRecord` 同型；cached 可空——
+//!   provider 未回执时为 None），供收尾输出面消费。
 //!
 //! 线程安全：全部状态经 Mutex 内聚，`observe` 可在任意 LLM 响应点调用。
 
@@ -69,9 +70,14 @@ impl UsageAwareTokenCounter {
         g.cumulative.prompt += usage.prompt_tokens as u64;
         g.cumulative.completion += usage.completion_tokens as u64;
         g.cumulative.total += usage.total_tokens as u64;
+        // 缓存命中累计:provider 回执 Some 才累加;None 不清空已累计真值
+        // (fail-soft 如实——未回执 ≠ 零命中,不抹平已记账面也不编造 0)
+        if let Some(v) = usage.cached_tokens {
+            g.cumulative.cached = Some(g.cumulative.cached.unwrap_or(0) + v as u64);
+        }
     }
 
-    /// 累计三元组快照（输出面消费；journal TokenRecord 复用类型）
+    /// 累计四元组快照（输出面消费；journal TokenRecord 复用类型）
     pub fn snapshot(&self) -> TokenRecord {
         self.inner
             .lock()
@@ -136,6 +142,15 @@ mod tests {
         }
     }
 
+    fn usage_with_cached(prompt: usize, completion: usize, cached: Option<usize>) -> TokenUsage {
+        TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            cached_tokens: cached,
+        }
+    }
+
     /// 冷启动回落：未 observe 时与 fallback 近似计数逐值一致
     #[test]
     fn cold_start_falls_back_to_approx() {
@@ -176,6 +191,40 @@ mod tests {
         assert_eq!(snap.prompt, 250);
         assert_eq!(snap.completion, 50);
         assert_eq!(snap.total, 300);
+    }
+
+    /// 缓存命中累计:provider 回执 Some 时按分量累加,snapshot 携带真值
+    #[test]
+    fn cached_accumulates_when_reported() {
+        let counter = UsageAwareTokenCounter::new_fallback(Box::new(ApproxTokenCounter::new()));
+        counter.observe(&usage_with_cached(100, 20, Some(60)));
+        counter.observe(&usage_with_cached(150, 30, Some(40)));
+        let snap = counter.snapshot();
+        assert_eq!(snap.prompt, 250);
+        assert_eq!(snap.total, 300);
+        assert_eq!(snap.cached, Some(100), "缓存命中按回执累加");
+    }
+
+    /// 缓存命中未回执(None):不清空已累计真值(fail-soft 如实——未回执 ≠ 零命中,
+    /// 不得把已记账面抹平,也不编造 0)
+    #[test]
+    fn cached_none_keeps_accumulated_truth() {
+        let counter = UsageAwareTokenCounter::new_fallback(Box::new(ApproxTokenCounter::new()));
+        counter.observe(&usage_with_cached(100, 20, Some(60)));
+        counter.observe(&usage_with_cached(50, 10, None));
+        assert_eq!(
+            counter.snapshot().cached,
+            Some(60),
+            "None 不得清空已累计缓存真值"
+        );
+    }
+
+    /// 从未回执缓存:快照 cached 恒 None,不编造
+    #[test]
+    fn cached_absent_stays_none() {
+        let counter = UsageAwareTokenCounter::new_fallback(Box::new(ApproxTokenCounter::new()));
+        counter.observe(&usage(100, 20));
+        assert_eq!(counter.snapshot().cached, None);
     }
 
     /// 线程安全：并发 observe 与 count 不死锁不撕裂（CI 常开）

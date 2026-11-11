@@ -70,8 +70,9 @@ pub struct BudgetCountersSnapshot {
     pub tokens_used: u64,
 }
 
-/// token 计数三元组(provider 真值 `LlmResponse.token_usage` 映射;
-/// 估算 fallback 存总量,导出期按 7:3 拆分——ATIF 映射表 §四.3)
+/// token 计数四元组(provider 真值 `LlmResponse.token_usage` 映射;cached
+/// 可空——provider 未回执或旧账为 None;估算 fallback 存总量,导出期按
+/// 7:3 拆分——ATIF 映射表 §四.3)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TokenRecord {
     /// 输入 token(累计发送至模型的输入)
@@ -80,6 +81,10 @@ pub struct TokenRecord {
     pub completion: u64,
     /// 总量(prompt + completion,provider 口径)
     pub total: u64,
+    /// 缓存命中输入 token(provider 回执 cached_tokens 累计;None=provider
+    /// 未回执或旧账)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached: Option<u64>,
 }
 
 /// todo 清单条目快照(todo_updated 事件载荷;与 builtin_tools::todo::TodoItem
@@ -3626,6 +3631,33 @@ mod tests {
         assert_eq!(w.lines_since_anchor(), 0);
     }
 
+    /// TokenRecord.cached additive 兼容面:旧账面(无 cached 键)反序列化零
+    /// 破坏 → None;None 序列化跳键(与旧形状逐字节一致);Some 值 round-trip 保真
+    #[test]
+    fn token_record_cached_additive_compat() {
+        let old = r#"{"prompt":100,"completion":50,"total":150}"#;
+        let rec: TokenRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(rec.cached, None, "旧账面无缓存键 → None");
+        let ser = serde_json::to_string(&TokenRecord::default()).unwrap();
+        assert_eq!(
+            ser, r#"{"prompt":0,"completion":0,"total":0}"#,
+            "None 必须跳键,缺省账面与旧形状逐字节一致"
+        );
+        let hit = TokenRecord {
+            prompt: 100,
+            completion: 50,
+            total: 150,
+            cached: Some(80),
+        };
+        let ser_hit = serde_json::to_string(&hit).unwrap();
+        assert_eq!(
+            ser_hit, r#"{"prompt":100,"completion":50,"total":150,"cached":80}"#,
+            "Some 值序列化携带 cached 键"
+        );
+        let de: TokenRecord = serde_json::from_str(&ser_hit).unwrap();
+        assert_eq!(de, hit, "Some 值 round-trip 保真");
+    }
+
     #[test]
     fn roundtrip_all_14_events() {
         let events = vec![
@@ -3641,6 +3673,7 @@ mod tests {
                     prompt: 100,
                     completion: 50,
                     total: 150,
+                    cached: None,
                 }),
                 tokens_est: Some(160),
                 request: 7,
