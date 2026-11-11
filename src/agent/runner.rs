@@ -8327,8 +8327,13 @@ impl AgentRunner {
                                    .i2_lexicon
                                    .clone()
                                    .unwrap_or_default();
+                               // γ 批 B-268:I2 扫描扩为跨消息口径——机制消息与
+                               // system 按序拼接扫描(关闭态机制消息空 = 现行为)
+                               let mechanism_for_scan: Vec<String> =
+                                   mechanism_message.iter().cloned().collect();
                                let mut conflicts = crate::agent::context_inspector::inspect_system_sections_with(
                                    &system_prompt,
+                                   &mechanism_for_scan,
                                    &tokens,
                                    &lexicon,
                                );
