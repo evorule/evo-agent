@@ -394,26 +394,21 @@ fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
-/// 分区切分:按机制标记首次出现位置切段;首个标记前的文本=基底段
-/// (含 F-101 身份段);返回有序 (分区名, 文本) 表,标记未出现则跳过。
-fn split_sections(system_prompt: &str) -> Vec<(String, String)> {
+/// 分区切分(带起始偏移版,γ 批 B-268 跨消息归因消费):按机制标记首次
+/// 出现位置切段;首个标记前的文本=基底段(含 F-101 身份段);返回有序
+/// (起始偏移, 分区名, 文本) 表,标记未出现则跳过。
+fn split_sections_with_pos(text: &str) -> Vec<(usize, String, String)> {
     let mut cuts: Vec<(usize, &str)> = MECHANISM_SECTION_MARKERS
         .iter()
-        .filter_map(|m| system_prompt.find(m).map(|p| (p, *m)))
+        .filter_map(|m| text.find(m).map(|p| (p, *m)))
         .collect();
     cuts.sort_by_key(|(p, _)| *p);
     let mut out = Vec::with_capacity(cuts.len() + 1);
-    let base_end = cuts.first().map(|(p, _)| *p).unwrap_or(system_prompt.len());
-    out.push((
-        "(基底段)".to_string(),
-        system_prompt[..base_end].to_string(),
-    ));
+    let base_end = cuts.first().map(|(p, _)| *p).unwrap_or(text.len());
+    out.push((0, "(基底段)".to_string(), text[..base_end].to_string()));
     for (i, (start, marker)) in cuts.iter().enumerate() {
-        let end = cuts
-            .get(i + 1)
-            .map(|(p, _)| *p)
-            .unwrap_or(system_prompt.len());
-        out.push((marker.to_string(), system_prompt[*start..end].to_string()));
+        let end = cuts.get(i + 1).map(|(p, _)| *p).unwrap_or(text.len());
+        out.push((*start, marker.to_string(), text[*start..end].to_string()));
     }
     out
 }
@@ -452,23 +447,52 @@ fn first_line_with(text: &str, token: &str) -> Option<String> {
         .map(|l| truncate_chars(l.trim(), EXCERPT_MAX_CHARS))
 }
 
-/// F-905 I2 检查器(初版):对组装完成的 system 文本做分区间字面级冲突扫描。
-/// `capability_tokens` = 声明能力名(工具名/skill 名);返回冲突报告(空=无冲突)。
+/// F-905 I2 检查器(初版):对组装完成的 system 文本与机制消息做分区间
+/// 字面级冲突扫描(γ 批 B-268 扩签名:机制消息按序拼接扫描,哨兵匹配语义
+/// 与嵌入态一致,标记可横跨拼接缝;分区归因带来源标签,冲突可定位到
+/// 具体机制消息)。`capability_tokens` = 声明能力名(工具名/skill 名);
+/// 返回冲突报告(空=无冲突)。
 pub fn inspect_system_sections(
-    system_prompt: &str,
+    system: &str,
+    mechanism: &[String],
     capability_tokens: &[String],
 ) -> Vec<I2ConflictRecord> {
-    inspect_system_sections_with(system_prompt, capability_tokens, &I2Lexicon::builtin())
+    inspect_system_sections_with(system, mechanism, capability_tokens, &I2Lexicon::builtin())
 }
 
 /// 同上（数据化入参版）：词表由调用方注入（definition.i2_lexicon 声明
 /// 覆盖,或机制内建 v2 表）。
 pub fn inspect_system_sections_with(
-    system_prompt: &str,
+    system: &str,
+    mechanism: &[String],
     capability_tokens: &[String],
     lexicon: &I2Lexicon,
 ) -> Vec<I2ConflictRecord> {
-    let sections = split_sections(system_prompt);
+    // 跨消息拼接(不加分隔符:机制消息内容物嵌入态原样紧随 system 尾段,
+    // 横跨拼接缝的哨兵与嵌入态同语义);来源标签按分区起始偏移定位——
+    // 起点落在哪条消息的区间,归因即该消息(横跨缝的分区归 system 侧)
+    let mut combined = system.to_string();
+    let mut bounds: Vec<(usize, String)> = vec![(0, String::new())];
+    for (i, msg) in mechanism.iter().enumerate() {
+        bounds.push((combined.len(), format!("(机制消息#{i})")));
+        combined.push_str(msg);
+    }
+    let sections: Vec<(String, String)> = split_sections_with_pos(&combined)
+        .into_iter()
+        .map(|(start, name, text)| {
+            let suffix = bounds
+                .iter()
+                .rev()
+                .find(|(s, _)| start >= *s)
+                .map(|(_, label)| label.as_str())
+                .unwrap_or("");
+            if suffix.is_empty() {
+                (name, text)
+            } else {
+                (format!("{name}{suffix}"), text)
+            }
+        })
+        .collect();
     let prohibition: Vec<&str> = lexicon.prohibition.iter().map(String::as_str).collect();
     let affirmation: Vec<&str> = lexicon.affirmation.iter().map(String::as_str).collect();
     let mut out = Vec::new();
@@ -514,21 +538,21 @@ mod tests {
     #[test]
     fn split_sections_base_and_markers() {
         let sp = "你是助手。\n\n## Stable Facts\n- a\n\n【能力边界声明】\n- b";
-        let secs = split_sections(sp);
-        assert_eq!(secs[0].0, "(基底段)");
-        assert!(secs[0].1.starts_with("你是助手"));
-        assert!(secs.iter().any(|(n, _)| n == "## Stable Facts"));
-        assert!(secs.iter().any(|(n, _)| n == "【能力边界声明】"));
+        let secs = split_sections_with_pos(sp);
+        assert_eq!(secs[0].1, "(基底段)");
+        assert!(secs[0].2.starts_with("你是助手"));
+        assert!(secs.iter().any(|(_, n, _)| n == "## Stable Facts"));
+        assert!(secs.iter().any(|(_, n, _)| n == "【能力边界声明】"));
         // 无标记文本 = 仅基底段
-        let only_base = split_sections("plain prompt");
+        let only_base = split_sections_with_pos("plain prompt");
         assert_eq!(only_base.len(), 1);
-        assert_eq!(only_base[0].0, "(基底段)");
+        assert_eq!(only_base[0].1, "(基底段)");
     }
 
     #[test]
     fn deny_vs_capability_conflict_reported() {
         let sp = "你是助手。禁止使用 web_search 工具。\n\n【能力边界声明】\n可用工具:web_search、file_read";
-        let r = inspect_system_sections(sp, &["web_search".to_string()]);
+        let r = inspect_system_sections(sp, &[], &["web_search".to_string()]);
         assert_eq!(r.len(), 1, "{r:?}");
         assert_eq!(r[0].kind, "deny_vs_capability");
         assert_eq!(r[0].token, "web_search");
@@ -541,7 +565,7 @@ mod tests {
     #[test]
     fn deny_vs_affirmation_conflict_reported() {
         let sp = "你可以使用 git_push 完成任务。\n\n## Stable Facts\n- 禁止使用 git_push(治理裁定)";
-        let r = inspect_system_sections(sp, &["git_push".to_string()]);
+        let r = inspect_system_sections(sp, &[], &["git_push".to_string()]);
         assert_eq!(r.len(), 1, "{r:?}");
         assert_eq!(r[0].kind, "deny_vs_affirmation");
         assert_eq!(r[0].section_a, "## Stable Facts");
@@ -551,15 +575,15 @@ mod tests {
     #[test]
     fn clean_system_no_conflicts() {
         let sp = "你可以使用 file_read。\n\n## Stable Facts\n- file_read 常用只读工具\n\n【能力边界声明】\n可用工具:file_read";
-        let r = inspect_system_sections(sp, &["file_read".to_string()]);
+        let r = inspect_system_sections(sp, &[], &["file_read".to_string()]);
         assert!(r.is_empty(), "{r:?}");
     }
 
     #[test]
     fn deterministic_same_input_same_report() {
         let sp = "禁止使用 web_search。\n\n【能力边界声明】\n- web_search";
-        let a = inspect_system_sections(sp, &["web_search".to_string()]);
-        let b = inspect_system_sections(sp, &["web_search".to_string()]);
+        let a = inspect_system_sections(sp, &[], &["web_search".to_string()]);
+        let b = inspect_system_sections(sp, &[], &["web_search".to_string()]);
         assert_eq!(a, b);
     }
 
@@ -572,8 +596,12 @@ mod tests {
 
 【能力边界声明】
 可用工具:web_search";
-        let r =
-            inspect_system_sections_with(sp, &["web_search".to_string()], &I2Lexicon::builtin());
+        let r = inspect_system_sections_with(
+            sp,
+            &[],
+            &["web_search".to_string()],
+            &I2Lexicon::builtin(),
+        );
         assert_eq!(r.len(), 1, "{r:?}");
         assert!(r[0].excerpt_a.contains("Never"), "{r:?}");
 
@@ -581,8 +609,12 @@ mod tests {
 
 ## Stable Facts
 - 推荐 git_push 做推送";
-        let r2 =
-            inspect_system_sections_with(sp2, &["git_push".to_string()], &I2Lexicon::builtin());
+        let r2 = inspect_system_sections_with(
+            sp2,
+            &[],
+            &["git_push".to_string()],
+            &I2Lexicon::builtin(),
+        );
         assert_eq!(r2.len(), 1, "must not × 推荐配对: {r2:?}");
     }
 
@@ -593,7 +625,8 @@ mod tests {
 
 【能力边界声明】
 - scanner";
-        let r = inspect_system_sections_with(sp, &["scanner".to_string()], &I2Lexicon::builtin());
+        let r =
+            inspect_system_sections_with(sp, &[], &["scanner".to_string()], &I2Lexicon::builtin());
         assert!(r.is_empty(), "无禁令=无配对(内嵌词形不伪命中): {r:?}");
     }
 
@@ -604,8 +637,12 @@ mod tests {
 
 【能力边界声明】
 - web_search";
-        let r =
-            inspect_system_sections_with(sp, &["web_search".to_string()], &I2Lexicon::builtin());
+        let r = inspect_system_sections_with(
+            sp,
+            &[],
+            &["web_search".to_string()],
+            &I2Lexicon::builtin(),
+        );
         assert_eq!(r.len(), 1, "24 字符窗口检出长距英文禁令: {r:?}");
     }
 
@@ -620,21 +657,23 @@ mod tests {
 
 【能力边界声明】
 - web_search";
-        let r = inspect_system_sections_with(sp, &["web_search".to_string()], &custom);
+        let r = inspect_system_sections_with(sp, &[], &["web_search".to_string()], &custom);
         assert_eq!(r.len(), 1, "自定义词形配对: {r:?}");
         // 内建词形在覆盖后失效
         let sp2 = "禁止使用 web_search。
 
 【能力边界声明】
 - web_search";
-        assert!(inspect_system_sections_with(sp2, &["web_search".to_string()], &custom).is_empty());
+        assert!(
+            inspect_system_sections_with(sp2, &[], &["web_search".to_string()], &custom).is_empty()
+        );
     }
 
     #[test]
     fn multibyte_window_no_panic() {
         // 禁令词与 token 间含多字节中文——窗口裁剪须走字符边界
         let sp = "治理裁定:根据规约禁止调用 git_push 命令。\n\n## Stable Facts\n- 推荐使用 git_push 做推送";
-        let r = inspect_system_sections(sp, &["git_push".to_string()]);
+        let r = inspect_system_sections(sp, &[], &["git_push".to_string()]);
         assert_eq!(r.len(), 1, "{r:?}");
     }
     // ===== 语义精判(两级通路第二级) =====
@@ -832,6 +871,61 @@ mod tests {
                     && tokens.as_ref().map(|t| t.total) == Some(15)
         );
         assert!(ok, "LlmCalled(i2_semantic) 含 token 账面");
+    }
+
+    // ===== 批 B-268 γ-2:哨兵跨消息扫描(机制消息入参) =====
+
+    /// 机制消息分区纳入扫描:禁令(system 基底)×声明(机制消息记忆分区)
+    /// 跨消息冲突照常检出,归因名带来源标签定位具体消息
+    #[test]
+    fn mechanism_message_section_conflict_reported_with_attribution() {
+        let sp = "你是助手。禁止使用 web_search 工具。";
+        let mech = vec!["## Stable Facts\n- 允许使用 web_search".to_string()];
+        let r = inspect_system_sections(sp, &mech, &["web_search".to_string()]);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].kind, "deny_vs_affirmation");
+        assert_eq!(r[0].section_a, "(基底段)");
+        assert_eq!(r[0].section_b, "## Stable Facts(机制消息#0)");
+        assert!(r[0].excerpt_b.contains("允许"), "{:?}", r[0].excerpt_b);
+    }
+
+    /// 逐消息归因:两条机制消息各携不同分区,冲突定位到具体消息序号
+    /// (同标记跨消息按首现归段 = 嵌入态切分语义,γ-3 只保最新一条后
+    /// 重复标记为非产线场景)
+    #[test]
+    fn mechanism_message_attribution_points_to_index() {
+        let sp = "禁止使用 git_push。";
+        let mech = vec![
+            "## Stable Facts\n- 无关内容".to_string(),
+            "## Relevant Events\n- 允许使用 git_push".to_string(),
+        ];
+        let r = inspect_system_sections(sp, &mech, &["git_push".to_string()]);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].section_b, "## Relevant Events(机制消息#1)");
+    }
+
+    /// 拼接边界:标记横跨 system 尾段与机制消息头段(「## Stable」+「 Facts」)
+    /// 仍按单分区匹配——拼接扫描语义与嵌入态一致;分区起点在 system 侧,
+    /// 归因不加机制消息标签
+    #[test]
+    fn marker_spanning_seam_matches_as_one_section() {
+        let sp = "禁止使用 web_search。\n\n## Stable";
+        let mech = vec![" Facts\n- 允许使用 web_search".to_string()];
+        let r = inspect_system_sections(sp, &mech, &["web_search".to_string()]);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].section_b, "## Stable Facts");
+        assert!(r[0].excerpt_b.contains("允许"), "{:?}", r[0].excerpt_b);
+    }
+
+    /// 空机制消息入参 = 现行为(单字符串扫描语义逐结果一致)
+    #[test]
+    fn empty_mechanism_slice_matches_legacy_single_string() {
+        let sp = "你可以使用 file_read。\n\n## Stable Facts\n- 禁止使用 file_read 之外的能力";
+        let legacy = inspect_system_sections(sp, &[], &["file_read".to_string()]);
+        assert_eq!(legacy.len(), 1, "{legacy:?}");
+        assert_eq!(legacy[0].kind, "deny_vs_affirmation");
+        assert_eq!(legacy[0].section_a, "## Stable Facts");
+        assert_eq!(legacy[0].section_b, "(基底段)");
     }
 }
 
