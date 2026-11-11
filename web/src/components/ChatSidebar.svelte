@@ -697,10 +697,11 @@
     refreshResumeBanner();
   });
 
-  // ---- 回合内过程容器(项目方令):思考与工具调用收进一个框 ----
-  // 回合进行中=框内实时展开(左缘品牌色+「进行中」标);正文/回答气泡抵达
-  // 即整框自动折叠成一行(约一行字高);点击头部展开,再点收起。开合状态
-  // 按组键记忆,用户手动开合覆写默认。
+  // ---- 回合内过程容器(项目方令;2026-11-11 用户令改策):思考与工具调用
+  // 收进一个框,运行中与已闭合一律**默认折叠成一行**(单行自带步数/用时/
+  // 最新动作摘要,运行中另有「进行中」标)——长回合 agentic 场景步级明细
+  // 铺满页面且批准审批卡后仍持续铺开,故运行中不再默认展开。点击头部展开,
+  // 再点收起;开合状态按组键记忆,跨重渲染(含审批卡交互)保持。
   const expandedGroups = new SvelteSet();
   // 回合布局纯函数(归组/回答提取/回执折叠阈值)在 lib/chat-layout.js,vitest 锁;
   // 组件只持交互态(手动开合覆写自动折叠缺省)。轮次收尾后,末尾未闭合段
@@ -710,6 +711,17 @@
     if ($turnActive) return groups;
     return groups.map((g) => (g.type === 'process' && !g.closed ? { ...g, closed: true } : g));
   });
+  /** 折叠单行的最新动作摘要:取末条工具名+命令头(思考块/回执聚合出工具名) */
+  function processPreviewLabel(m) {
+    if (!m) return '';
+    if (m.kind === 'assistant') return '';
+    if (m.toolName) {
+      const extra = m.command ? String(m.command).slice(0, 60) : '';
+      return extra ? `${m.toolName} ${extra}` : m.toolName;
+    }
+    return '';
+  }
+
   function toggleGroup(key) {
     if (expandedGroups.has(key)) expandedGroups.delete(key);
     else expandedGroups.add(key);
@@ -1995,11 +2007,13 @@
 
     {#each turnLayout as g (g.key)}
       {#if g.type === 'process'}
-        {@const open = g.closed ? expandedGroups.has(g.key) : !expandedGroups.has(g.key)}
+        {@const open = expandedGroups.has(g.key)}
+        {@const preview = processPreviewLabel(g.items[g.items.length - 1])}
         <div class="process-box" class:live={!g.closed}>
           <button type="button" class="process-head" onclick={() => toggleGroup(g.key)}>
             <span class="tool-chev" class:rot={open}>▸</span>
             <span>{t('过程（{n} 步{took} · 思考与工具调用）', { n: g.steps ?? g.items.length, took: g.tookMs ? ` · ${formatTook(g.tookMs)}` : '' })}</span>
+            {#if preview}<span class="process-preview mono" title={preview}>{preview}</span>{/if}
             {#if !g.closed}<span class="process-live">{t('· 进行中')}</span>{/if}
           </button>
           {#if open}
@@ -3036,7 +3050,16 @@
     text-align: left;
     user-select: none;
   }
+  .process-preview {
+    margin-left: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    opacity: 0.85;
+  }
   .process-head:hover {
+
     background: var(--bg-hover);
     color: var(--text-secondary);
   }
