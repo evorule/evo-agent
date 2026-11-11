@@ -24,7 +24,7 @@ use crate::agent::approval::{
     ApprovalRequest,
 };
 use crate::agent::callback::CallbackChain;
-use crate::agent::context_window::{ContextWindowManager, TrimStrategy};
+use crate::agent::context_window::{sanitize_ref_segment, ContextWindowManager, TrimStrategy};
 use crate::agent::journal::REWIND_BUDGET_LIMIT;
 use crate::builtin_tools::ask_user::{
     parse_ask_user_query, AskUserCallback, AskUserQuery, ASK_USER_TOOL,
@@ -143,24 +143,6 @@ const TOOL_RESULTS_DIR: &str = "tool_results";
 const TOOL_RESULT_FETCH_TOOL: &str = "tool_result_fetch";
 /// 取回单窗缺省 chars(上限=引用化阈值 tool_result_max_chars,窗口不二次引用化)
 const TOOL_RESULT_FETCH_DEFAULT_CHARS: usize = 20000;
-/// ref_id 段字符白名单(文件名安全;其余替换下划线)
-fn sanitize_ref_segment(call_id: &str) -> String {
-    let cleaned: String = call_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let mut s: String = cleaned.chars().take(80).collect();
-    if s.is_empty() {
-        s.push_str("call");
-    }
-    s
-}
 
 /// 构造超大工具结果的引用块(纯函数;LLM 可见面)。原文完整保留在引用文件,
 /// messages/会话记忆只携带本块:指纹可验证、头尾可判性、按 ref_id 可取回。
@@ -1419,6 +1401,10 @@ pub struct AgentRunner {
     assembly: crate::agent::assembly::AssemblyExecutor,
     /// 工具输出回喂字符上限(配方 budget.tool_result_max_chars;默认 48000)
     tool_result_max_chars: usize,
+    /// 陈旧工具结果发送视图降级声明(None = 默认关闭——发送视图与现行为
+    /// 逐字节一致;Some = 历史中已消费的陈旧工具结果在发送视图降级为占位块,
+    /// 原文落盘 tool_results 供 tool_result_fetch 取回,账本原文不动)
+    stale_demotion: Option<crate::agent::assembly::StaleDemotionSpec>,
     /// plan-execute tokens 埋点累加器（纲领 §8 Phase 2 交付物 7，None = 不埋点）
     ///
     /// 由 [`DelegateContext::with_token_counter`] 注入并随每个子 runner 共享
@@ -1635,6 +1621,7 @@ impl AgentRunner {
             max_context_tokens: 8192,
             assembly: crate::agent::assembly::AssemblyExecutor::default_executor(),
             tool_result_max_chars: 48_000,
+            stale_demotion: None,
             token_counter: None,
             adjudicator: tokio::sync::Mutex::new(
                 crate::agent::adjudicator::AdjudicationChannel::new(
@@ -2036,6 +2023,8 @@ impl AgentRunner {
         // 实现,WS 流式构造路径(construct_runner)复用同源逻辑
         runner.wire_definition_context_window(def.context_window_tokens);
         runner.tool_result_max_chars = runner.assembly.tool_result_max_chars();
+        // 陈旧工具结果降级声明(配方可选段;缺省 None = 关闭,行为零变化)
+        runner.stale_demotion = runner.assembly.stale_result_demotion().cloned();
 
         // G11:从 def.output_format 构造 OutputValidator
         // schema 编译失败时早失败(可控),不让用户跑一半才发现配错
@@ -2562,6 +2551,42 @@ impl AgentRunner {
             "returned": window.chars().count(),
             "content": window,
         })
+    }
+
+    /// 陈旧工具结果发送视图降级(发送视图变换;权威历史永不修改):
+    /// 未启用(None)或 journal 目录未启用 → 原样逐字节 clone(现行为)。
+    /// 启用则跑确定性纯变换,把 offload 清单原文落盘
+    /// `{journal_dir}/tool_results/{ref_id}.txt`(内容寻址 ref_id,同内容
+    /// 同文件幂等覆盖;降级路径禁写 journal 事件——账本逐字节不动)。
+    /// 任一落盘失败 → fail-soft:整次变换放弃,返回原视图副本。
+    fn apply_stale_demotion(&self, messages: &[Message]) -> Vec<Message> {
+        let Some(spec) = &self.stale_demotion else {
+            return messages.to_vec();
+        };
+        let Some(dir) = &self.journal_dir else {
+            return messages.to_vec();
+        };
+        let (view, offloads) = crate::agent::context_window::demote_stale_tool_results(
+            messages,
+            spec.min_turns,
+            spec.min_bytes,
+        );
+        if offloads.is_empty() {
+            return view;
+        }
+        let tool_results = dir.join(TOOL_RESULTS_DIR);
+        if std::fs::create_dir_all(&tool_results).is_err() {
+            tracing::warn!("stale result demotion aborted: tool_results dir unavailable");
+            return messages.to_vec();
+        }
+        for off in &offloads {
+            let path = tool_results.join(format!("{}.txt", off.ref_id));
+            if std::fs::write(&path, &off.content).is_err() {
+                tracing::warn!(ref_id = %off.ref_id, "stale result demotion aborted: offload write failed");
+                return messages.to_vec();
+            }
+        }
+        view
     }
 
     /// 写面撤销批:一次接线两钩子(快照仓库 + 自验证门禁;两钩子同点不同
@@ -4981,6 +5006,9 @@ impl AgentRunner {
                 max_context_tokens,
                 assembly: assembly.clone(),
                 tool_result_max_chars,
+                // 陈旧工具结果降级声明沿链继承(与父 runner 同配方口径;
+                // None = 关闭,子代理行为零变化)
+                stale_demotion: assembly.stale_result_demotion().cloned(),
                 token_counter: Some(chain_counter.clone()),
                 adjudicator: tokio::sync::Mutex::new(
                     crate::agent::adjudicator::AdjudicationChannel::new(
@@ -5315,7 +5343,9 @@ impl AgentRunner {
         // 回写持久化;被动裁剪换区后下标失真,不落账=等同现行为
         let send_view_pending;
         let mut messages_to_send = if let Some(ctx) = &self.context_window {
-            let mut trim_result = ctx.trim_detailed(messages);
+            // 陈旧工具结果发送视图降级(发送视图变换;权威 messages 不动)
+            let demoted_view = self.apply_stale_demotion(messages);
+            let mut trim_result = ctx.trim_detailed(&demoted_view);
             send_view_pending = trim_result.dropped.is_empty();
             if !trim_result.dropped.is_empty() {
                 info!(
@@ -5345,7 +5375,8 @@ impl AgentRunner {
             trim_result.messages
         } else {
             send_view_pending = true;
-            messages.clone()
+            // 陈旧工具结果发送视图降级(发送视图变换;权威 messages 不动)
+            self.apply_stale_demotion(messages)
         };
 
         // H1(自主交接设计):窗口余量信号行——每轮请求前按当前发送集计数,
@@ -8946,6 +8977,8 @@ impl AgentRunner {
                                                let messages_to_send = if let Some(ctx) = &runner.context_window {
                                                    // B21 D3:主动 compaction(阈值触发,先于被动 trim;
                                                    // None=未启用/未触发/无 summarizer——原消息直接走被动 trim)
+                                                   // 陈旧工具结果发送视图降级(发送视图变换;权威 messages 不动)
+                                                   let demoted_view = runner.apply_stale_demotion(&messages);
                                                    let mut compaction_note: Option<(usize, usize, bool)> = None;
                                                    let mut trim_result = match runner
                                                        .active_compaction(
@@ -8962,9 +8995,10 @@ impl AgentRunner {
                                                                outcome.after_chars,
                                                                outcome.summary_generated,
                                                            ));
-                                                           ctx.trim_detailed(&outcome.compacted)
+                                                           let demoted_compacted = runner.apply_stale_demotion(&outcome.compacted);
+                                                           ctx.trim_detailed(&demoted_compacted)
                                                        }
-                                                       None => ctx.trim_detailed(&messages),
+                                                       None => ctx.trim_detailed(&demoted_view),
                                                    };
                                                    // 观测面:压缩发生即广播(前端一次性提示;与 journal
                                                    // 落账同口径,批五 CompactionPerformed 观测件)

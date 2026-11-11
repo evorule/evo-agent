@@ -137,6 +137,41 @@ pub struct BudgetSpec {
     /// 工具输出回喂字符上限（现状 TOOL_RESULT_MAX_CHARS = 48000）
     #[serde(default = "default_tool_result_max_chars")]
     pub tool_result_max_chars: usize,
+    /// 陈旧工具结果发送视图降级声明（可选段;缺省/缺键 = None = 关闭,
+    /// 发送视图与现行为逐字节一致——additive 扩展,不升配方版本）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_result_demotion: Option<StaleDemotionSpec>,
+}
+
+/// 陈旧工具结果发送视图降级声明（确定性纯函数,三条件全部满足才降级:
+/// ①结果已被消费——其后存在 Assistant 消息;②距当前 ≥ min_turns 个
+/// assistant 轮;③结果字节数 > min_bytes）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleDemotionSpec {
+    /// 距当前最小 assistant 轮数（默认 4;声明 < 1 校验期拒绝）
+    #[serde(default = "default_stale_min_turns")]
+    pub min_turns: usize,
+    /// 结果字节阈值（默认 2000,锚定 runner 引用块头摘要量
+    /// TOOL_RESULT_REF_HEAD_CHARS——结果比引用块自身头尾还小则降级无收益;
+    /// 声明 0 校验期拒绝）
+    #[serde(default = "default_stale_min_bytes")]
+    pub min_bytes: usize,
+}
+
+impl Default for StaleDemotionSpec {
+    fn default() -> Self {
+        Self {
+            min_turns: default_stale_min_turns(),
+            min_bytes: default_stale_min_bytes(),
+        }
+    }
+}
+
+fn default_stale_min_turns() -> usize {
+    4
+}
+fn default_stale_min_bytes() -> usize {
+    2_000
 }
 
 /// 召回范围声明（引用式:单一事实源在 definition.memory,配方只声明「从哪取」,
@@ -190,6 +225,7 @@ impl Default for BudgetSpec {
             window_tokens_source: default_window_tokens_source(),
             reserve_for_response_pct: default_reserve_pct(),
             tool_result_max_chars: default_tool_result_max_chars(),
+            stale_result_demotion: None,
         }
     }
 }
@@ -525,6 +561,14 @@ impl AssemblyRecipe {
         if self.budget.tool_result_max_chars == 0 {
             return Err("budget.tool_result_max_chars must be > 0".to_string());
         }
+        if let Some(sd) = &self.budget.stale_result_demotion {
+            if sd.min_turns < 1 {
+                return Err("budget.stale_result_demotion.min_turns must be >= 1".to_string());
+            }
+            if sd.min_bytes == 0 {
+                return Err("budget.stale_result_demotion.min_bytes must be > 0".to_string());
+            }
+        }
         Ok(())
     }
 }
@@ -708,6 +752,11 @@ impl AssemblyExecutor {
     /// 工具输出回喂字符上限(默认配方 48000 = 现状 TOOL_RESULT_MAX_CHARS)
     pub fn tool_result_max_chars(&self) -> usize {
         self.recipe.budget.tool_result_max_chars
+    }
+
+    /// 陈旧工具结果发送视图降级声明(None = 默认关闭——发送视图零变化)
+    pub fn stale_result_demotion(&self) -> Option<&StaleDemotionSpec> {
+        self.recipe.budget.stale_result_demotion.as_ref()
     }
 
     /// S7 裁剪参数(策略名/buffer%/hint token,供 ContextWindowManager 构造)
@@ -1049,6 +1098,69 @@ mod tests {
     fn test_empty_object_deserializes_to_default() {
         let r: AssemblyRecipe = serde_json::from_str("{}").unwrap();
         assert_eq!(r, AssemblyRecipe::default());
+    }
+
+    /// 预算可选段缺省缺键 = None(默认关闭,等价迁移零影响);
+    /// 默认配方序列化不出现该键(关闭面不进配方 JSON)
+    #[test]
+    fn test_budget_stale_demotion_absent_by_default() {
+        let r = AssemblyRecipe::default();
+        assert!(r.budget.stale_result_demotion.is_none());
+        let empty: AssemblyRecipe = serde_json::from_str("{}").unwrap();
+        assert!(empty.budget.stale_result_demotion.is_none());
+        let s = serde_json::to_string(&AssemblyRecipe::default()).unwrap();
+        assert!(
+            !s.contains("stale_result_demotion"),
+            "默认关闭段不应出现在序列化面"
+        );
+    }
+
+    /// StaleDemotionSpec serde 缺省与 Default 同值(min_turns=4/min_bytes=2000)
+    #[test]
+    fn test_stale_demotion_spec_defaults() {
+        let d = StaleDemotionSpec::default();
+        assert_eq!(d.min_turns, 4);
+        assert_eq!(d.min_bytes, 2000);
+        let sd: StaleDemotionSpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(sd, StaleDemotionSpec::default());
+    }
+
+    /// 显式声明段:反序列化落位 + validate 通过 + 执行器访问器透传
+    #[test]
+    fn test_budget_stale_demotion_deserializes_and_propagates() {
+        let json = r#"{"budget": {"stale_result_demotion": {"min_turns": 2, "min_bytes": 100}}}"#;
+        let r: AssemblyRecipe = serde_json::from_str(json).unwrap();
+        r.validate().expect("显式段合法值必须过校验");
+        let exec = AssemblyExecutor::new(r);
+        let sd = exec.stale_result_demotion().expect("访问器透传");
+        assert_eq!(sd.min_turns, 2);
+        assert_eq!(sd.min_bytes, 100);
+    }
+
+    /// fail-fast:min_turns < 1 / min_bytes = 0 拒绝(加载期拦截,不进运行期)
+    #[test]
+    fn test_validate_rejects_stale_demotion_invalid_params() {
+        let mut r = AssemblyRecipe::default();
+        r.budget.stale_result_demotion = Some(StaleDemotionSpec {
+            min_turns: 0,
+            min_bytes: 100,
+        });
+        let err = r.validate().unwrap_err();
+        assert!(
+            err.contains("stale_result_demotion") && err.contains("min_turns"),
+            "got: {err}"
+        );
+
+        let mut r = AssemblyRecipe::default();
+        r.budget.stale_result_demotion = Some(StaleDemotionSpec {
+            min_turns: 2,
+            min_bytes: 0,
+        });
+        let err = r.validate().unwrap_err();
+        assert!(
+            err.contains("stale_result_demotion") && err.contains("min_bytes"),
+            "got: {err}"
+        );
     }
 
     /// S2c_agents_md 静态区槽位:段落序=知识契约之后、动态尾区(todo)之前

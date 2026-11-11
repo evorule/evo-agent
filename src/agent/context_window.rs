@@ -48,6 +48,103 @@ pub struct TrimResult {
     pub dropped: Vec<Message>,
 }
 
+/// ref_id 段字符白名单(文件名安全;其余替换下划线,段长截断 80;
+/// 出站引用化与陈旧降级两面共用的唯一白名单实现)
+pub(crate) fn sanitize_ref_segment(call_id: &str) -> String {
+    let cleaned: String = call_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut s: String = cleaned.chars().take(80).collect();
+    if s.is_empty() {
+        s.push_str("call");
+    }
+    s
+}
+
+/// 陈旧工具结果降级的待落盘产物(offload 清单项)
+///
+/// ref_id 内容寻址(`stale-{digest hex 段}`):同内容同 ref_id——引用文件
+/// 幂等覆盖、重放可重建;Tool 消息无 call_id,内容寻址是唯一确定性键。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleOffload {
+    /// 引用标识(引用文件 stem;hex 段已过 [`sanitize_ref_segment`] 白名单)
+    pub ref_id: String,
+    /// 工具名(占位块回显)
+    pub tool_name: String,
+    /// 原文全文(落盘体,与权威历史逐字节一致)
+    pub content: String,
+    /// 原文摘要(evorule-hash 口径,占位块/取回对账同源)
+    pub digest: String,
+}
+
+/// 陈旧工具结果发送视图降级(确定性纯函数;无时钟/无随机/无外部读取,
+/// 账后视图装配纪律同款:同输入同输出,可由账上原文+本函数重建发送视图)
+///
+/// 把历史中已消费的陈旧工具结果在发送视图里替换为占位块,原文落盘由调用方
+/// 执行(账本原文不动)。三条件全部满足才降级:
+/// ① 结果已被消费——其后存在 Assistant 消息;
+/// ② 距当前 ≥ `min_turns` 个 assistant 轮——其后 Assistant 消息数 ≥ `min_turns`;
+/// ③ 结果字节数 > `min_bytes`。
+///
+/// 已引用化内容(`[TOOL_RESULT_REF]` 前缀)跳过不二次降级;Tool 消息旁路
+/// images 原样保留;只替换 Tool 消息 content,配对 Assistant(tool_calls)
+/// 零改动——trim 原子组纪律天然兼容(消息条数不变,下标对齐保持)。
+pub fn demote_stale_tool_results(
+    messages: &[Message],
+    min_turns: usize,
+    min_bytes: usize,
+) -> (Vec<Message>, Vec<StaleOffload>) {
+    let mut view = messages.to_vec();
+    let mut offloads: Vec<StaleOffload> = Vec::new();
+    for (i, msg) in view.iter_mut().enumerate() {
+        let Message::Tool {
+            content, tool_name, ..
+        } = msg
+        else {
+            continue;
+        };
+        // 条件①②:其后 Assistant 消息数(0 = 尚未消费,永不降级)
+        let assistants_after = messages[i + 1..]
+            .iter()
+            .filter(|m| matches!(m, Message::Assistant { .. }))
+            .count();
+        if assistants_after == 0 || assistants_after < min_turns {
+            continue;
+        }
+        // 条件③:字节数须严格超过阈值(结果比引用块自身头尾还小则降级无收益)
+        if content.len() <= min_bytes {
+            continue;
+        }
+        // 已引用化内容跳过(不二次降级)
+        if content.starts_with("[TOOL_RESULT_REF]") {
+            continue;
+        }
+        let digest = crate::agent::journal::evorule_digest(content);
+        // 内容寻址:digest hex 段过引用段白名单(与出站引用化同口径)
+        let hex_segment = digest.rsplit(':').next().unwrap_or(&digest);
+        let ref_id = format!("stale-{}", sanitize_ref_segment(hex_segment));
+        let placeholder = format!(
+            "[STALE_TOOL_RESULT]\nref_id: {ref_id}\ntool: {tool_name}\nbytes: {}\ndigest: {digest}\n(陈旧工具结果已降级。需要原文时调用 tool_result_fetch 工具,按 ref_id 分页读取。)",
+            content.len()
+        );
+        offloads.push(StaleOffload {
+            ref_id,
+            tool_name: tool_name.clone(),
+            content: content.clone(),
+            digest,
+        });
+        *content = placeholder;
+    }
+    (view, offloads)
+}
+
 /// Token 计数器 trait
 pub trait TokenCounter: Send + Sync + std::fmt::Debug {
     /// 估算 messages 数组的总 token 数(含 role 开销 + 结尾标记)
@@ -852,5 +949,210 @@ mod tests {
         // 最后一条是最近的 message number 099
         let last = trimmed.last().unwrap();
         assert!(last.content().contains("message number 099"));
+    }
+
+    // ========== 陈旧工具结果发送视图降级(纯变换) ==========
+
+    use crate::agent::journal::evorule_digest;
+
+    /// 构造降级场景的最小历史:user → tool(原文 content)→ 其后 n 条 Assistant
+    fn history_with_tool_after_n_assistants(
+        content: &str,
+        assistants_after: usize,
+    ) -> Vec<Message> {
+        let mut msgs = vec![user("q")];
+        msgs.push(tool_result(content, "grep_files"));
+        for i in 0..assistants_after {
+            msgs.push(Message::Assistant {
+                content: format!("a{i}"),
+                tool_calls: None,
+            });
+        }
+        msgs
+    }
+
+    /// 黄金向量确定性:同输入两次跑,输出视图与 offload 清单逐字节相等
+    #[test]
+    fn test_demote_stale_deterministic_golden() {
+        let long = "L".repeat(300);
+        let msgs = vec![
+            user("q"),
+            tool_result(&long, "grep_files"),
+            Message::Assistant {
+                content: "a".to_string(),
+                tool_calls: None,
+            },
+            user("q2"),
+            Message::Assistant {
+                content: "b".to_string(),
+                tool_calls: None,
+            },
+        ];
+        let (v1, o1) = demote_stale_tool_results(&msgs, 2, 100);
+        let (v2, o2) = demote_stale_tool_results(&msgs, 2, 100);
+        assert_eq!(
+            serde_json::to_string(&v1).unwrap(),
+            serde_json::to_string(&v2).unwrap(),
+            "视图两次输出逐字节相等"
+        );
+        assert_eq!(o1, o2, "offload 清单两次输出相等");
+        // 黄金形态锚:占位块全文确定性(字段序固定)
+        let digest = evorule_digest(&long);
+        let hex = digest.rsplit(':').next().unwrap();
+        let expected = format!(
+            "[STALE_TOOL_RESULT]\nref_id: stale-{hex}\ntool: grep_files\nbytes: {}\ndigest: {digest}\n(陈旧工具结果已降级。需要原文时调用 tool_result_fetch 工具,按 ref_id 分页读取。)",
+            long.len()
+        );
+        assert_eq!(v1[1].content(), expected);
+        assert_eq!(o1.len(), 1);
+        assert_eq!(o1[0].ref_id, format!("stale-{hex}"));
+        assert_eq!(o1[0].digest, digest);
+        assert_eq!(o1[0].tool_name, "grep_files");
+        assert_eq!(o1[0].content, long);
+    }
+
+    /// 条件②轮距边界:K-1 轮不降级,K 轮降级(显式小值 K=3)
+    #[test]
+    fn test_demote_turn_boundary() {
+        let content = "X".repeat(500);
+        // 其后 2 条 Assistant(< K=3)→ 不降级,原文保留
+        let msgs = history_with_tool_after_n_assistants(&content, 2);
+        let (view, offs) = demote_stale_tool_results(&msgs, 3, 100);
+        assert!(offs.is_empty());
+        assert_eq!(view[1].content(), &content);
+        // 其后 3 条 Assistant(= K)→ 降级
+        let msgs = history_with_tool_after_n_assistants(&content, 3);
+        let (view, offs) = demote_stale_tool_results(&msgs, 3, 100);
+        assert_eq!(offs.len(), 1);
+        assert!(view[1].content().starts_with("[STALE_TOOL_RESULT]"));
+    }
+
+    /// 条件③字节阈值边界:T 字节不降级(条件为严格大于),T+1 降级(显式小值 T=100)
+    #[test]
+    fn test_demote_bytes_threshold_boundary() {
+        // 恰 100 字节 = T → 不降级
+        let msgs = history_with_tool_after_n_assistants(&"Y".repeat(100), 2);
+        let (view, offs) = demote_stale_tool_results(&msgs, 2, 100);
+        assert!(offs.is_empty());
+        assert_eq!(view[1].content().len(), 100);
+        // 101 字节 = T+1 → 降级
+        let msgs = history_with_tool_after_n_assistants(&"Y".repeat(101), 2);
+        let (view, offs) = demote_stale_tool_results(&msgs, 2, 100);
+        assert_eq!(offs.len(), 1);
+        assert!(view[1].content().starts_with("[STALE_TOOL_RESULT]"));
+    }
+
+    /// 条件①已消费边界:其后无 Assistant 消息 = 尚未消费,永不降级
+    /// (病态 min_turns=0 输入同样被本条件拦住)
+    #[test]
+    fn test_demote_requires_consumed_assistant_after() {
+        let content = "Z".repeat(500);
+        let msgs = vec![user("q"), tool_result(&content, "t")];
+        let (view, offs) = demote_stale_tool_results(&msgs, 1, 100);
+        assert!(offs.is_empty());
+        assert_eq!(view[1].content(), &content);
+        let (view, offs) = demote_stale_tool_results(&msgs, 0, 100);
+        assert!(offs.is_empty());
+        assert_eq!(view[1].content(), &content);
+    }
+
+    /// 已引用化内容跳过:不二次降级,原样保留
+    #[test]
+    fn test_demote_skips_existing_reference_block() {
+        let ref_block = format!("[TOOL_RESULT_REF]\nref_id: call-1-2\n{}", "x".repeat(500));
+        let msgs = history_with_tool_after_n_assistants(&ref_block, 2);
+        let (view, offs) = demote_stale_tool_results(&msgs, 2, 100);
+        assert!(offs.is_empty());
+        assert_eq!(view[1].content(), &ref_block, "引用块原样保留");
+    }
+
+    /// Tool 消息旁路 images 原样保留;offload 只携带原文不带图
+    #[test]
+    fn test_demote_preserves_tool_images() {
+        let img = ImageData {
+            mime_type: "image/png".to_string(),
+            data_base64: "QUJD".to_string(),
+        };
+        let long = "W".repeat(500);
+        let mut msgs = vec![user("q")];
+        msgs.push(Message::Tool {
+            content: long.clone(),
+            tool_name: "screenshot".to_string(),
+            images: vec![img],
+        });
+        msgs.push(Message::Assistant {
+            content: "a".to_string(),
+            tool_calls: None,
+        });
+        msgs.push(Message::Assistant {
+            content: "b".to_string(),
+            tool_calls: None,
+        });
+        let (view, offs) = demote_stale_tool_results(&msgs, 2, 100);
+        assert_eq!(offs.len(), 1);
+        match &view[1] {
+            Message::Tool { images, .. } => assert_eq!(images.len(), 1, "旁路图原样保留"),
+            other => panic!("expected Tool, got {other:?}"),
+        }
+        assert_eq!(offs[0].content, long, "offload 携带原文全文");
+    }
+
+    /// 占位块含 ref_id/digest/bytes/tool/取回指引;原子组兼容
+    /// (配对 Assistant 侧消息零改动;权威历史入参零改动;消息条数不变)
+    #[test]
+    fn test_demote_placeholder_shape_and_atomic_group_compatibility() {
+        let content = "P".repeat(500);
+        let mut msgs = vec![user("q")];
+        msgs.push(Message::Assistant {
+            content: "thinking".to_string(),
+            tool_calls: Some(vec![ToolCall {
+                name: "grep_files".to_string(),
+                arguments: json!({"q": "test"}),
+                id: None,
+            }]),
+        });
+        msgs.push(tool_result(&content, "grep_files"));
+        msgs.push(Message::Assistant {
+            content: "after".to_string(),
+            tool_calls: None,
+        });
+        msgs.push(Message::Assistant {
+            content: "after2".to_string(),
+            tool_calls: None,
+        });
+        let snapshot = serde_json::to_string(&msgs).unwrap();
+        let (view, offs) = demote_stale_tool_results(&msgs, 2, 100);
+        assert_eq!(offs.len(), 1);
+        let digest = evorule_digest(&content);
+        let hex = digest.rsplit(':').next().unwrap();
+        let ph = view[2].content();
+        assert!(ph.starts_with("[STALE_TOOL_RESULT]"));
+        assert!(ph.contains(&format!("ref_id: stale-{hex}")));
+        assert!(ph.contains(&format!("digest: {digest}")));
+        assert!(ph.contains(&format!("bytes: {}", content.len())));
+        assert!(ph.contains("tool: grep_files"));
+        assert!(ph.contains("tool_result_fetch"), "取回指引在场");
+        // 原子组兼容:Assistant 侧消息零改动(逐字段比对)
+        match &view[1] {
+            Message::Assistant {
+                content,
+                tool_calls,
+            } => {
+                assert_eq!(content, "thinking");
+                assert_eq!(tool_calls.as_ref().map(|c| c.len()).unwrap_or(0), 1);
+            }
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+        assert!(matches!(
+            &view[3],
+            Message::Assistant { content, .. } if content == "after"
+        ));
+        assert!(matches!(
+            &view[4],
+            Message::Assistant { content, .. } if content == "after2"
+        ));
+        // 权威历史入参零改动;消息条数不变(下标对齐保持)
+        assert_eq!(serde_json::to_string(&msgs).unwrap(), snapshot);
+        assert_eq!(view.len(), msgs.len());
     }
 }
