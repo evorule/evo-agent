@@ -1034,6 +1034,19 @@ fn write_ai_plugin_config(
                 })
                 .collect(),
         );
+        // 目录模型描述随路由节透传（模型选择器副标题；稀疏表，自定义
+        // provider 无描述即缺键，执行体视图不携带）
+        let mut descriptions = serde_json::Map::new();
+        for (p, _) in providers.iter() {
+            for m in p.models.iter() {
+                if let Some(d) = crate::wizard::model_description(m) {
+                    descriptions.insert(m.clone(), serde_json::json!(d));
+                }
+            }
+        }
+        if !descriptions.is_empty() {
+            cfg["model_descriptions"] = serde_json::Value::Object(descriptions);
+        }
     }
     let out = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
     std::fs::write(paths.runtime_dir.join("ai-plugin.json"), out)
@@ -1629,6 +1642,10 @@ mod tests {
         );
         assert!(providers[0]["models"].as_array().unwrap().len() >= 1);
         assert_eq!(providers[1]["name"], "kimi");
+        // 目录模型描述随路由节透传（deepseek/kimi 目录成员各带定位副标题）
+        let desc = v["model_descriptions"].as_object().expect("descriptions emitted");
+        assert!(desc.contains_key("deepseek-chat"));
+        assert!(desc.contains_key("kimi-k3.1-pro"));
         // 零落盘红线延伸：路由节同样不得出现 key 本体
         assert!(raw.contains("api_key_env") && !raw.contains("sk-ds-test"));
         // 单端点形态保留（旧版捆绑插件降级路径）
@@ -1649,6 +1666,10 @@ mod tests {
         let raw = std::fs::read_to_string(paths.runtime_dir.join("ai-plugin.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(v.get("llm_providers").is_none(), "无 key 不生成路由节");
+        assert!(
+            v.get("model_descriptions").is_none(),
+            "无 key 不生成描述节"
+        );
         assert!(read_primary_llm_key(&paths).is_none());
         std::fs::remove_dir_all(&paths.data_dir).ok();
     }

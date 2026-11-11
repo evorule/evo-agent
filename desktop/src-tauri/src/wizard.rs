@@ -290,6 +290,35 @@ pub const PROVIDERS: &[ProviderEntry] = &[
     },
 ];
 
+/// 目录模型能力描述（模型选择器副标题，纯展示元数据）：编排层合并进
+/// ai-plugin 配置 `model_descriptions` 节透传执行体视图。稀疏表——无描述
+/// 的模型（含自定义 provider）副标题不渲染；定位语仅取自目录在档事实
+/// （端点注释/产品命名），不编造参数与基准值。
+pub const MODEL_DESCRIPTIONS: &[(&str, &str)] = &[
+    ("MiniMax-M2.5", "高速轻量：日常问答与快速迭代"),
+    ("MiniMax-M3", "深度推理：复杂任务与长工具链"),
+    ("deepseek-chat", "通用对话：均衡的日常助手"),
+    ("deepseek-reasoner", "深度推理：数学与代码强项"),
+    ("kimi-k3.1-pro", "旗舰全能：原生视觉（多模态）"),
+    ("kimi-k3.1-pro-highspeed", "旗舰加速：同能高速通道"),
+    ("kimi-k2.7-code", "代码专精：编程与重构"),
+    ("glm-5.3", "旗舰：复杂推理与代码"),
+    ("glm-5.3-flash", "高速：日常问答（原生多模态）"),
+    ("glm-5.3-flashx", "极速形态：轻快响应"),
+    ("glm-4.6", "上一代旗舰：稳定的对话与代码"),
+    ("glm-4.5-air", "轻量经济：高频低成本"),
+    ("step-5-preview", "旗舰：文本/图片/视频输入"),
+    ("step-3.7-flash", "高速多模态"),
+];
+
+/// 目录模型描述查询（编排层生成 model_descriptions 时消费）
+pub fn model_description(model: &str) -> Option<&'static str> {
+    MODEL_DESCRIPTIONS
+        .iter()
+        .find(|(m, _)| *m == model)
+        .map(|(_, d)| *d)
+}
+
 /// 目录内查找（编排层生成 llm_providers 时消费）
 pub fn catalog_entry(name: &str) -> Option<&'static ProviderEntry> {
     PROVIDERS.iter().find(|p| p.name == name)

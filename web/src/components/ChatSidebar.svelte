@@ -279,6 +279,7 @@
   let modelNavIdx = $state(-1);
   let modelSearchEl = $state(null);
   let modelProviders = $state({});
+  let modelDescriptions = $state({});
   let filteredModels = $derived(
     modelSearch.trim()
       ? modelList.filter((m) => m.toLowerCase().includes(modelSearch.trim().toLowerCase()))
@@ -309,6 +310,7 @@
       const s = await getLlmModels();
       modelList = Array.isArray(s.models) ? s.models : [];
       modelProviders = s.providers && typeof s.providers === 'object' ? s.providers : {};
+      modelDescriptions = s.descriptions && typeof s.descriptions === 'object' ? s.descriptions : {};
       modelReady = !!s.ready;
       modelNote = s.note || '';
       if (s.current) currentModel = s.current;
@@ -2258,7 +2260,12 @@
                       onclick={() => pickModel(row.model)}
                       disabled={modelBusy}
                     >
-                      <span class="mono">{row.model}</span>
+                      <span class="model-main">
+                        <span class="mono">{row.model}</span>
+                        {#if modelDescriptions[row.model]}
+                          <span class="model-desc">{modelDescriptions[row.model]}</span>
+                        {/if}
+                      </span>
                       {#if row.model === currentModel}<span class="model-check">✓</span>{/if}
                     </button>
                   {/if}
@@ -4046,6 +4053,20 @@
   }
   .model-item.nav:not(:disabled) {
     background: var(--bg-hover);
+  }
+  .model-main {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+  .model-desc {
+    font-size: var(--fs-2xs);
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 260px;
   }
   .model-group-head {
     padding: 7px 10px 3px;
