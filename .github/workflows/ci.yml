@@ -186,14 +186,28 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Host "== after =="; free -m; df -h /
 
-      - name: verify 3/5a-2 test-run lib (rest)
+      # 3/5a-2 serial bisect experiment (2026-11-12): three independent runs
+      # all died at the same output boundary (after preflight's last test)
+      # with ample memory (10.6G free) and every spawn-kill-reap family
+      # green, so neither a fixed test signature nor memory explains it.
+      # Serial execution makes output order == execution order, so the
+      # dying test's name becomes visible at the kill boundary. Split in
+      # two halves to stay inside the 35-min cap.
+      - name: verify 3/5a-2a test-run lib serial (rest minus builtin_tools)
         if: matrix.tests && runner.os == 'Linux'
         shell: pwsh
         run: |
-          $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','--skip','runner::'
+          $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '1'
+          ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','--skip','runner::','--skip','builtin_tools::'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Write-Host "== after =="; free -m; df -h /
+
+      - name: verify 3/5a-2b test-run lib serial (builtin_tools)
+        if: matrix.tests && runner.os == 'Linux'
+        shell: pwsh
+        run: |
+          $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '1'
+          ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','builtin_tools::'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: verify 3/5b test-run integration_test
         if: matrix.tests && runner.os == 'Linux'
