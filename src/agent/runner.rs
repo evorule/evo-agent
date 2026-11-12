@@ -65,6 +65,7 @@ fn heartbeat_timeout_secs() -> u64 {
 pub const ASSEMBLY_PROTOCOL_VERSION: &str = "assembly-v3";
 
 use crate::agent::acceptance::{apply_acceptance_gate, GateOutcome};
+use crate::agent::assembly::AssemblyInputs;
 use crate::agent::definition::{AgentDefinition, OutputFormat};
 use crate::agent::delegate::DelegateContext;
 use crate::agent::memory::{MemoryManager, MessagePersistMode, MessageRecord};
@@ -3870,29 +3871,29 @@ impl AgentRunner {
         // 机制消息 None,system_prompt 与现行为逐字节一致)
         let (system_prompt, mechanism_message) = self
             .assembly
-            .assemble_split(
-                &self.config.system_prompt,
-                self.config.identity_segment.as_deref(),
-                self.config.north_star.as_deref(),
-                self.memory.as_ref(),
-                &recall,
-                self.max_context_tokens,
-                boundary_segment.as_deref(),
-                self.config.skills.as_deref(),
-                self.config.skills_notice.as_deref(),
-                self.config.handoff.as_ref(),
-                self.config.governance_segment.as_deref(),
-                knowledge_segment.as_deref(),
+            .assemble_split(AssemblyInputs {
+                base_prompt: &self.config.system_prompt,
+                identity_segment: self.config.identity_segment.as_deref(),
+                north_star: self.config.north_star.as_deref(),
+                memory: self.memory.as_ref(),
+                recall: &recall,
+                total_window: self.max_context_tokens,
+                boundary_segment: boundary_segment.as_deref(),
+                skills: self.config.skills.as_deref(),
+                skills_notice: self.config.skills_notice.as_deref(),
+                handoff: self.config.handoff.as_ref(),
+                governance_segment: self.config.governance_segment.as_deref(),
+                knowledge_segment: knowledge_segment.as_deref(),
                 // 项目记忆段(AGENTS.md 层级)入静态区槽位(知识契约之后、
                 // 记忆召回之前)——内容仅随文件编辑变化,跨轮字节级稳定,
                 // 被动前缀缓存的跨轮命中段因此覆盖静态头+项目记忆
-                self.agents_md_segment.as_deref(),
+                agents_md: self.agents_md_segment.as_deref(),
                 // 批K 段4:S3c_todo 槽位内容物(开关单键双绑;None=静默跳过)
-                self.todo_summary_segment().as_deref(),
+                todo_summary: self.todo_summary_segment().as_deref(),
                 // S2d 服务目录槽位内容物(注册面启动期渲染,每轮重渲染
                 // 字节级一致;None=静默跳过)
-                service_catalog_segment.as_deref(),
-            )
+                service_catalog: service_catalog_segment.as_deref(),
+            })
             .map_err(AgentError::Internal)?;
 
         // 建会话前 IO 形状契约协商——404/连不通=旧 server warn
@@ -8109,27 +8110,28 @@ impl AgentRunner {
                            // γ 批 B-268:动态区外移分叉(同 run() 组装点口径——
                            // 配方 mechanism_messages 开启时动态区渲染进独立机制
                            // 消息;关闭态机制消息 None,system_prompt 逐字节现行为)
-                           let (system_prompt, mechanism_message) = match runner.assembly.assemble_split(
-                               &runner.config.system_prompt,
-                               runner.config.identity_segment.as_deref(),
-                               runner.config.north_star.as_deref(),
-                               runner.memory.as_ref(),
-                               &recall,
-                               runner.max_context_tokens,
-                               boundary_segment.as_deref(),
-                               runner.config.skills.as_deref(),
-                               runner.config.skills_notice.as_deref(),
-                               runner.config.handoff.as_ref(),
-                               runner.config.governance_segment.as_deref(),
-                               knowledge_segment.as_deref(),
-                               // 项目记忆段(AGENTS.md 层级)入静态区槽位——
-                               // 与 run() 路径同口径,跨轮前缀稳定
-                               runner.agents_md_segment.as_deref(),
-                               // 批K 段4:S3c_todo 槽位内容物(每轮装配重建——
-                               // 状态锚定不靠消息历史;None=静默跳过)
-                               runner.todo_summary_segment().as_deref(),
-                               service_catalog_segment.as_deref(),
-                           ) {
+                           let (system_prompt, mechanism_message) =
+                               match runner.assembly.assemble_split(AssemblyInputs {
+                                   base_prompt: &runner.config.system_prompt,
+                                   identity_segment: runner.config.identity_segment.as_deref(),
+                                   north_star: runner.config.north_star.as_deref(),
+                                   memory: runner.memory.as_ref(),
+                                   recall: &recall,
+                                   total_window: runner.max_context_tokens,
+                                   boundary_segment: boundary_segment.as_deref(),
+                                   skills: runner.config.skills.as_deref(),
+                                   skills_notice: runner.config.skills_notice.as_deref(),
+                                   handoff: runner.config.handoff.as_ref(),
+                                   governance_segment: runner.config.governance_segment.as_deref(),
+                                   knowledge_segment: knowledge_segment.as_deref(),
+                                   // 项目记忆段(AGENTS.md 层级)入静态区槽位——
+                                   // 与 run() 路径同口径,跨轮前缀稳定
+                                   agents_md: runner.agents_md_segment.as_deref(),
+                                   // 批K 段4:S3c_todo 槽位内容物(每轮装配重建——
+                                   // 状态锚定不靠消息历史;None=静默跳过)
+                                   todo_summary: runner.todo_summary_segment().as_deref(),
+                                   service_catalog: service_catalog_segment.as_deref(),
+                               }) {
                                Ok((p, m)) => (p, m),
                                Err(e) => {
                                    yield Err(AgentError::Internal(e));
