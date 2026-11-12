@@ -583,50 +583,116 @@ pub fn judge_signal(node_id: &str, passed: bool, detail: &str) -> serde_json::Va
     serde_json::json!({ "type": "set", "params": params })
 }
 
+/// 判据命令整体预算(秒):挂起判据 = 节点无 done 路径,整条 workflow 被楔死。
+/// 预算到期 kill_on_drop 终止子进程并报超时(判据不过形态,fail-visible)
+const JUDGE_COMMAND_TIMEOUT_SECS: u64 = 120;
+
 /// 判据命令执行（判据 v0 第二级；tokio 异步执行不阻塞执行器线程）
 ///
 /// 容器在位 = `docker exec <container> sh -c <cmd>`（P1 执行桥同款宿主侧 argv，
 /// 容器名过白名单校验防 argv 注入）；否则宿主直执行（acceptance 门禁同款：
 /// windows=cmd /C，其余=sh -c）。spawn 失败按判据不过处理（Err 携带原因）。
+/// 整体受 [`JUDGE_COMMAND_TIMEOUT_SECS`] 预算约束（超时 = 终止,非放弃）。
 async fn run_judge_command(
     cmd: &str,
     container: Option<&str>,
+) -> Result<std::process::Output, String> {
+    run_judge_command_with_budget(
+        cmd,
+        container,
+        std::time::Duration::from_secs(JUDGE_COMMAND_TIMEOUT_SECS),
+    )
+    .await
+}
+
+/// 预算参数化主体(测试注入短预算实测超时/终止路径)
+async fn run_judge_command_with_budget(
+    cmd: &str,
+    container: Option<&str>,
+    budget: std::time::Duration,
 ) -> Result<std::process::Output, String> {
     // H2 运行期闸:spawn 前白名单校验(物化期闸防 PlanFact 面;此处防手写
     // DSL v1.2 workflow json 绕过物化器校验的路径——materialize_workflow_dag
     // 也走物化期闸,此闸对直列 JudgeSpec 的调用面兜底,双闸纵深)
     crate::agent::judge_guard::validate_judge_command(cmd)
         .map_err(|e| format!("judge command blocked by H2 guard: {e}"))?;
-    if let Some(c) = container {
+    let mut command = if let Some(c) = container {
         crate::builtin_tools::shell_exec::validate_container_name(c)
             .map_err(|e| format!("judge container name invalid: {e}"))?;
         let mut command = tokio::process::Command::new("docker");
         command.args(["exec", c, "sh", "-c", cmd]);
-        return command
-            .output()
-            .await
-            .map_err(|e| format!("judge command spawn failed: {e}"));
+        command
+    } else {
+        #[cfg(windows)]
+        {
+            let mut c = tokio::process::Command::new("cmd");
+            // raw_arg 直传判据串：arg() 按 MSVCRT 约定对内层引号做反斜杠转义，
+            // 而 cmd 不认转义——含引号判据串经 arg() 必被搅碎（实锤：探针
+            // python -c "exit(7)" 返 0）；直传让 cmd 收到与声明一致的串，
+            // 引号语义交给 cmd 原生规则，与人工在终端输入完全同形
+            c.raw_arg("/C").raw_arg(cmd);
+            c
+        }
+        #[cfg(not(windows))]
+        {
+            let mut c = tokio::process::Command::new("sh");
+            c.args(["-c", cmd]);
+            c
+        }
+    };
+    // 预算=终止(非放弃): Unix 独立进程组 + 到期进程族终止(shell_exec
+    // 同款原语)——树级/组级终止必须在树存活时进行(kill_on_drop 的 drop
+    // 直杀会先断树,taskkill /T 即扑空),故用借用式 wait + 前置 pid 快照;
+    // 挂起判据不再楔死 workflow
+    #[cfg(unix)]
+    command.process_group(0);
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    command.kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("judge command spawn failed: {e}"))?;
+    let child_pid = child.id();
+    // 管道并发排空(防满管阻塞子进程);内容收进缓冲,自然退出臂组装 Output
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let out_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(s) = stdout_pipe.as_mut() {
+            let _ = tokio::io::AsyncReadExt::read_to_end(s, &mut buf).await;
+        }
+        buf
+    });
+    let err_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(s) = stderr_pipe.as_mut() {
+            let _ = tokio::io::AsyncReadExt::read_to_end(s, &mut buf).await;
+        }
+        buf
+    });
+    match tokio::time::timeout(budget, child.wait()).await {
+        Ok(Ok(status)) => {
+            let stdout = out_task.await.unwrap_or_default();
+            let stderr = err_task.await.unwrap_or_default();
+            Ok(std::process::Output { status, stdout, stderr })
+        }
+        Ok(Err(e)) => Err(format!("judge command spawn failed: {e}")),
+        Err(_) => {
+            // 进程族终止(树级/组级,树存活时链条完整)+ 直杀兜底 + reap
+            if let Some(pid) = child_pid {
+                crate::builtin_tools::shell_exec::terminate_family_by_pid(pid);
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = out_task.await;
+            let _ = err_task.await;
+            Err(format!(
+                "judge command timed out after {}s (process tree terminated)",
+                budget.as_secs()
+            ))
+        }
     }
-    #[cfg(windows)]
-    let mut command = {
-        let mut c = tokio::process::Command::new("cmd");
-        // raw_arg 直传判据串：arg() 按 MSVCRT 约定对内层引号做反斜杠转义，
-        // 而 cmd 不认转义——含引号判据串经 arg() 必被搅碎（实锤：探针
-        // python -c "exit(7)" 返 0）；直传让 cmd 收到与声明一致的串，
-        // 引号语义交给 cmd 原生规则，与人工在终端输入完全同形
-        c.raw_arg("/C").raw_arg(cmd);
-        c
-    };
-    #[cfg(not(windows))]
-    let mut command = {
-        let mut c = tokio::process::Command::new("sh");
-        c.args(["-c", cmd]);
-        c
-    };
-    command
-        .output()
-        .await
-        .map_err(|e| format!("judge command spawn failed: {e}"))
 }
 
 /// 判据裁决（纯函数；判据 v0 第二级）
@@ -4422,6 +4488,59 @@ mod tests {
         assert!(
             err.contains("judge container name invalid"),
             "错误须指明容器名非法: {err}"
+        );
+    }
+
+    // ===== 判据命令整体预算(o85):挂起判据不再楔死 workflow =====
+
+    /// 跨平台挂起探针(白名单内、引号内分号——o67 引号感知语义):
+    /// python/python3 睡 120s,judge 预算远小于此
+    #[cfg(windows)]
+    const HUNG_JUDGE_CMD: &str = "python -c \"import time; time.sleep(120)\"";
+    #[cfg(not(windows))]
+    const HUNG_JUDGE_CMD: &str = "python3 -c \"import time; time.sleep(120)\"";
+
+    #[cfg(windows)]
+    const HUNG_JUDGE_RUNTIME: &str = "python";
+    #[cfg(not(windows))]
+    const HUNG_JUDGE_RUNTIME: &str = "python3";
+
+    #[tokio::test]
+    async fn test_run_judge_command_budget_bounds_hung_command() {
+        // 判据命令挂起原为无界 await——节点无 done 路径,整条 workflow 楔死。
+        // 预算到期必须报超时(判据不过形态)且快速返回
+        let t0 = std::time::Instant::now();
+        let err = run_judge_command_with_budget(
+            HUNG_JUDGE_CMD,
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("hung judge command must hit the budget");
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "budget must fire near 1s, took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_judge_command_budget_kills_before_side_effect() {
+        // kill 实证(对照 hook 超时真杀先例):延迟写标记(6s)在 1s 预算下
+        // 永不发生——kill_on_drop 真终止子进程,非「放弃等待」
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker.txt");
+        let marker_str = marker.display().to_string().replace('\'', "");
+        let cmd = format!(
+            "{} -c \"import time; time.sleep(6); open(r'{}','w').write('done')\"",
+            HUNG_JUDGE_RUNTIME, marker_str
+        );
+        let _ = run_judge_command_with_budget(&cmd, None, std::time::Duration::from_secs(1)).await;
+        std::thread::sleep(std::time::Duration::from_secs(7));
+        assert!(
+            !marker.exists(),
+            "killed judge process must not complete its side effect"
         );
     }
 
