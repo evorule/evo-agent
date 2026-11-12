@@ -2899,14 +2899,16 @@ impl MemoryManager {
             .fetch_shared_facts_visible(&sessions_prefix, "summaries", &mut ctx.degradation_notices)
             .await
         {
-            let mut summaries: Vec<MemoryRecord> = facts
+            let mut summaries: Vec<MemoryRecord> = latest_entries_by_path(facts)
                 .into_iter()
-                .filter(|f| !f.path.contains(".rollup."))
-                .filter_map(|f| {
-                    serde_json::from_value::<MemoryRecord>(f.value)
-                        .ok()
+                .filter(|(f, _)| !f.path.contains(".rollup."))
+                .filter_map(|(f, record)| {
+                    record
+                        // 同 path 去重后的 Tombstoned 摘要渲染层必被过滤——
+                        // 不进选取面（防占 max_summaries 名额）
+                        .filter(|r| r.lifecycle_state.as_deref() != Some("Tombstoned"))
                         .map(|mut r| {
-                            r.fact_id = Some(f.fact_id);
+                            r.fact_id.get_or_insert(f.fact_id);
                             r
                         })
                 })
@@ -2929,9 +2931,18 @@ impl MemoryManager {
             // 水合,会话末 apply_lifecycle_transitions 可见历史事件,治理门
             // 跨会话可触发。仅补缺(缺 cache 镜像才插,不覆盖本地新写);
             // path→cache_key 与 path_to_cache_key 同构(Shared 域)。
-            for f in &facts {
-                if let Some(ck) = self.path_to_cache_key(&f.path) {
-                    if let Ok(mut r) = serde_json::from_value::<MemoryRecord>(f.value.clone()) {
+            // 版本裁决单源化（与 stable 同源）：同 path 取最新版本 + null 墓碑
+            // 抑制——旧版本不再重复进评分/名额/usage 计数；Tombstoned 记录
+            // （值非 null 的状态墓碑）渲染层必被过滤，直接跳过（防占名额+
+            // 防镜像 Reinforced 化）。
+            let deduped = latest_entries_by_path(facts);
+            for (f, record) in &deduped {
+                if let Some(r) = record {
+                    if r.lifecycle_state.as_deref() == Some("Tombstoned") {
+                        continue;
+                    }
+                    if let Some(ck) = self.path_to_cache_key(&f.path) {
+                        let mut r = r.clone();
                         // fact_id 由服务端分配,存储的 MemoryRecord JSON 不含它——
                         // 必须从 SharedFactEntry 补进镜像,否则 flush_usage 按
                         // fact_id 匹配 cache 落增量时永不命中(断点5 收尾)。
@@ -2947,58 +2958,57 @@ impl MemoryManager {
                     }
                 }
             }
-            let mut events: Vec<(MemoryRecord, f32)> = facts
+            let mut events: Vec<(MemoryRecord, f32)> = deduped
                 .into_iter()
-                .filter_map(|f| {
-                    serde_json::from_value::<MemoryRecord>(f.value)
-                        .ok()
-                        .map(|mut r| {
-                            r.fact_id = Some(f.fact_id);
-                            // F-616:events 命中计数(去重 fact_id)
-                            if let Some(fid) = r.fact_id {
-                                *self
-                                    .usage_pending
+                .filter_map(|(f, record)| {
+                    let mut r = record?;
+                    if r.lifecycle_state.as_deref() == Some("Tombstoned") {
+                        return None;
+                    }
+                    r.fact_id = Some(f.fact_id);
+                    // F-616:events 命中计数(去重后每 path 一次)
+                    if let Some(fid) = r.fact_id {
+                        *self
+                            .usage_pending
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .entry(fid)
+                            .or_insert(0) += 1;
+                    }
+                    // R05（E4）：CJK 感知确定性分词 + 关键词重叠计数
+                    let value_lower = r.value.to_lowercase();
+                    let hits = tokenize_for_match(goal)
+                        .iter()
+                        .filter(|kw| value_lower.contains(kw.as_str()))
+                        .count();
+                    // 阶段 2：评分双模式——Recipe 在位=三因子加权
+                    // （相关性归一+情景半衰期+置信度）；None=词法 legacy
+                    let score = if policy.is_legacy() {
+                        hits as f32
+                    } else {
+                        let goal_n = tokenize_for_match(goal).len().max(1) as f32;
+                        let rel_norm = (hits as f32 / goal_n).min(1.0);
+                        let age_days = (now_secs().saturating_sub(r.timestamp)) as f64 / 86400.0;
+                        let recency =
+                            policy.recency_factor(age_days, policy.half_life_episodic_days);
+                        let conf = r.confidence.unwrap_or(0.5);
+                        let usage_bonus = r
+                            .fact_id
+                            .and_then(|fid| {
+                                self.usage_pending
                                     .lock()
                                     .unwrap_or_else(|p| p.into_inner())
-                                    .entry(fid)
-                                    .or_insert(0) += 1;
-                            }
-                            // R05（E4）：CJK 感知确定性分词 + 关键词重叠计数
-                            let value_lower = r.value.to_lowercase();
-                            let hits = tokenize_for_match(goal)
-                                .iter()
-                                .filter(|kw| value_lower.contains(kw.as_str()))
-                                .count();
-                            // 阶段 2：评分双模式——Recipe 在位=三因子加权
-                            // （相关性归一+情景半衰期+置信度）；None=词法 legacy
-                            let score = if policy.is_legacy() {
-                                hits as f32
-                            } else {
-                                let goal_n = tokenize_for_match(goal).len().max(1) as f32;
-                                let rel_norm = (hits as f32 / goal_n).min(1.0);
-                                let age_days =
-                                    (now_secs().saturating_sub(r.timestamp)) as f64 / 86400.0;
-                                let recency =
-                                    policy.recency_factor(age_days, policy.half_life_episodic_days);
-                                let conf = r.confidence.unwrap_or(0.5);
-                                let usage_bonus = r
-                                    .fact_id
-                                    .and_then(|fid| {
-                                        self.usage_pending
-                                            .lock()
-                                            .unwrap_or_else(|p| p.into_inner())
-                                            .get(&fid)
-                                            .copied()
-                                    })
-                                    .map(|u| (u as f32 * 0.05).min(0.3))
-                                    .unwrap_or(0.0);
-                                let importance = (conf + usage_bonus).clamp(0.0, 1.0);
-                                policy.w_relevance * rel_norm
-                                    + policy.w_recency * recency
-                                    + policy.w_importance * importance
-                            };
-                            (r, score)
-                        })
+                                    .get(&fid)
+                                    .copied()
+                            })
+                            .map(|u| (u as f32 * 0.05).min(0.3))
+                            .unwrap_or(0.0);
+                        let importance = (conf + usage_bonus).clamp(0.0, 1.0);
+                        policy.w_relevance * rel_norm
+                            + policy.w_recency * recency
+                            + policy.w_importance * importance
+                    };
+                    Some((r, score))
                 })
                 .collect();
             // 按 score 降序，同分按时间倒序（f32 全序比较，确定性）
@@ -3097,24 +3107,31 @@ impl MemoryManager {
                     "notes recall degraded: ledger unreachable for '{prefix}' ({e})——本轮笔记回喂缺失"
                 )
             })?;
+        // 版本裁决单源化：同 path 取最新版本 + null 墓碑抑制 + Tombstoned
+        // 状态墓碑过滤——目录=最新版且未被遗忘的条目（修复前全版本直收，
+        // 旧版本重复进选取、已遗忘条目占 NOTES_RECALL_LIMIT 名额）。
         let mut out = Vec::with_capacity(facts.len());
-        for f in facts {
-            // 记录 payload=MemoryRecord JSON（note_write/沉淀草稿同形）;
+        for (f, record) in latest_entries_by_path(facts) {
             // 解析失败=保留为原始条目(键取 path 尾段,值取原文)——催写与
             // 相关性匹配不丢数据
-            let raw = f
-                .value
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| f.value.to_string());
-            let record = match serde_json::from_str::<MemoryRecord>(&raw) {
-                Ok(mut r) => {
+            let record = match record {
+                Some(mut r) => {
+                    if r.lifecycle_state.as_deref() == Some("Tombstoned") {
+                        continue;
+                    }
                     if r.key.is_empty() {
                         r.key = f.path.rsplit('.').next().unwrap_or(&f.path).to_string();
                     }
                     r
                 }
-                Err(_) => MemoryRecord::new(f.path.rsplit('.').next().unwrap_or(&f.path), &raw, 0),
+                None => {
+                    let raw = f
+                        .value
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| f.value.to_string());
+                    MemoryRecord::new(f.path.rsplit('.').next().unwrap_or(&f.path), &raw, 0)
+                }
             };
             out.push(record);
         }
@@ -4097,7 +4114,7 @@ impl MemoryManager {
                             path: f.path,
                             value: f.value,
                             source_session_id: 0,
-                            version: 0,
+                            version: f.version,
                             origin_fact_id: None,
                         })
                         .collect(),
@@ -4108,12 +4125,12 @@ impl MemoryManager {
             .fetch_shared_facts_visible(prefix, layer, notices)
             .await;
         if let (Some(store), Some(facts)) = (&self.lex_store, &fetched) {
-            let rows: Vec<(u64, String, serde_json::Value)> = facts
+            let rows: Vec<(u64, String, serde_json::Value, u64)> = facts
                 .iter()
-                .map(|f| (f.fact_id, f.path.clone(), f.value.clone()))
+                .map(|f| (f.fact_id, f.path.clone(), f.value.clone(), f.version))
                 .collect();
-            if let Err(e) = store.replace_partition(prefix, &rows) {
-                tracing::warn!(prefix = %prefix, error = %e, "LexStore replace_partition failed; next recall refetches");
+            if let Err(e) = store.replace_partition_versioned(prefix, &rows) {
+                tracing::warn!(prefix = %prefix, error = %e, "LexStore replace_partition_versioned failed; next recall refetches");
             }
         }
         fetched
@@ -9713,5 +9730,84 @@ mod tests {
         )
         .await;
         m_write.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_events_recall_dedups_versions() {
+        // 单源化修复（召回层版本裁决）：events 召回分支与 stable 单源化——同 path 多版本
+        // 不得重复进评分/名额/usage 计数（修复前：全版本逐条进 events）。
+        let mut server = mockito::Server::new_async().await;
+        let mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()));
+        let body = r#"[
+            {"fact_id":71,"path":"shared.test.events.EV","value":{"key":"EV","value":"old","timestamp":100},"source_session_id":1,"version":1},
+            {"fact_id":72,"path":"shared.test.events.EV","value":{"key":"EV","value":"new","timestamp":200},"source_session_id":1,"version":2}
+        ]"#;
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.events.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        let ctx = mgr.recall_context("goal", 3, 5).await;
+        assert_eq!(
+            ctx.events.len(),
+            1,
+            "同 path 多版本必须去重为最新版一条（修复前红=2 条）"
+        );
+        assert_eq!(ctx.events[0].value, "new");
+        let pending = mgr.usage_pending.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(pending.get(&72), Some(&1), "usage 计数只记最新版一次");
+        assert!(
+            !pending.contains_key(&71),
+            "旧版本 fact_id 不得进 usage 计数"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_summaries_recall_dedups_versions() {
+        // 单源化修复（召回层版本裁决）：summaries 分支同源化——同 path 多版本摘要重复占
+        // max_summaries 名额（修复前红=2 条）；Tombstoned 摘要不占名额。
+        let mut server = mockito::Server::new_async().await;
+        let mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()));
+        let body = r#"[
+            {"fact_id":81,"path":"shared.test.sessions.s1.summary","value":{"key":"s1.summary","value":"old summary","timestamp":100},"source_session_id":1,"version":1},
+            {"fact_id":82,"path":"shared.test.sessions.s1.summary","value":{"key":"s1.summary","value":"new summary","timestamp":200},"source_session_id":1,"version":2},
+            {"fact_id":83,"path":"shared.test.sessions.s9.summary","value":{"key":"s9.summary","value":"tomb","timestamp":300,"lifecycle_state":"Tombstoned"},"source_session_id":1,"version":1}
+        ]"#;
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.sessions.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        let ctx = mgr.recall_context("goal", 3, 5).await;
+        assert_eq!(ctx.summaries.len(), 1, "去重后仅最新版（修复前红=2）");
+        assert_eq!(ctx.summaries[0].value, "new summary");
+    }
+
+    #[tokio::test]
+    async fn test_family_catalog_dedups_and_filters_tombstones() {
+        // 单源化修复（召回层版本裁决）：notes/family 目录直读单源化——多版本去重 +
+        // Tombstoned 条目不进选取目录（修复前红=3 条含墓碑+旧版）。
+        let mut server = mockito::Server::new_async().await;
+        let mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()));
+        let body = r#"[
+            {"fact_id":91,"path":"shared.test.user.note_a","value":{"key":"note_a","value":"old","timestamp":100},"source_session_id":1,"version":1},
+            {"fact_id":92,"path":"shared.test.user.note_a","value":{"key":"note_a","value":"new","timestamp":200},"source_session_id":1,"version":2},
+            {"fact_id":93,"path":"shared.test.user.note_dead","value":{"key":"note_dead","value":"gone","timestamp":300,"lifecycle_state":"Tombstoned"},"source_session_id":1,"version":1}
+        ]"#;
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.user.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        let out = mgr.fetch_family_catalog("user").await.unwrap();
+        assert_eq!(out.len(), 1, "目录=最新版去重+墓碑过滤（修复前红=3）");
+        assert_eq!(out[0].key, "note_a");
+        assert_eq!(out[0].value, "new");
     }
 }
