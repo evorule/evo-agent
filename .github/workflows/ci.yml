@@ -193,7 +193,10 @@ jobs:
         if: matrix.tests && runner.os == 'Linux'
         shell: pwsh
         run: |
-          $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '2'
+          # serial (threads=1): under parallel execution the guard kills the
+          # tree when a spawn-kill-reap family test overlaps another test's
+          # children on the process tree; serial keeps at most one child.
+          $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '1'
           ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','--skip','runner::','--skip','builtin_tools::','--skip','pty::'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -201,7 +204,7 @@ jobs:
         if: matrix.tests && runner.os == 'Linux'
         shell: pwsh
         run: |
-          $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '2'
+          $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '1'
           ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','builtin_tools::','--skip','pty::'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
