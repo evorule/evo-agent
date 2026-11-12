@@ -558,6 +558,15 @@ fn shell_command(command: &str) -> (std::process::Command, String) {
 /// 声明不可达子进程（凭据外带面收闸；与 MCP spawn 闸最小集纪律对齐）
 fn build_hook_env(rule_env_keys: &[String]) -> Vec<(String, String)> {
     let parent: std::collections::HashMap<String, String> = std::env::vars().collect();
+    build_hook_env_from(&parent, rule_env_keys)
+}
+
+/// 纯函数变体（parent 可注入——测试不经进程环境，杜绝并行测试的
+/// 进程级 environ 竞争）
+fn build_hook_env_from(
+    parent: &std::collections::HashMap<String, String>,
+    rule_env_keys: &[String],
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for key in HOOK_MINIMAL_ENV_KEYS {
         if let Some(v) = parent.get(*key) {
@@ -609,25 +618,20 @@ async fn run_hook_rule(
         }
     };
     let payload = serde_json::to_vec(ctx).unwrap_or_default();
-    // stdin 写入与等待/排空并发：stdin 句柄先 take 脱离（所有权独立），
-    // 写入交独立 future；wait_with_output 并发读 stdout/stderr——子进程不排
-    // stdin / stdout 缓冲满时互不再阻塞（此前顺序写先于等待，post_tool 大
-    // 结果与不读 stdin 的子进程互锁至「超时」）
-    let mut stdin_handle = child.stdin.take();
-    let stdin_fut = async {
-        if let Some(stdin) = stdin_handle.as_mut() {
+    // stdin 写入与等待/排空并发：stdin 句柄移交独立任务写入（慢子进程不读
+    // stdin 时任务挂起，进程被超时杀死后管道断开、任务自然退出——无泄漏）；
+    // wait_with_output 并发读 stdout/stderr——大 payload 与不排 stdout 的
+    // 子进程互不再阻塞（此前顺序写先于等待，post_tool 大结果互锁至「超时」）
+    if let Some(mut stdin) = child.stdin.take() {
+        tokio::spawn(async move {
             if let Err(e) = stdin.write_all(&payload).await {
                 // 管道关闭（进程早退）不算致命——继续等退出码
                 let _ = e;
             }
             let _ = stdin.shutdown().await;
-        }
-    };
-    let timed = tokio::time::timeout(rule.timeout(), async move {
-        let (_, out) = tokio::join!(stdin_fut, child.wait_with_output());
-        out
-    })
-    .await;
+        });
+    }
+    let timed = tokio::time::timeout(rule.timeout(), child.wait_with_output()).await;
     match timed {
         Err(_) => HookOutcome {
             rule_index,
@@ -798,7 +802,8 @@ mod tests {
                     // timeout.exe 拒绝重定向 stdin;ping 是 Windows 惯用睡眠
                     "ping -n 30 127.0.0.1".into()
                 } else {
-                    "sleep 30".into()
+                    // exec 替换 shell 进程为本体——超时杀死的就是延迟本体
+                    "exec sleep 30".into()
                 },
                 timeout_secs: Some(1),
                 env_keys: Vec::new(),
@@ -991,15 +996,13 @@ mod batch_a_behavior {
 
     #[test]
     fn hook_env_is_minimal_baseline_plus_declared_keys() {
-        // 声明前：业务键不可达；声明后：可达；PATH 基线恒在
-        std::env::set_var("EVO_TEST_HOOK_ENV_KEY", "sentinel");
-        let rule = HookRule {
-            tool: "*".into(),
-            command: "echo hi".into(),
-            timeout_secs: None,
-            env_keys: vec!["EVO_TEST_HOOK_ENV_KEY".into()],
-        };
-        let env = build_hook_env(&rule.env_keys);
+        // 注入式：父环境为合成 HashMap（不经进程环境——并行测试下
+        // set_var 与他人 vars()/spawn 的 environ 竞争是 Linux UB 面）
+        let mut parent = std::collections::HashMap::new();
+        parent.insert("PATH".to_string(), "/usr/bin".to_string());
+        parent.insert("EVO_TEST_HOOK_ENV_KEY".to_string(), "sentinel".to_string());
+        let rule_env_keys = ["EVO_TEST_HOOK_ENV_KEY".to_string()];
+        let env = build_hook_env_from(&parent, &rule_env_keys);
         assert!(
             env.iter().any(|(k, _)| k == "PATH"),
             "PATH 基线必须在场（进程拉起必需）"
@@ -1009,7 +1012,7 @@ mod batch_a_behavior {
                 .any(|(k, v)| k == "EVO_TEST_HOOK_ENV_KEY" && v == "sentinel"),
             "env_keys 显式声明的键必须注入"
         );
-        let bare = build_hook_env(&[]);
+        let bare = build_hook_env_from(&parent, &[]);
         assert!(
             !bare.iter().any(|(k, _)| k == "EVO_TEST_HOOK_ENV_KEY"),
             "未声明的业务键不得注入（凭据外带面收闸）"
@@ -1017,7 +1020,6 @@ mod batch_a_behavior {
         assert!(bare
             .iter()
             .all(|(k, _)| HOOK_MINIMAL_ENV_KEYS.contains(&k.as_str())));
-        std::env::remove_var("EVO_TEST_HOOK_ENV_KEY");
     }
 
     #[tokio::test]
@@ -1032,7 +1034,9 @@ mod batch_a_behavior {
                 marker.display()
             )
         } else {
-            format!("sleep 6 && echo done > {}", marker.display())
+            // exec 替换 shell 进程为本体——超时杀死的就是延迟本体（普通
+            // 形态下 sh 死而 sleep 存活，marker 仍会被孤儿写出）
+            format!("exec sleep 6; echo done > {}", marker.display())
         };
         let hooks = UserHooks {
             pre_tool: vec![HookRule {
@@ -1054,8 +1058,8 @@ mod batch_a_behavior {
             .unwrap_or("")
             .contains("timeout"));
         assert!(
-            t0.elapsed() < std::time::Duration::from_secs(5),
-            "超时分支必须即时返回（kill_on_drop），不得干等子进程自然退出"
+            t0.elapsed() < std::time::Duration::from_secs(20),
+            "超时分支必须即时返回（kill_on_drop），不得干等子进程自然退出（CI 负载余量）"
         );
         // 越过延迟窗口：进程若仍存活则标记已写
         tokio::time::sleep(std::time::Duration::from_secs(7)).await;

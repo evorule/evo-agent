@@ -1361,6 +1361,17 @@ mod tests {
         }
     }
 
+    /// 决策文件形态 hook 命令（POSIX cat / Windows type——不依赖 shell 对
+    /// JSON 字面量的引号/brace 处理；echo 形态在 sh 下被 brace expansion
+    /// 撕裂，CI 实证）
+    fn decision_hook_cmd(file: &std::path::Path) -> String {
+        if cfg!(target_os = "windows") {
+            format!("type {}", file.display())
+        } else {
+            format!("cat {}", file.display())
+        }
+    }
+
     fn wired_for(
         dir: &std::path::Path,
         rules: Vec<crate::agent::user_hooks::HookRule>,
@@ -2182,6 +2193,12 @@ mod tests {
         let focus = FocusSnapshot::from_names(["file_write"]);
         let args = serde_json::json!({"path": "ok.txt", "content": "x"});
         let dir = tempfile::tempdir().unwrap();
+        let decision_file = dir.path().join("rewrite_out.json");
+        std::fs::write(
+            &decision_file,
+            r#"{"decision":"rewrite","args":{"path":"C:\\outside.txt","content":"x"}}"#,
+        )
+        .unwrap();
         let hooks = wired_for(
             dir.path(),
             vec![crate::agent::user_hooks::HookRule {
@@ -2224,12 +2241,17 @@ mod tests {
         let focus = FocusSnapshot::from_names(["shell_exec"]);
         let args = serde_json::json!({"command": "cargo build"});
         let dir = tempfile::tempdir().unwrap();
+        let decision_file = dir.path().join("rewrite_rm.json");
+        std::fs::write(
+            &decision_file,
+            r#"{"decision":"rewrite","args":{"command":"rm -rf old_dir"}}"#,
+        )
+        .unwrap();
         let hooks = wired_for(
             dir.path(),
             vec![crate::agent::user_hooks::HookRule {
                 tool: "shell_exec".into(),
-                command: r#"echo {"decision":"rewrite","args":{"command":"rm -rf old_dir"}}"#
-                    .into(),
+                command: decision_hook_cmd(&decision_file),
                 timeout_secs: Some(15),
                 env_keys: Vec::new(),
             }],
@@ -2284,11 +2306,17 @@ mod tests {
         let focus = FocusSnapshot::from_names(["file_read"]);
         let args = serde_json::json!({"path": "a.txt"});
         let dir = tempfile::tempdir().unwrap();
+        let decision_file = dir.path().join("rewrite_rw.json");
+        std::fs::write(
+            &decision_file,
+            r#"{"decision":"rewrite","args":{"path":"rewritten.txt"}}"#,
+        )
+        .unwrap();
         let hooks = wired_for(
             dir.path(),
             vec![crate::agent::user_hooks::HookRule {
                 tool: "file_read".into(),
-                command: r#"echo {"decision":"rewrite","args":{"path":"rewritten.txt"}}"#.into(),
+                command: decision_hook_cmd(&decision_file),
                 timeout_secs: Some(15),
                 env_keys: Vec::new(),
             }],
