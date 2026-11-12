@@ -157,7 +157,15 @@ jobs:
           # debug-full target artifacts; restoring them re-fills the disk
           # even though new builds are slim (debug=0). Bump the key so a
           # fresh slim cache is built from scratch.
-          key: ${{ matrix.os }}-slim1
+          # Warm-pool reroute (2026-11-03): controlled experiments showed the
+          # ubuntu verify pool lineage went stale on 10-28 (every frozen run
+          # died before its post-job save) and stale restores make this job
+          # slow enough to cross the ~50-minute hosted-runner wall where the
+          # job is killed with its whole log blob lost. Linux now restores the
+          # healthy lineage validated today via prefix matching; a nightly
+          # keep-warm run (freeze-bisect schedule) keeps it from going stale
+          # again. Windows lineage stayed healthy and keeps its old key.
+          key: ${{ runner.os == 'Linux' && 'ubuntu-probe-fresh0' || format('{0}-slim1', matrix.os) }}
 
       # 宪法 schema 校验组件以 git 依赖(rev 钉版)由 cargo 自动拉取,
       # 且 0.2.0 起 schema 编译期内嵌——运行时零磁盘依赖,无需检出宪法仓。
