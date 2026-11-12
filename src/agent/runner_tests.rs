@@ -7138,6 +7138,36 @@ async fn tool_result_fetch_reaches_real_executor_via_service_pipeline() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+#[tokio::test]
+async fn tool_result_fetch_direct_intercept_respects_toolkit_membership() {
+    // 保留名直拦先于管道,「关闭=下线」语义此前对其不成立——契约面无此
+    // 工具(被 agentTools/聚焦面过滤下线)时直拦不得触发,调用落回管道
+    // ①查表 fail-visible(tool not found),保留名不再豁免于开关面
+    let dir = gate_temp_dir("fetch-offline");
+    let mut handler = crate::builtin_tools::default_safe_toolkit(&dir, &dir);
+    assert!(
+        handler.unregister("tool_result_fetch"),
+        "fixture requires the tool to be registered by the default toolkit"
+    );
+    let runner = AgentRunner::new(AgentConfig::default(), make_test_client())
+        .with_tool_handler(handler)
+        .with_journal_dir(dir.clone());
+    let v = runner
+        .execute_tool_request(&serde_json::json!({
+            "tool_name": "tool_result_fetch",
+            "args": {"ref_id": "anything", "offset": 0u64, "max_chars": 5u64}
+        }))
+        .await
+        .expect("offline reserved name must fail visible, not panic");
+    let err = v["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("not found"),
+        "expected tool-not-found fail-visible, got: {v}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---- 陈旧工具结果发送视图降级(发送视图变换,默认关闭) ----
 
 /// 降级测试历史(K=2/T=100 显式小值场景):

@@ -6104,7 +6104,12 @@ impl AgentRunner {
         // 契约面(manifest+默认工具集注册+agent 白名单),但本拦截仍是唯一真
         // 执行点(持有 journal_dir 会话态);注册的 stub 仅并行臂路径可达,
         // fail-visible 提示后 LLM 单独重调即至此。
-        if tool_name == TOOL_RESULT_FETCH_TOOL {
+        // 「关闭=下线」语义:直拦仅在工具确实在契约面注册时生效——
+        // agentTools/聚焦面把该工具过滤下线后,保留名不再豁免于开关面,
+        // 调用落回管道①查表 fail-visible(tool not found)
+        if tool_name == TOOL_RESULT_FETCH_TOOL
+            && self.tool_handler.has_tool(TOOL_RESULT_FETCH_TOOL)
+        {
             return Ok((self.execute_tool_result_fetch(args), None));
         }
         // 一管道(工具面统一架构 §3.2):本函数为管道的薄翻译层——
