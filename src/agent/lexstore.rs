@@ -93,7 +93,7 @@ impl std::fmt::Display for LexError {
 
 impl std::error::Error for LexError {}
 
-/// 缓存事实(fact_id / path / 反序列化后的值)
+/// 缓存事实(fact_id / path / 反序列化后的值 / 账本版本号)
 #[derive(Debug, Clone)]
 pub struct CachedFact {
     /// 事实全局唯一 ID(账本分配;本地源合成 id 带 bit63 标记位)
@@ -102,6 +102,9 @@ pub struct CachedFact {
     pub path: String,
     /// 反序列化后的值 JSON
     pub value: serde_json::Value,
+    /// 账本版本号（版本裁决依据：同 path 取 version 最大/平局后出现者胜；
+    /// 0=旧库行或合成 id——退化为「后出现者胜」，语义与调用方约定一致）
+    pub version: u64,
 }
 
 /// LexStore:本地检索缓存(WAL;内部 Mutex 串行化——单写者纪律)
@@ -160,6 +163,7 @@ CREATE TABLE IF NOT EXISTS facts(
     source TEXT NOT NULL DEFAULT 'ledger',
     mem_type TEXT NOT NULL DEFAULT 'semantic',
     content_hash TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(prefix, fact_id)
 );
 CREATE TABLE IF NOT EXISTS postings(
@@ -420,6 +424,12 @@ impl LexStore {
             "content_hash",
             "content_hash TEXT NOT NULL DEFAULT ''",
         )?;
+        ensure_column(
+            &conn,
+            "facts",
+            "version",
+            "version INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
             path: path.to_path_buf(),
@@ -571,10 +581,27 @@ impl LexStore {
 
     /// 整分区替换(全量拉取后调用):淘汰该前缀旧事实与倒排,写入新事实,
     /// 并为每条事实的 path+value 分词倒排(R05 同源分词=同一实现同一索引)。
+    /// 旧形态兼容入口：version 记 0（裁决退化为「后出现者胜」）；
+    /// 生产召回面请用 [`Self::replace_partition_versioned`]。
     pub fn replace_partition(
         &self,
         prefix: &str,
         facts: &[(u64, String, serde_json::Value)],
+    ) -> Result<(), LexError> {
+        let versioned: Vec<(u64, String, serde_json::Value, u64)> = facts
+            .iter()
+            .map(|(fid, p, v)| (*fid, p.clone(), v.clone(), 0))
+            .collect();
+        self.replace_partition_versioned(prefix, &versioned)
+    }
+
+    /// 整分区替换·带版本形态：facts 表落真 version 列——缓存命中路径的
+    /// 版本裁决（同 path 取 version 最大/平局后出现者胜）不再依赖
+    /// 「服务端版本升序返回」隐含前提。
+    pub fn replace_partition_versioned(
+        &self,
+        prefix: &str,
+        facts: &[(u64, String, serde_json::Value, u64)],
     ) -> Result<(), LexError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let tx = conn
@@ -593,7 +620,7 @@ impl LexStore {
             [prefix],
         )
         .map_err(|e| LexError(format!("delete causes: {e}")))?;
-        for (fact_id, path, value) in facts {
+        for (fact_id, path, value, version) in facts {
             let value_json =
                 serde_json::to_string(value).map_err(|e| LexError(format!("serialize: {e}")))?;
             let mem_type = row_mem_type(value, prefix);
@@ -601,8 +628,8 @@ impl LexStore {
             // 去重视图基础（存储设计档 §十——去重从巩固管线下沉到存储层）
             let content_hash = blake3::hash(value_json.as_bytes()).to_string();
             tx.execute(
-                "INSERT INTO facts(prefix, fact_id, path, value_json, source, mem_type, content_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO facts(prefix, fact_id, path, value_json, source, mem_type, content_hash, version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     prefix,
                     *fact_id as i64,
@@ -610,7 +637,8 @@ impl LexStore {
                     value_json,
                     row_source::LEDGER,
                     mem_type,
-                    content_hash
+                    content_hash,
+                    *version as i64
                 ],
             )
             .map_err(|e| LexError(format!("insert fact: {e}")))?;
@@ -698,7 +726,7 @@ impl LexStore {
             return None;
         }
         let mut stmt = conn
-            .prepare("SELECT fact_id, path, value_json FROM facts WHERE prefix = ?1")
+            .prepare("SELECT fact_id, path, value_json, version FROM facts WHERE prefix = ?1")
             .ok()?;
         let rows = stmt
             .query_map([prefix], |row| {
@@ -706,17 +734,19 @@ impl LexStore {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })
             .ok()?;
         let mut out = Vec::new();
         for row in rows {
-            let (fact_id, path, value_json) = row.ok()?;
+            let (fact_id, path, value_json, version) = row.ok()?;
             let value = serde_json::from_str(&value_json).ok()?;
             out.push(CachedFact {
                 fact_id: fact_id as u64,
                 path,
                 value,
+                version: version.max(0) as u64,
             });
         }
         Some(out)
@@ -756,7 +786,7 @@ impl LexStore {
     pub fn local_facts(&self, prefix: &str) -> Option<Vec<CachedFact>> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = conn
-            .prepare("SELECT fact_id, path, value_json FROM facts WHERE prefix = ?1")
+            .prepare("SELECT fact_id, path, value_json, version FROM facts WHERE prefix = ?1")
             .ok()?;
         let rows = stmt
             .query_map([prefix], |row| {
@@ -764,17 +794,19 @@ impl LexStore {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })
             .ok()?;
         let mut out = Vec::new();
         for row in rows {
-            let (fact_id, path, value_json) = row.ok()?;
+            let (fact_id, path, value_json, version) = row.ok()?;
             let value = serde_json::from_str(&value_json).ok()?;
             out.push(CachedFact {
                 fact_id: fact_id as u64,
                 path,
                 value,
+                version: version.max(0) as u64,
             });
         }
         Some(out)
@@ -788,7 +820,7 @@ impl LexStore {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = conn
             .prepare(
-                "SELECT f.fact_id, f.path, f.value_json FROM facts f \
+                "SELECT f.fact_id, f.path, f.value_json, f.version FROM facts f \
                  WHERE f.prefix = ?1 AND f.content_hash != '' AND f.fact_id = (\
                  SELECT MAX(g.fact_id) FROM facts g \
                  WHERE g.prefix = f.prefix AND g.content_hash = f.content_hash) \
@@ -801,12 +833,13 @@ impl LexStore {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })
             .map_err(|e| LexError(format!("dedup_view query: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            let (fact_id, path, value_json) =
+            let (fact_id, path, value_json, version) =
                 row.map_err(|e| LexError(format!("dedup_view row: {e}")))?;
             let value = serde_json::from_str(&value_json)
                 .map_err(|e| LexError(format!("dedup_view parse: {e}")))?;
@@ -814,6 +847,7 @@ impl LexStore {
                 fact_id: fact_id as u64,
                 path,
                 value,
+                version: version.max(0) as u64,
             });
         }
         Ok(out)
@@ -1208,6 +1242,44 @@ mod tests {
         assert_eq!(got.len(), 2);
         // TTL 过期 → None(调用方走全量刷新)
         assert!(store.cached_facts("shared.ns.stable.", 0).is_none());
+    }
+
+    #[test]
+    fn test_replace_partition_versioned_preserves_version() {
+        // 单源化修复（缓存版本裁决）：facts 表落真 version 列——缓存命中路径的版本裁决
+        // 不再依赖「服务端版本升序返回」隐含前提（缓存命中映射回真 version）。
+        let path = temp_db("ver");
+        let store = LexStore::open(&path).unwrap();
+        let rows = vec![
+            (
+                11u64,
+                "shared.ns.stable.a".to_string(),
+                serde_json::json!({"key": "a", "value": "v1", "timestamp": 100}),
+                1u64,
+            ),
+            (
+                12u64,
+                "shared.ns.stable.a".to_string(),
+                serde_json::json!({"key": "a", "value": "v2", "timestamp": 200}),
+                7u64,
+            ),
+        ];
+        store
+            .replace_partition_versioned("shared.ns.stable.", &rows)
+            .unwrap();
+        let got = store.cached_facts("shared.ns.stable.", 60).unwrap();
+        assert_eq!(got.len(), 2);
+        let versions: std::collections::BTreeMap<u64, u64> =
+            got.iter().map(|f| (f.fact_id, f.version)).collect();
+        assert_eq!(versions.get(&11), Some(&1), "行 version 必须原样保留");
+        assert_eq!(versions.get(&12), Some(&7), "行 version 必须原样保留");
+        // 旧形态入口（version=0）语义保持：退化为「后出现者胜」的既定契约
+        let store2 = LexStore::open(&temp_db("ver0")).unwrap();
+        store2
+            .replace_partition("shared.ns.stable.", &facts()[..2])
+            .unwrap();
+        let got2 = store2.cached_facts("shared.ns.stable.", 60).unwrap();
+        assert!(got2.iter().all(|f| f.version == 0), "旧入口 version=0");
     }
 
     #[test]
