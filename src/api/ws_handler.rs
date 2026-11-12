@@ -988,6 +988,10 @@ async fn construct_runner(
     workspace: Option<&str>,
 ) -> Option<AgentRunner> {
     let mut def = state.definitions().load(agent_type).ok()?;
+    // 模型选择接线:工作台选择器写 serve 当前模型(llm_config.model,持久于
+    // llm_state),WS 主回合必须携带之——否则回合执行回落 def(toml 缺省),
+    // 选择器形同装饰(def.model 缺省 MiniMax-M3,用户切换不生效)。
+    def.model = state.current_llm_model();
     // 与 HTTP 端点同口径:general 定义未配置 memory 时注入最小持久记忆档
     if agent_type == "general"
         && (def.memory.memory_type == "none" || def.memory.memory_type.is_empty())
@@ -1790,6 +1794,64 @@ mod tests {
         assert_eq!(
             partial.request_approval(&req("file_delete")).await.reason,
             "file-delete"
+        );
+    }
+
+    // ===== 模型选择接线(工作台 WS 主路径) =====
+
+    #[tokio::test]
+    async fn construct_runner_uses_live_selected_model_over_def() {
+        // 选择器(switch_llm_model)写 serve 当前模型后,construct_runner 必须
+        // 将其覆盖到回合 def.model——修复前 WS 回合执行回落 def(toml 缺省
+        // MiniMax-M2.5),选择器形同装饰(agent 自报与实际执行全为旧模型)。
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("researcher.json"),
+            r#"{
+              "agent_type": "researcher",
+              "version": "0.1.0",
+              "description": "model selection wiring test agent",
+              "license": "AGPL-3.0-or-later",
+              "system_prompt": "test",
+              "model": "MiniMax-M2.5",
+              "temperature": 0.3,
+              "max_steps": 3,
+              "context_window_tokens": 204800,
+              "step_timeout_secs": 60,
+              "tools": ["file_read"],
+              "memory": {"type": "none", "namespace": "researcher"}
+            }"#,
+        )
+        .unwrap();
+        let cfg = crate::config::LlmConfig {
+            model: "glm-test-selection".to_string(),
+            ..Default::default()
+        };
+        let state = AgentApiState::new_with_metrics(
+            crate::agent::AgentDefinitionManager::new(agents_dir),
+            EvoruleApiClient::new("http://localhost:0"),
+            std::sync::Arc::new(crate::api::metrics::Metrics::new().unwrap()),
+            dir.path().to_path_buf(),
+            std::sync::Arc::new(crate::api::workspace_client::WorkspaceApiClient::new(
+                "http://localhost:0",
+            )),
+            std::sync::Arc::new(std::sync::RwLock::new(
+                crate::io_handlers::tool_handler::ToolHandler::new(),
+            )),
+        )
+        .with_llm_config(cfg);
+        // 模拟工作台选择器切换(写 serve 当前模型)
+        state.switch_llm_model("glm-test-selection");
+
+        let runner = construct_runner(&state, "researcher", None)
+            .await
+            .expect("construct_runner must succeed");
+        assert_eq!(
+            runner.config().model,
+            "glm-test-selection",
+            "回合模型必须=选择器当前值,而非 def(toml) 缺省"
         );
     }
 
