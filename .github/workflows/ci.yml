@@ -182,7 +182,7 @@ jobs:
         shell: pwsh
         run: |
           $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '2'; Write-Host "== before =="; free -m; df -h /
-          ./verify.ps1 -Phase test-run -CargoArgs --lib -- runner::
+          ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','runner::'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Host "== after =="; free -m; df -h /
 
@@ -191,7 +191,7 @@ jobs:
         shell: pwsh
         run: |
           $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs --lib -- --skip runner::
+          ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','--skip','runner::'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Host "== after =="; free -m; df -h /
 
