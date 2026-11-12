@@ -625,6 +625,31 @@ impl DelegateContext {
         .await
     }
 
+    /// 并发额度获取（递归死锁防线）：顶层委托（depth==0）照旧排队等待；
+    /// **递归委托（depth>0）**时父 runner 自身持着 permit 等子结果——信号量
+    /// 饱和时子代理的 acquire 将永久排队（父子互等，无超时结构性死锁）。
+    /// 递归场景改为 try_acquire 一次：额度可用=借用并发额度继续；不可用=
+    /// 显式失败回喂（LLM 可改路或提高并发上限），不再挂起。
+    async fn acquire_delegate_permit(
+        sem: &std::sync::Arc<tokio::sync::Semaphore>,
+        current_depth: usize,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        if current_depth > 0 {
+            sem.clone().try_acquire_owned().map_err(|_| {
+                format!(
+                    "recursive delegation would deadlock: all concurrent delegate \
+                     slots are held by ancestor agents (depth={current_depth}); \
+                     increase max_concurrent or delegate from the top-level agent"
+                )
+            })
+        } else {
+            sem.clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| format!("delegate semaphore closed: {e}"))
+        }
+    }
+
     /// 带父上下文摘要的并行委托(其余同 [`Self::delegate_parallel`])
     pub async fn delegate_parallel_with_context(
         &self,
@@ -637,12 +662,11 @@ impl DelegateContext {
                 let sem = ctx.max_concurrent.clone();
                 async move {
                     if let Some(sem) = sem {
-                        let _permit = match sem.acquire_owned().await {
-                            Ok(p) => p,
-                            Err(e) => {
-                                return Err(format!("delegate semaphore closed: {}", e));
-                            }
-                        };
+                        let _permit =
+                            match Self::acquire_delegate_permit(&sem, ctx.current_depth).await {
+                                Ok(p) => p,
+                                Err(e) => return Err(e),
+                            };
                     }
                     ctx.delegate_with_context(&agent_type, &task, context.as_deref())
                         .await
@@ -688,12 +712,11 @@ impl DelegateContext {
                 let ctx = self.increment_depth();
                 Box::pin(async move {
                     if let Some(sem) = ctx.max_concurrent.clone() {
-                        let _permit = match sem.acquire_owned().await {
-                            Ok(p) => p,
-                            Err(e) => {
-                                return Err(format!("delegate semaphore closed: {}", e));
-                            }
-                        };
+                        let _permit =
+                            match Self::acquire_delegate_permit(&sem, ctx.current_depth).await {
+                                Ok(p) => p,
+                                Err(e) => return Err(e),
+                            };
                     }
                     ctx.delegate_with_context(&agent_type, &task, context.as_deref())
                         .await
@@ -1133,5 +1156,47 @@ mod tests {
     #[test]
     fn test_default_max_concurrent_delegates_is_5() {
         assert_eq!(DEFAULT_MAX_CONCURRENT_DELEGATES, 5);
+    }
+}
+
+#[cfg(test)]
+mod permit_deadlock_tests {
+    use super::*;
+
+    /// 递归委托（depth>0）在额度饱和时必须立即显式失败——不得挂起
+    #[tokio::test]
+    async fn recursive_delegate_fails_fast_when_saturated() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        // 饱和：唯一 permit 被祖先持有
+        let _ancestor = sem.clone().acquire_owned().await.unwrap();
+        let t0 = std::time::Instant::now();
+        let err = DelegateContext::acquire_delegate_permit(&sem, 1)
+            .await
+            .expect_err("递归+饱和必须显式失败");
+        assert!(err.contains("deadlock"), "错误必须点名死锁语义: {err}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(500),
+            "必须立即返回（不得排队挂起）"
+        );
+    }
+
+    /// 递归委托在额度可用时照常获取
+    #[tokio::test]
+    async fn recursive_delegate_acquires_when_slot_free() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let p = DelegateContext::acquire_delegate_permit(&sem, 1)
+            .await
+            .expect("额度可用必须获取成功");
+        drop(p);
+    }
+
+    /// 顶层委托（depth=0）在额度可用时照常获取（排队语义不受影响）
+    #[tokio::test]
+    async fn top_level_delegate_acquires_when_slot_free() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let p = DelegateContext::acquire_delegate_permit(&sem, 0)
+            .await
+            .expect("顶层获取不受影响");
+        drop(p);
     }
 }

@@ -167,16 +167,58 @@ impl McpClient {
     ///
     /// 返回 server 暴露的所有工具的 spec。
     pub async fn list_tools(&self) -> Result<Vec<McpToolSpec>, String> {
-        let result = self
-            .request_tracked("tools/list", serde_json::json!({}))
-            .await?;
+        // cursor 分页循环：server 侧分页大小小于工具总数时逐页取齐——
+        // 此前只取首页且对 nextCursor 静默（工具面缺件不可见）
+        let mut specs: Vec<McpToolSpec> = Vec::new();
+        let mut cursor: Option<Value> = None;
+        let mut pages = 0usize;
+        loop {
+            let mut params = serde_json::json!({});
+            if let Some(c) = &cursor {
+                params["cursor"] = c.clone();
+            }
+            let result = self.request_tracked("tools/list", params).await?;
+            let tools = result
+                .get("tools")
+                .ok_or("MCP tools/list: missing 'tools' field")?
+                .as_array()
+                .ok_or("MCP tools/list: 'tools' is not an array")?;
+            for t in tools {
+                let name = t
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or("MCP tool: missing 'name'")?
+                    .to_string();
+                let description = t
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let input_schema = t.get("inputSchema").cloned().unwrap_or(Value::Null);
+                specs.push(McpToolSpec {
+                    name,
+                    description,
+                    input_schema,
+                });
+            }
+            pages += 1;
+            cursor = result.get("nextCursor").filter(|c| !c.is_null()).cloned();
+            if cursor.is_none() {
+                break;
+            }
+            if pages >= 100 {
+                return Err(
+                    "MCP tools/list pagination exceeded 100 pages (possible cursor loop)"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(specs)
+    }
 
-        let tools = result
-            .get("tools")
-            .ok_or("MCP tools/list: missing 'tools' field")?
-            .as_array()
-            .ok_or("MCP tools/list: 'tools' is not an array")?;
-
+    /// 解析单页工具条目（分页循环内联辅助——保留旧形态签名供测试引用）
+    #[allow(dead_code)]
+    fn parse_tool_page(tools: &[Value]) -> Result<Vec<McpToolSpec>, String> {
         tools
             .iter()
             .map(|t| {
