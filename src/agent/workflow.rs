@@ -1027,6 +1027,31 @@ impl WorkflowEngine {
                     node_id = %id,
                     "resume: node restored from checkpoint, skipping re-execution"
                 );
+                // 恢复收敛（reconcile-on-restart）：run 账检查点与 marks 会话
+                // 标记可能落在崩溃/通道故障的窗口两侧（checkpoint_node 已落、
+                // mark_node_done 未落）——恢复后不补标=下游 phase 门恒拒
+                // （prerequisite mark missing）且外层不 replan，恢复语义永久
+                // 卡死。放行继续执行前先把标记收敛一致（幂等：node_done 为
+                // 中性 set 信号，重复提交仅再次推进 marks 会话 version）。
+                // 仅 LLM 节点参与 phase 门（compute 节点无标记面）。
+                if let Some(gate) = &self.phase_gate {
+                    let is_llm = wf
+                        .nodes
+                        .iter()
+                        .find(|n| &n.id == id)
+                        .map(|n| n.compute.is_none())
+                        .unwrap_or(false);
+                    if is_llm {
+                        Self::mark_node_done(gate, id).await.map_err(|e| {
+                            format!("workflow resume reconcile failed (node '{}'): {}", id, e)
+                        })?;
+                        tracing::info!(
+                            workflow_id = %wf.workflow_id,
+                            node_id = %id,
+                            "resume: reconciled node_done mark for restored node"
+                        );
+                    }
+                }
             }
             for id in &newly_skipped {
                 tracing::info!(
@@ -1095,6 +1120,25 @@ impl WorkflowEngine {
             // 配对:节点成功后 mark_node_done 即时打标(见 PhaseGate 时序契约),
             // 保证下一节点的门可查到前置标记。
             if let Some(gate) = &self.phase_gate {
+                // o86 前置可达性预检：phase 前置任务在设计期被 run_when 级联
+                // 跳过时，其 node_done 标记永不存在——phase 门必拒且归因误导
+                // （prerequisite mark missing 指向一个永远不会出现的标记）。
+                // 显式预检给出准确归因并即时失败（fail-visible）：治理语义
+                // 保持（前置任务被跳过=未尽责，下游不实施——不放行，只让
+                // 失败立即可判读、归因直达成因）。
+                for node in &llm_nodes {
+                    let skipped_prereqs: Vec<&String> = node
+                        .depends_on
+                        .iter()
+                        .filter(|d| skipped.contains(*d))
+                        .collect();
+                    if !skipped_prereqs.is_empty() {
+                        return Err(format!(
+                            "workflow node '{}' is gated on skipped prerequisites {:?}                              (run_when cascade): the phase prerequisite mark can never                              exist for a skipped task — adjust run_when or the                              dependency edge",
+                            node.id, skipped_prereqs
+                        ));
+                    }
+                }
                 for node in &llm_nodes {
                     let allowed = crate::agent::runner::submit_signal_and_await_verdict(
                         &gate.client,
@@ -4730,5 +4774,123 @@ mod tests {
             err.contains("cannot declare both compute and judge"),
             "错误须指明互斥: {err}"
         );
+    }
+    // ── 批 W：o73 恢复收敛 + o86 skipped 前置预检 ──
+
+    /// o73：restored LLM 节点在 resume 时必须幂等补提 node_done 标记
+    /// （reconcile-on-restart）——崩溃窗口（checkpoint 已落/mark 未落）后
+    /// 不补标=下游 phase 门恒拒永久卡死。mockito 断言 mark 信号确已提交。
+    #[tokio::test]
+    async fn resume_reconciles_missing_node_done_mark() {
+        use crate::agent::driver::node_done_signal;
+        let mut server = mockito::Server::new_async().await;
+        // marks 会话：before=v0 → command(node_done) → poll=v1（放行）
+        server
+            .mock("GET", "/api/sessions/77/state")
+            .with_status(200)
+            .with_body(r#"{"version": 0}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/sessions/77/state")
+            .with_status(200)
+            .with_body(r#"{"version": 1}"#)
+            .create_async()
+            .await;
+        let mark_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_for_body = std::sync::Arc::clone(&mark_hits);
+        server
+            .mock("POST", "/api/sessions/77/command")
+            .with_chunked_body(move |w: &mut dyn std::io::Write| {
+                hits_for_body.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                w.write_all(b"{}")
+            })
+            .create_async()
+            .await;
+
+        let engine = WorkflowEngine::new(make_ctx()).with_phase_gate(PhaseGate {
+            marks_session: "77".to_string(),
+            client: EvoruleApiClient::new(&server.url()),
+        });
+        let wf = Workflow {
+            workflow_id: "resume-w".to_string(),
+            description: String::new(),
+            nodes: vec![
+                node("n1", "researcher", &[]),
+                WorkflowNode {
+                    compute: Some(ComputeSpec::Strcmp {
+                        inputs: vec![
+                            ComputeInput::Node("n1".into()),
+                            ComputeInput::Node("n1".into()),
+                        ],
+                        mode: StrcmpMode::Equal,
+                    }),
+                    ..node("out", "writer", &["n1"])
+                },
+            ],
+            output_node: "out".to_string(),
+        };
+        let mut replay = NodeCheckpointReplay::default();
+        replay.results.insert("n1".to_string(), "r1".to_string());
+
+        let result = engine.execute_with_resume(&wf, replay).await;
+        assert!(result.is_ok(), "resume 应收敛标记并继续: {result:?}");
+        assert!(
+            mark_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "resume 必须对 restored LLM 节点补提 node_done 标记"
+        );
+    }
+
+    /// o86：phase 前置被 run_when 级联跳过时，显式预检给出准确归因并即时
+    /// 失败（run_when 显式为真的节点不受级联约束，但其 depends_on 落在
+    /// skipped 集 → 前置标记永不存在 → 必须立即可判读地失败，而非走进
+    /// phase 门收下一条误导性 enforce violation）。
+    #[tokio::test]
+    async fn phase_gate_skipped_prerequisite_fails_fast_with_accurate_attribution() {
+        let engine = WorkflowEngine::new(make_ctx()).with_phase_gate(PhaseGate {
+            marks_session: "78".to_string(),
+            client: EvoruleApiClient::new("http://127.0.0.1:1"),
+        });
+        let c = WorkflowNode {
+            compute: Some(ComputeSpec::Strcmp {
+                inputs: vec![ComputeInput::Empty, ComputeInput::Empty],
+                mode: StrcmpMode::Equal,
+            }),
+            ..node("c", "checker", &[])
+        };
+        let mut a = node("a", "researcher", &["c"]);
+        // a 被 run_when 求值跳过（c 在更早层，其产出 equal 不含 never；
+        // run_when 引用须严格更早层，故 a 挂 depends_on c 落下一层）
+        a.run_when = Some(RunWhen {
+            node: "c".to_string(),
+            op: ConditionOp::Contains,
+            value: "never".to_string(),
+        });
+        let mut b = node("b", "writer", &["a"]);
+        // b 的 run_when 显式为真（c 的产出 equal 不含 never → NotContains 命中）
+        // ——不受级联约束，进 phase 门
+        b.run_when = Some(RunWhen {
+            node: "c".to_string(),
+            op: ConditionOp::NotContains,
+            value: "never".to_string(),
+        });
+        let wf = Workflow {
+            workflow_id: "skip-gate-w".to_string(),
+            description: String::new(),
+            nodes: vec![c, a, b],
+            output_node: "b".to_string(),
+        };
+        let replay = NodeCheckpointReplay::default();
+
+        let err = engine
+            .execute_with_resume(&wf, replay)
+            .await
+            .expect_err("skipped 前置必须显式失败");
+        assert!(
+            err.contains("skipped prerequisites"),
+            "归因必须点名 skipped 前置: {err}"
+        );
+        assert!(err.contains('a'), "归因必须点名被跳过的前置节点: {err}");
     }
 }
