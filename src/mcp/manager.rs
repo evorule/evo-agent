@@ -58,6 +58,10 @@ pub struct McpServerEntry {
     pub client: Option<std::sync::Arc<McpClient>>,
     /// tools/list 发现的工具清单(connected 态填充,状态面/工具树数据源)
     pub tools: Vec<McpToolSpec>,
+    /// 已成功注册进 toolkit 的注册名名册（`mcp_{server}_{tool}` 全集；注册闸
+    /// 碰撞检测的归属权威——只在注册成功后登记，拒绝注册不占名）。收割/
+    /// 断连/落 Failed 即清空（所有权随运行态消失）
+    pub registered: Vec<String>,
     /// 生命周期收割通知端（资源边界设计（L1）；策略激活时 Some——serve 重启监督
     /// 经 [`McpManager::take_reap_receivers`] 取走消费）
     pub reap_rx: Option<tokio::sync::mpsc::UnboundedReceiver<super::lifecycle::ReapNotice>>,
@@ -120,6 +124,7 @@ impl McpManager {
                 status: McpServerStatus::Starting,
                 client: None,
                 tools: Vec::new(),
+                registered: Vec::new(),
                 reap_rx: None,
             },
         );
@@ -140,6 +145,7 @@ impl McpManager {
                         status: McpServerStatus::Connected,
                         client: Some(client.clone()),
                         tools: tools.clone(),
+                        registered: Vec::new(),
                         reap_rx,
                     },
                 )
@@ -152,6 +158,7 @@ impl McpManager {
                     },
                     client: None,
                     tools: Vec::new(),
+                    registered: Vec::new(),
                     reap_rx: None,
                 },
             ),
@@ -301,12 +308,11 @@ impl McpManager {
                 for name in &stale {
                     tool_handler.unregister(name);
                 }
-                register_client_tools(
+                self.register_server_tools_checked(
                     tool_handler,
-                    &cfg.name,
+                    cfg,
                     &client,
                     &tools,
-                    &cfg.always_allow,
                     cfg.timeout_secs,
                 )
             }
@@ -336,12 +342,11 @@ impl McpManager {
             }
             match self.connect_server(cfg).await {
                 Ok((client, tools)) => {
-                    match register_client_tools(
+                    match self.register_server_tools_checked(
                         tool_handler,
-                        &cfg.name,
+                        cfg,
                         &client,
                         &tools,
-                        &cfg.always_allow,
                         cfg.timeout_secs,
                     ) {
                         Ok(count) => {
@@ -361,6 +366,7 @@ impl McpManager {
                                     status: McpServerStatus::Failed { error: e },
                                     client: None,
                                     tools: Vec::new(),
+                                    registered: Vec::new(),
                                     reap_rx: None,
                                 },
                             );
@@ -402,6 +408,7 @@ impl McpManager {
                         status: v.status.clone(),
                         client: v.client.clone(),
                         tools: v.tools.clone(),
+                        registered: v.registered.clone(),
                         reap_rx: None,
                     },
                 )
@@ -440,6 +447,7 @@ impl McpManager {
             McpServerEntry {
                 status: McpServerStatus::Connected,
                 client: None,
+                registered: server_tool_registered_names(name, &tools),
                 tools,
                 reap_rx: None,
             },
@@ -457,13 +465,142 @@ impl McpManager {
                 },
                 client: None,
                 tools: Vec::new(),
+                registered: Vec::new(),
                 reap_rx: None,
             },
         );
     }
 
+    /// 收割落账：lifecycle 收割（close→kill 进程树）后由 serve 重启监督任务
+    /// 调用——运行态条目落 Failed（kill 已发生、client 失效，状态面不得再
+    /// 报 connected 假活）、清空 client/tools/名册/reap_rx；返回该 server 既有
+    /// 注册名清单供调用方在 toolkit 侧同步注销（指向死连接的执行器条目
+    /// 不再滞留）。条目缺席（已 disconnect/未连接）= 无操作返回空。
+    pub fn mark_reaped(&self, name: &str, reason: &super::lifecycle::ReapReason) -> Vec<String> {
+        let mut guard = self.entries.lock().expect("mcp manager lock");
+        let Some(entry) = guard.get_mut(name) else {
+            return Vec::new();
+        };
+        let mut stale = entry.registered.clone();
+        if stale.is_empty() {
+            // 名册缺席（注册前即收割的窗口）回落到工具清单重算
+            stale = server_tool_registered_names(name, &entry.tools);
+        }
+        entry.status = McpServerStatus::Failed {
+            error: format!("reaped ({})", reason.detail()),
+        };
+        entry.client = None;
+        entry.tools = Vec::new();
+        entry.registered = Vec::new();
+        entry.reap_rx = None;
+        stale
+    }
+
+    /// 注册名归属查表：entries 内逐 server 扫描其**已登记名册**（注册成功
+    /// 后由 [`Self::register_server_tools_checked`] 写入），返回拥有该注册名
+    /// 的 server 名。
+    ///
+    /// 注册闸碰撞检测的归属面——纯拼接命名可碰撞（server `a` tool `b_x` ≡
+    /// server `a_b` tool `x`），handler 条目只有注册名无 server 身份，归属
+    /// 必须由 manager 名册反查。名册只在注册成功后登记（拒绝注册不占名），
+    /// 收割/断连/落 Failed 即清空——所有权唯一且确定（HashMap 迭代序无关）。
+    pub fn owner_of_registered_name(&self, registered: &str) -> Option<String> {
+        let guard = self.entries.lock().expect("mcp manager lock");
+        for (name, entry) in guard.iter() {
+            if entry.registered.iter().any(|n| n == registered) {
+                return Some(name.clone());
+            }
+        }
+        None
+    }
+
+    /// 碰撞检测版注册（MCP 工具进 toolkit 的唯一注册入口）
+    ///
+    /// 逐工具过注册闸（见 [`registration_collision_gate`]）后委托
+    /// [`register_client_tools`]，成功即登记名册（所有权生效）。消费点 =
+    /// `connect_and_register_all`（启动）、[`Self::restart`]（重启）、
+    /// mcp_api reload/restart 端点——四个注册面同闸，杜绝跨 server 拼接
+    /// 碰撞的静默顶替。
+    pub fn register_server_tools_checked(
+        &self,
+        tool_handler: &mut crate::io_handlers::tool_handler::ToolHandler,
+        cfg: &McpServerConfig,
+        client: &std::sync::Arc<McpClient>,
+        tools: &[McpToolSpec],
+        timeout_secs: u64,
+    ) -> Result<usize, String> {
+        let registrant_tracked = self
+            .entries
+            .lock()
+            .expect("mcp manager lock")
+            .contains_key(&cfg.name);
+        for tool in tools {
+            let registered = crate::mcp::mcp_tool_name(&cfg.name, &tool.name);
+            let existing = tool_handler.manifest(&registered);
+            let owner = self.owner_of_registered_name(&registered);
+            registration_collision_gate(
+                existing.as_ref(),
+                owner.as_deref(),
+                &cfg.name,
+                registrant_tracked,
+            )
+            .map_err(|e| format!("tool '{registered}': {e}"))?;
+        }
+        let count = register_client_tools(
+            tool_handler,
+            &cfg.name,
+            client,
+            tools,
+            &cfg.always_allow,
+            timeout_secs,
+        )?;
+        // 注册成功 = 所有权登记（拒绝注册不占名；整批成功或整批失败，
+        // register_client_tools 中途失败时无部分登记面）
+        let names = server_tool_registered_names(&cfg.name, tools);
+        self.entries
+            .lock()
+            .expect("mcp manager lock")
+            .entry(cfg.name.clone())
+            .and_modify(|e| e.registered = names);
+        Ok(count)
+    }
+
     fn remove_entry(&self, name: &str) -> Option<McpServerEntry> {
         self.entries.lock().expect("mcp manager lock").remove(name)
+    }
+}
+
+/// 注册闸决策（纯函数，MC-8 碰撞检测判定面，测试锚定）
+///
+/// `existing` = toolkit 内同名既有条目；`owner` = 注册名归属查表结果；
+/// `registrant` = 本次注册的 server 名；`registrant_tracked` = 该 server
+/// 是否在 manager 运行态在册（收割/断连窗口内自家重注册的放行判据）。
+/// 返回 `Err` = 拒绝注册（fail-visible，调用方落 Failed 呈状态面）。
+fn registration_collision_gate(
+    existing: Option<&crate::agent::tool_manifest::ToolManifest>,
+    owner: Option<&str>,
+    registrant: &str,
+    registrant_tracked: bool,
+) -> Result<(), String> {
+    let Some(m) = existing else {
+        return Ok(());
+    };
+    if m.source != crate::agent::tool_manifest::ToolSource::Mcp {
+        return Err(format!(
+            "name collides with non-MCP tool (source {:?}); refusing cross-source shadow registration",
+            m.source
+        ));
+    }
+    match owner {
+        Some(o) if o == registrant => Ok(()),
+        Some(o) => Err(format!(
+            "name already owned by MCP server '{o}'; rename one of the servers/tools (concatenated names must stay unique)"
+        )),
+        None if registrant_tracked => Ok(()),
+        None => Err(
+            "name exists but no MCP server claims it; refusing orphan shadow registration"
+                .to_string(),
+        ),
     }
 }
 
@@ -691,6 +828,191 @@ mod tests {
         );
         let snap = mgr.snapshot();
         assert_eq!(snap[0].1.status.as_str(), "failed");
+    }
+
+    // ---- 收割落账（MC-5）----
+
+    #[test]
+    fn test_mark_reaped_lands_failed_and_returns_stale_names() {
+        let mgr = McpManager::new();
+        mgr.seed_connected_entry(
+            "reaped",
+            vec![McpToolSpec {
+                name: "echo".to_string(),
+                description: "e".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+        );
+        let stale = mgr.mark_reaped(
+            "reaped",
+            &super::super::lifecycle::ReapReason::Idle { idle_secs: 90 },
+        );
+        assert_eq!(stale, vec!["mcp_reaped_echo".to_string()]);
+        let snap = mgr.snapshot();
+        assert_eq!(
+            snap[0].1.status.as_str(),
+            "failed",
+            "state face must not report connected after reap"
+        );
+        assert!(snap[0].1.client.is_none());
+        assert!(
+            snap[0].1.tools.is_empty(),
+            "dead server tool list must clear"
+        );
+        // 未知 server = 无操作
+        let none = mgr.mark_reaped(
+            "ghost",
+            &super::super::lifecycle::ReapReason::Idle { idle_secs: 1 },
+        );
+        assert!(none.is_empty());
+        assert!(
+            mgr.snapshot().len() == 1,
+            "unknown reap must not create entries"
+        );
+    }
+
+    // ---- 注册闸（MC-8）----
+
+    fn mcp_manifest(name: &str) -> crate::agent::tool_manifest::ToolManifest {
+        crate::agent::tool_manifest::dynamic_manifest(
+            name,
+            crate::agent::tool_manifest::ToolSource::Mcp,
+            "probe".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_registration_collision_gate_verdicts() {
+        use crate::agent::tool_manifest::ToolSource;
+        let mcp_existing = mcp_manifest("mcp_a_b_x");
+        // 空位 = 放行
+        assert!(registration_collision_gate(None, None, "a_b", false).is_ok());
+        // 跨来源冒名覆盖 = 拒（与 register_guarded 同语义的注册前置面）
+        let mut builtin = mcp_manifest("mcp_a_b_x");
+        builtin.source = ToolSource::Builtin;
+        assert!(registration_collision_gate(Some(&builtin), None, "a_b", false).is_err());
+        // Mcp↔Mcp 拼接碰撞：归属他 server = 拒（MC-8 静默顶替面）
+        assert!(registration_collision_gate(Some(&mcp_existing), Some("a"), "a_b", true).is_err());
+        // 归属本 server（重启/重载正当重注册）= 放行
+        assert!(registration_collision_gate(Some(&mcp_existing), Some("a_b"), "a_b", true).is_ok());
+        // 归属不明 + 本 server 在册（收割/断连窗口自家重注册）= 放行
+        assert!(registration_collision_gate(Some(&mcp_existing), None, "a_b", true).is_ok());
+        // 归属不明 + 本 server 不在册（孤儿条目）= 拒（fail-visible）
+        assert!(registration_collision_gate(Some(&mcp_existing), None, "a_b", false).is_err());
+    }
+
+    #[test]
+    fn test_owner_of_registered_name_reflects_registry() {
+        // 注册名归属 = 已登记名册反查（唯一且确定，HashMap 迭代序无关）：
+        // server "a" 注册 tool "b_x" → mcp_a_b_x 归属 "a"；无主名 → None
+        let mgr = McpManager::new();
+        mgr.seed_connected_entry(
+            "a",
+            vec![McpToolSpec {
+                name: "b_x".to_string(),
+                description: "d".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+        );
+        assert_eq!(
+            mgr.owner_of_registered_name("mcp_a_b_x"),
+            Some("a".to_string()),
+            "registered name is owned by its registrant"
+        );
+        assert_eq!(mgr.owner_of_registered_name("mcp_nobody_here"), None);
+        // 收割落账清名册 → 归属消失（所有权随运行态消失）
+        mgr.mark_reaped(
+            "a",
+            &super::super::lifecycle::ReapReason::Lifetime { age_secs: 99 },
+        );
+        assert_eq!(
+            mgr.owner_of_registered_name("mcp_a_b_x"),
+            None,
+            "reaped server releases name ownership"
+        );
+    }
+
+    /// 注册闸测试用的最小传输桩：握手/清单应答，空工具集
+    struct GateStubTransport;
+    #[async_trait::async_trait]
+    impl McpTransport for GateStubTransport {
+        async fn request(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            match method {
+                "initialize" => Ok(serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": {"name": "gate-stub", "version": "0"},
+                    "capabilities": {"tools": {}}
+                })),
+                "tools/list" => Ok(serde_json::json!({"tools": []})),
+                _ => Ok(serde_json::json!({})),
+            }
+        }
+        async fn notify(&self, _method: &str, _params: serde_json::Value) -> Result<(), String> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_register_server_tools_checked_refuses_cross_server_collision() {
+        let mgr = McpManager::new();
+        let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
+        // server "a" 已连接并注册 tool "b_x"（注册名 mcp_a_b_x，名册登记）
+        mgr.seed_connected_entry(
+            "a",
+            vec![McpToolSpec {
+                name: "b_x".to_string(),
+                description: "d".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+        );
+        handler.register(
+            mcp_manifest("mcp_a_b_x"),
+            std::sync::Arc::new(RebindProbeTool),
+        );
+        // server "a_b" 连接成功（stub 握手），tool "x" 拼接出同一注册名 → 拒
+        let client = std::sync::Arc::new(
+            McpClient::connect(std::sync::Arc::new(GateStubTransport))
+                .await
+                .unwrap(),
+        );
+        let cfg_ab = cfg("a_b", "noop");
+        let tools = vec![McpToolSpec {
+            name: "x".to_string(),
+            description: "d".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let err = mgr
+            .register_server_tools_checked(&mut handler, &cfg_ab, &client, &tools, 5)
+            .unwrap_err();
+        assert!(
+            err.contains("already owned by MCP server 'a'"),
+            "cross-server concatenation collision must be refused, got: {err}"
+        );
+        assert!(
+            handler.has_tool("mcp_a_b_x"),
+            "existing entry must stay intact on refusal"
+        );
+        // 拒绝注册不占名：a_b 的条目即使由 connect 先建，名册也不含被拒名
+        assert_eq!(
+            mgr.owner_of_registered_name("mcp_a_b_x"),
+            Some("a".to_string())
+        );
+        // 同 server 重注册（重启/重载窗口，归属=本 server）= 放行
+        let cfg_a = cfg("a", "noop");
+        let ok = mgr.register_server_tools_checked(&mut handler, &cfg_a, &client, &tools, 5);
+        assert!(
+            ok.is_ok(),
+            "same-server re-registration must pass the gate: {ok:?}"
+        );
     }
 }
 

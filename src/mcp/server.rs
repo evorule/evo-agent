@@ -123,6 +123,36 @@ fn tools_view(state: &AgentApiState) -> Result<Vec<Value>, String> {
     Ok(tools)
 }
 
+/// /mcp 面裁决闸决策（纯函数，测试锚定面）
+///
+/// 返回 `true` = 该工具在本面必须拒执（无裁决通道在场）。判定序：
+/// 1. **动态源白名单直跑豁免**：runtime manifest 为 Mcp/ServiceProxy 源且
+///    `approval_policy==AutoPolicy`（注册期 `always_allow` 覆写，= 用户对
+///    该工具的显式授权）→ 免裁决放行。豁免判据与注册覆写同源
+///    （`tool_adapter::register_client_tools`）；同名注册被注册闸碰撞检测
+///    与 `register_guarded` 跨来源防线封堵，runtime manifest 的来源字段
+///    可信，不构成冒名豁免通道。静态工具（Builtin/Rule）不适用豁免——
+///    其分级以静态表为准（防降级锚），行为不变。
+/// 2. 其余沿用 `is_p2_adjudicated_runtime`（静态表优先 ∪ 动态分级）。
+fn mcp_face_requires_adjudication(
+    name: &str,
+    runtime: Option<&crate::agent::tool_manifest::ToolManifest>,
+) -> bool {
+    let whitelisted_direct_run = runtime
+        .map(|m| {
+            matches!(
+                m.source,
+                crate::agent::tool_manifest::ToolSource::Mcp
+                    | crate::agent::tool_manifest::ToolSource::ServiceProxy
+            ) && m.approval_policy == crate::agent::tool_manifest::ApprovalPolicy::AutoPolicy
+        })
+        .unwrap_or(false);
+    if whitelisted_direct_run {
+        return false;
+    }
+    crate::agent::tool_manifest::is_p2_adjudicated_runtime(name, runtime)
+}
+
 /// tools/call:执行工具并映射 MCP result 形态
 ///
 /// 业务错误(工具执行失败)映射 `isError:true` + 文本 content——MCP 规范
@@ -148,12 +178,10 @@ async fn call_tool(state: &AgentApiState, params: &Value) -> Result<Value, Strin
     // 裁决会话通道——本面无该通道在场，直接拒绝而非静默跳过裁决（意图
     // 必报语义对面级调用不可打折）；file_write/edit_file/delegate 等
     // AutoPolicy 写面/派发面工具由此不可被外部客户端免裁决直跑。可调面
-    // =Standard 工具（只读/查账/技能读等）+人工降档后的动态源工具；
+    // =Standard 工具（只读/查账/技能读等）+人工降档后的动态源工具+动态源
+    // 白名单直跑工具（见 mcp_face_requires_adjudication 豁免半边）；
     // candidate 形态另由下方⑤同源评估短路。
-    if crate::agent::tool_manifest::is_p2_adjudicated_runtime(
-        &name,
-        toolkit.manifest(&name).as_ref(),
-    ) {
+    if mcp_face_requires_adjudication(&name, toolkit.manifest(&name).as_ref()) {
         warn!(tool = %name, "MCP tools/call governance-adjudicated tool; no adjudication channel on this face; not executed");
         state
             .mcp_ledger()
@@ -334,6 +362,95 @@ mod tests {
             text.to_lowercase().contains("adjudication")
                 || text.to_lowercase().contains("governance"),
             "拒执文案必须点名治理裁决缺失: {text}"
+        );
+    }
+
+    // ---- 裁决闸决策纯函数（白名单豁免半边，(a)+(b) 双通裁定）----
+
+    fn dynamic_manifest_for_test(
+        name: &str,
+        source: crate::agent::tool_manifest::ToolSource,
+    ) -> crate::agent::tool_manifest::ToolManifest {
+        crate::agent::tool_manifest::dynamic_manifest(
+            name,
+            source,
+            "gate probe".to_string(),
+            json!({"type": "object", "properties": {}}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_mcp_face_gate_whitelist_exemption_verdicts() {
+        use crate::agent::tool_manifest::{ApprovalPolicy, ToolSource};
+        // 缺省动态源（Sensitive+ManualDefault）= 拒
+        let m = dynamic_manifest_for_test("mcp_srv_t1", ToolSource::Mcp);
+        assert!(mcp_face_requires_adjudication("mcp_srv_t1", Some(&m)));
+        // 白名单直跑（注册期覆写 AutoPolicy）= 免裁决放行
+        let mut whitelisted = dynamic_manifest_for_test("mcp_srv_t2", ToolSource::Mcp);
+        whitelisted.approval_policy = ApprovalPolicy::AutoPolicy;
+        assert!(
+            !mcp_face_requires_adjudication("mcp_srv_t2", Some(&whitelisted)),
+            "always_allow tools are user-authorized direct runs on the /mcp face"
+        );
+        // ServiceProxy 白名单同语义
+        let mut svc = dynamic_manifest_for_test("svc_demo_t", ToolSource::ServiceProxy);
+        svc.approval_policy = ApprovalPolicy::AutoPolicy;
+        assert!(!mcp_face_requires_adjudication("svc_demo_t", Some(&svc)));
+        // 静态工具不适用豁免（静态分级以静态表为准，防降级锚不变）
+        assert!(
+            mcp_face_requires_adjudication("file_write", None),
+            "static adjudicated tool must stay rejected (no exemption)"
+        );
+        // 未知名（无静态无动态）= 不判裁决（放行至执行层自然报缺，闸不越权）
+        assert!(!mcp_face_requires_adjudication("no_such_tool_xyz", None));
+        // 降档后的动态源（Standard）= 放行
+        let mut downgraded = dynamic_manifest_for_test("mcp_srv_t3", ToolSource::Mcp);
+        downgraded.adjudication_class = crate::agent::tool_manifest::AdjudicationClass::Standard;
+        assert!(!mcp_face_requires_adjudication(
+            "mcp_srv_t3",
+            Some(&downgraded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_whitelisted_dynamic_tool_executes_on_mcp_face() {
+        // MC-1(a) 回归锁：always_allow 白名单工具（注册期 AutoPolicy 覆写）
+        // 在 /mcp 面 tools/call 免裁决真实执行；豁免半边不破坏 fail-closed
+        // （对照 test_p2_adjudicated_tool_refused_without_adjudication_channel）
+        let state = state_with_toolkit();
+        {
+            use crate::agent::tool_manifest::ApprovalPolicy;
+            use crate::io_handlers::tool_handler::ToolFunction;
+            struct Echo;
+            #[async_trait::async_trait]
+            impl ToolFunction for Echo {
+                async fn call(&self, args: &Value) -> crate::io_handler::IoResult {
+                    Ok(json!({"echo": args}))
+                }
+            }
+            let mut manifest = dynamic_manifest_for_test(
+                "mcp_mock_echo",
+                crate::agent::tool_manifest::ToolSource::Mcp,
+            );
+            manifest.approval_policy = ApprovalPolicy::AutoPolicy;
+            let mut toolkit = state.toolkit_lock().write().unwrap();
+            toolkit.register(manifest, std::sync::Arc::new(Echo));
+        }
+        let resp = mcp_post(
+            State(state),
+            post_body(
+                "tools/call",
+                json!(11),
+                json!({"name": "mcp_mock_echo", "arguments": {"msg": "gate-exempt"}}),
+            ),
+        )
+        .await;
+        let v = parse_json(resp).await;
+        assert_eq!(
+            v["result"]["isError"],
+            json!(false),
+            "whitelisted dynamic tool must execute without adjudication: {v}"
         );
     }
 

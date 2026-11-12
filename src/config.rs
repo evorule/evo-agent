@@ -1157,6 +1157,63 @@ impl Config {
             }
         }
 
+        // [mcp] 段结构级校验（配置装载期 fail-fast，脏配置不再延迟到启动
+        // 连接期才落 Failed）：与 mcp_api PUT 面 validate 同语义子集——
+        // 名非空/transport 已知/stdio 必有 command/http 必有 url/timeout>0/
+        // 名唯一。空 [mcp] 段（无 server）不受影响。
+        let mut seen = std::collections::HashSet::new();
+        for (idx, srv) in self.mcp.servers.iter().enumerate() {
+            let at = |field: &str| format!("mcp.servers[{idx}].{field}");
+            if srv.name.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: at("name"),
+                    reason: "server name must not be empty".to_string(),
+                });
+            }
+            if !seen.insert(srv.name.clone()) {
+                return Err(ConfigError::InvalidValue {
+                    field: at("name"),
+                    reason: format!(
+                        "duplicate server name '{}'; later duplicates would silently override earlier ones",
+                        srv.name
+                    ),
+                });
+            }
+            match srv.transport.as_deref() {
+                None | Some("stdio") => {
+                    if srv.command.trim().is_empty() {
+                        return Err(ConfigError::InvalidValue {
+                            field: at("command"),
+                            reason: "stdio transport requires a non-empty command".to_string(),
+                        });
+                    }
+                }
+                Some("streamable_http") => {
+                    if srv.url.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                        return Err(ConfigError::InvalidValue {
+                            field: at("url"),
+                            reason: "streamable_http transport requires a non-empty url"
+                                .to_string(),
+                        });
+                    }
+                }
+                Some(other) => {
+                    return Err(ConfigError::InvalidValue {
+                        field: at("transport"),
+                        reason: format!(
+                            "unsupported transport '{other}' (expected stdio | streamable_http)"
+                        ),
+                    });
+                }
+            }
+            if srv.timeout_secs == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: at("timeout_secs"),
+                    reason: "timeout_secs must be > 0 (unbounded timeouts are refused)".to_string(),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -1471,6 +1528,94 @@ mod tests {
         assert!(matches!(
             result,
             Err(ConfigError::InvalidValue { ref field, .. }) if field == "logging.level"
+        ));
+    }
+
+    // ---- [mcp] 段结构级校验（配置装载期 fail-fast）----
+
+    fn stdio_server(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            command: "python".to_string(),
+            args: vec![],
+            env: Default::default(),
+            disabled: false,
+            timeout_secs: 30,
+            always_allow: vec![],
+            transport: None,
+            url: None,
+            headers: Default::default(),
+            max_idle_secs: None,
+            max_lifetime_secs: None,
+            hang_threshold: None,
+            restart_on_reap: false,
+            max_memory_mb: None,
+            cpu_rate_percent: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_mcp_section_structural_fail_fast() {
+        // 空段/合规段 = 通过
+        let mut cfg = Config::default();
+        assert!(cfg.validate().is_ok(), "empty [mcp] section is fine");
+        cfg.mcp.servers.push(stdio_server("fs"));
+        assert!(cfg.validate().is_ok(), "valid stdio server is fine");
+
+        // 空 name 拒启
+        let mut cfg = Config::default();
+        cfg.mcp.servers.push(stdio_server(""));
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field.contains("mcp.servers[0].name")
+        ));
+
+        // 重复名拒启
+        let mut cfg = Config::default();
+        cfg.mcp.servers.push(stdio_server("fs"));
+        cfg.mcp.servers.push(stdio_server("fs"));
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field.contains("mcp.servers[1].name")
+        ));
+
+        // stdio 缺 command 拒启
+        let mut cfg = Config::default();
+        cfg.mcp.servers.push(stdio_server("fs"));
+        cfg.mcp.servers[0].command = "  ".to_string();
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field.contains("mcp.servers[0].command")
+        ));
+
+        // http 缺 url 拒启
+        let mut cfg = Config::default();
+        let mut http = stdio_server("remote");
+        http.command = String::new();
+        http.transport = Some("streamable_http".to_string());
+        cfg.mcp.servers.push(http);
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field.contains("mcp.servers[0].url")
+        ));
+
+        // 未知 transport 拒启
+        let mut cfg = Config::default();
+        let mut bad = stdio_server("weird");
+        bad.transport = Some("websocket".to_string());
+        cfg.mcp.servers.push(bad);
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field.contains("mcp.servers[0].transport")
+        ));
+
+        // timeout=0 拒启（不限时）
+        let mut cfg = Config::default();
+        cfg.mcp.servers.push(stdio_server("fs"));
+        cfg.mcp.servers[0].timeout_secs = 0;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field.contains("mcp.servers[0].timeout_secs")
         ));
     }
 

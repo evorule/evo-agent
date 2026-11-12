@@ -562,25 +562,43 @@ pub fn build_filtered_toolkit_with_switches(
             }
         }
     }
-    // D6 终态 + D7-A 方案一：动态源分级按来源级 settings 键覆写
-    // （= "standard" 时人工降档为 Standard，免意图裁决；"sensitive"/缺省 =
-    // 维持 dynamic_manifest 默认 Sensitive 意图必报）。覆写只命中动态源
-    // 条目——静态条目分级以静态表为准不在射程（防降级锚，见
-    // is_p2_adjudicated_runtime）。分级管裁决性，开关管在场性，正交。
+    // D6 终态 + D7-A 方案一：动态源分级按来源级 settings 键覆写（共享原语，
+    // 见 [`apply_dynamic_source_adjudication_downgrade`]——降档语义跨 face
+    // 同源，会话面与 /mcp 面消费同一判定）。分级管裁决性，开关管在场性，正交。
+    apply_dynamic_source_adjudication_downgrade(&mut filtered, settings);
+    filtered
+}
+
+/// 动态源裁决降档共享原语（MC-1(b)/MC-3 修复面）
+///
+/// settings 键 `agentTools.mcpAdjudication` / `agentTools.serviceProxyAdjudication`
+/// == "standard" 时把对应动态源条目人工降档 Standard（免意图裁决）；
+/// "sensitive"/缺省 = 维持 dynamic_manifest 默认 Sensitive 意图必报。
+/// 覆写只命中动态源条目——静态条目分级以静态表为准不在射程（防降级锚，
+/// 见 `is_p2_adjudicated_runtime`）。
+///
+/// 消费点（降档语义跨 face 同源；新注册条目缺省 Sensitive，故注册后须重应用）：
+/// - 会话面过滤装配 [`build_filtered_toolkit_with_switches`]（原位）；
+/// - serve 启动 /mcp 面 union 装配（union 直装此前不读 settings——降档键
+///   对该面不可达缺陷的修复位）；
+/// - 运行期重注册三处（mcp_api reload/restart、reap 重启监督）。
+pub fn apply_dynamic_source_adjudication_downgrade(
+    handler: &mut crate::io_handlers::tool_handler::ToolHandler,
+    settings: &serde_json::Map<String, Value>,
+) {
     let downgraded = |key: &str| settings.get(key).and_then(|v| v.as_str()) == Some("standard");
     if downgraded(crate::agent::tool_manifest::AGENT_TOOLS_MCP_ADJUDICATION) {
-        filtered.set_adjudication_for_source(
+        handler.set_adjudication_for_source(
             crate::agent::tool_manifest::ToolSource::Mcp,
             crate::agent::tool_manifest::AdjudicationClass::Standard,
         );
     }
     if downgraded(crate::agent::tool_manifest::AGENT_TOOLS_SERVICE_PROXY_ADJUDICATION) {
-        filtered.set_adjudication_for_source(
+        handler.set_adjudication_for_source(
             crate::agent::tool_manifest::ToolSource::ServiceProxy,
             crate::agent::tool_manifest::AdjudicationClass::Standard,
         );
     }
-    filtered
 }
 
 /// P1 执行桥:按 run 请求扩展字段把 shell_exec 替换为 docker-exec 后端
@@ -1635,6 +1653,93 @@ service_tools = ["config_persist", "rule_sandbox"]
         let filtered = build_filtered_toolkit_with_switches(&union, &whitelist, &settings);
         assert!(!filtered.has_tool("mcp_demo_echo"));
         assert!(filtered.has_tool("svc_demo_query"));
+    }
+
+    #[test]
+    fn test_dynamic_source_adjudication_downgrade_primitive() {
+        // 降档共享原语（union 直装消费点同款）：键 =="standard" 时对应动态源
+        // 分级降 Standard（免意图裁决），其余源/静态面不动；键缺省=维持
+        // Sensitive 意图必报。
+        let mut handler = ToolHandler::new();
+        for (name, source) in [
+            (
+                "mcp_demo_echo",
+                crate::agent::tool_manifest::ToolSource::Mcp,
+            ),
+            (
+                "svc_demo_query",
+                crate::agent::tool_manifest::ToolSource::ServiceProxy,
+            ),
+        ] {
+            let manifest = crate::agent::tool_manifest::dynamic_manifest(
+                name,
+                source,
+                format!("dynamic tool {name}"),
+                serde_json::json!({"type": "object", "properties": {}}),
+            )
+            .unwrap();
+            handler.register(manifest, std::sync::Arc::new(DynamicStub));
+        }
+        // 缺省：两动态源维持 Sensitive
+        apply_dynamic_source_adjudication_downgrade(&mut handler, &serde_json::Map::new());
+        assert_eq!(
+            handler
+                .manifest("mcp_demo_echo")
+                .unwrap()
+                .adjudication_class,
+            crate::agent::tool_manifest::AdjudicationClass::Sensitive
+        );
+        // 降档：两动态源降 Standard
+        let mut settings = serde_json::Map::new();
+        settings.insert(
+            crate::agent::tool_manifest::AGENT_TOOLS_MCP_ADJUDICATION.to_string(),
+            serde_json::json!("standard"),
+        );
+        settings.insert(
+            crate::agent::tool_manifest::AGENT_TOOLS_SERVICE_PROXY_ADJUDICATION.to_string(),
+            serde_json::json!("standard"),
+        );
+        apply_dynamic_source_adjudication_downgrade(&mut handler, &settings);
+        assert_eq!(
+            handler
+                .manifest("mcp_demo_echo")
+                .unwrap()
+                .adjudication_class,
+            crate::agent::tool_manifest::AdjudicationClass::Standard,
+            "mcp source must be downgraded to Standard"
+        );
+        assert_eq!(
+            handler
+                .manifest("svc_demo_query")
+                .unwrap()
+                .adjudication_class,
+            crate::agent::tool_manifest::AdjudicationClass::Standard,
+            "service proxy source must be downgraded to Standard"
+        );
+        // 半档：只降 mcp
+        let mut half = serde_json::Map::new();
+        half.insert(
+            crate::agent::tool_manifest::AGENT_TOOLS_MCP_ADJUDICATION.to_string(),
+            serde_json::json!("standard"),
+        );
+        let mut handler2 = ToolHandler::new();
+        let manifest = crate::agent::tool_manifest::dynamic_manifest(
+            "svc_demo_query",
+            crate::agent::tool_manifest::ToolSource::ServiceProxy,
+            "dynamic tool svc_demo_query".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        handler2.register(manifest, std::sync::Arc::new(DynamicStub));
+        apply_dynamic_source_adjudication_downgrade(&mut handler2, &half);
+        assert_eq!(
+            handler2
+                .manifest("svc_demo_query")
+                .unwrap()
+                .adjudication_class,
+            crate::agent::tool_manifest::AdjudicationClass::Sensitive,
+            "unrelated downgrade key must not touch other sources"
+        );
     }
 
     #[test]
