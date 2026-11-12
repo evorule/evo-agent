@@ -67,6 +67,23 @@ pub struct McpServerEntry {
 #[derive(Debug, Default)]
 pub struct McpManager {
     entries: Mutex<HashMap<String, McpServerEntry>>,
+    /// streamable_http URL 信任白名单覆盖（测试注入面；None=读进程环境白名单）
+    pub(crate) http_trust: Option<String>,
+}
+
+/// streamable_http 远程 endpoint 信任白名单进程环境（逗号分隔 URL 精确匹配）
+pub(crate) const MCP_HTTP_TRUST_ENV: &str = "EVO_MCP_HTTP_TRUST";
+
+/// http URL 信任判定（纯函数可测；未设置白名单=一律不信任，fail-closed）
+pub(crate) fn http_url_trusted(url: &str, trust: Option<&str>) -> bool {
+    let Some(listed) = trust else {
+        return false;
+    };
+    listed
+        .split(',')
+        .map(|u| u.trim())
+        .filter(|u| !u.is_empty())
+        .any(|u| u == url)
 }
 
 impl McpManager {
@@ -170,28 +187,46 @@ impl McpManager {
         &self,
         cfg: &McpServerConfig,
     ) -> Result<(std::sync::Arc<McpClient>, Vec<McpToolSpec>), String> {
-        let transport: std::sync::Arc<dyn McpTransport> =
-            match cfg.transport.as_deref().unwrap_or("stdio") {
-                "stdio" => {
-                    let args: Vec<&str> = cfg.args.iter().map(|s| s.as_str()).collect();
-                    let limits = super::lifecycle::ResourceLimits::from_config(cfg);
-                    std::sync::Arc::new(
-                        StdioTransport::spawn_with_env_and_limits(
-                            &cfg.command,
-                            &args,
-                            &cfg.env,
-                            &limits,
-                        )
-                        .await?,
+        let transport: std::sync::Arc<dyn McpTransport> = match cfg
+            .transport
+            .as_deref()
+            .unwrap_or("stdio")
+        {
+            "stdio" => {
+                let args: Vec<&str> = cfg.args.iter().map(|s| s.as_str()).collect();
+                let limits = super::lifecycle::ResourceLimits::from_config(cfg);
+                std::sync::Arc::new(
+                    StdioTransport::spawn_with_env_and_limits(
+                        &cfg.command,
+                        &args,
+                        &cfg.env,
+                        &limits,
                     )
+                    .await?,
+                )
+            }
+            "streamable_http" => {
+                let url = cfg.url.as_deref().unwrap_or("");
+                // 远程 endpoint 信任闸（fail-closed）：mcp.toml 位于工作区
+                // 内容域（可被不可信内容写入），远程 URL 即稳定出网通道的
+                // 钉版锚——url 必须逐字列入进程环境 MCP_HTTP_TRUST_ENV
+                // （逗号分隔白名单）才可连接；未设置或不匹配=拒绝连接，
+                // server 落 Failed（既有隔离语义，其他 server 不受影响）。
+                let trust = self
+                    .http_trust
+                    .clone()
+                    .or_else(|| std::env::var(MCP_HTTP_TRUST_ENV).ok());
+                if !http_url_trusted(url, trust.as_deref()) {
+                    return Err(format!(
+                            "MCP streamable_http url '{}' is not trusted: add it to {}                              (comma-separated allowlist) to pin this remote endpoint                              (config file content is an untrusted write domain)",
+                            url, MCP_HTTP_TRUST_ENV
+                        ));
                 }
-                "streamable_http" => {
-                    let url = cfg.url.as_deref().unwrap_or("");
-                    let headers = cfg.headers.clone().unwrap_or_default();
-                    std::sync::Arc::new(StreamableHttpTransport::new(url, &headers)?)
-                }
-                other => return Err(format!("unsupported MCP transport '{}'", other)),
-            };
+                let headers = cfg.headers.clone().unwrap_or_default();
+                std::sync::Arc::new(StreamableHttpTransport::new(url, &headers)?)
+            }
+            other => return Err(format!("unsupported MCP transport '{}'", other)),
+        };
         // 握手 + 工具发现整体受 timeout_secs 约束(兑现 connect_server
         // 文档承诺;原无界 await——hang 住的 server 会拖死 serve 启动期
         // block_on 与 CLI 连接路径)
@@ -448,11 +483,13 @@ mod tests {
             let _held = listener.accept();
             std::thread::sleep(std::time::Duration::from_secs(30));
         });
-        let mgr = McpManager::new();
+        let mut mgr = McpManager::new();
         let mut slow = cfg("hung", "");
         slow.transport = Some("streamable_http".to_string());
         slow.url = Some(format!("http://{addr}/mcp"));
         slow.timeout_secs = 1;
+        // 本测试钉版 hung URL（注入面；生产=进程环境白名单）
+        mgr.http_trust = Some(slow.url.clone().unwrap());
         let t0 = std::time::Instant::now();
         let err = mgr.connect_server(&slow).await.unwrap_err();
         assert!(err.contains("timed out"), "got: {err}");
@@ -516,5 +553,34 @@ mod tests {
             McpServerStatus::Failed { error: "x".into() }.as_str(),
             "failed"
         );
+    }
+}
+
+#[cfg(test)]
+mod http_trust_tests {
+    use super::*;
+
+    #[test]
+    fn http_url_trust_is_fail_closed() {
+        // 未设置白名单=一律不信任（配置文件是可被不可信内容写入的域）
+        assert!(!http_url_trusted("https://evil.example", None));
+        assert!(!http_url_trusted("", None));
+        // 白名单精确匹配（逐字，trim 容忍格式空格）
+        assert!(http_url_trusted(
+            "https://mcp.example/rpc",
+            Some("https://a.example, https://mcp.example/rpc")
+        ));
+        // 前缀/子串相似 URL 不得通过（精确匹配语义）
+        assert!(!http_url_trusted(
+            "https://mcp.example/rpc/extra",
+            Some("https://mcp.example/rpc")
+        ));
+        assert!(!http_url_trusted(
+            "https://mcp.example.evil/rpc",
+            Some("https://mcp.example/rpc")
+        ));
+        // 空白名单=不信任
+        assert!(!http_url_trusted("https://mcp.example/rpc", Some("")));
+        assert!(!http_url_trusted("https://mcp.example/rpc", Some("  ")));
     }
 }

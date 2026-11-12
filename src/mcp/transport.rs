@@ -377,6 +377,20 @@ impl McpTransport for StdioTransport {
 /// `"Authorization": "Bearer ${MCP_TOKEN}"`),避免明文密钥落配置文件。
 /// 变量缺失 → fail-closed 报错(不静默替换空值,防凭据语义被静默削弱)。
 fn expand_env_refs(value: &str) -> Result<String, String> {
+    expand_env_refs_with(value, &|k| std::env::var(k).ok())
+}
+
+/// 展开主体（lookup 可注入——测试不经进程环境）。
+///
+/// **命名空间收窄**：仅展开 EVO_MCP_ 前缀键。headers 引用是配置文件
+/// （工作区内容域，可被不可信内容写入）到宿主进程环境的通道——无前缀
+/// 约束时 `${ANY_KEY}` 可把宿主任意凭据（API key/token）经 initialize
+/// 请求外带至任意 endpoint。部署方以 `EVO_MCP_*` 命名显式暴露凭据给
+/// MCP 面（缺变量 fail-closed 报错，提示改名）。
+fn expand_env_refs_with(
+    value: &str,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, String> {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(start) = rest.find("${") {
@@ -389,9 +403,15 @@ fn expand_env_refs(value: &str) -> Result<String, String> {
         if var.is_empty() {
             return Err(format!("empty ${{}} reference in header value: {}", value));
         }
-        match std::env::var(var) {
-            Ok(v) => out.push_str(&v),
-            Err(_) => {
+        if !var.starts_with("EVO_MCP_") {
+            return Err(format!(
+                "environment variable '{}' referenced in MCP header is outside the                  EVO_MCP_ namespace; rename the variable with the EVO_MCP_ prefix and                  export it explicitly (config-file references must not reach arbitrary                  host environment keys)",
+                var
+            ));
+        }
+        match lookup(var) {
+            Some(v) => out.push_str(&v),
+            None => {
                 return Err(format!(
                     "environment variable '{}' referenced in MCP header not set",
                     var
@@ -1107,14 +1127,36 @@ while True:
 
     #[test]
     fn test_expand_env_refs() {
-        std::env::set_var("B23_TEST_TOKEN", "secret-value");
+        std::env::set_var("EVO_MCP_B23_TEST_TOKEN", "secret-value");
         assert_eq!(
-            expand_env_refs("Bearer ${B23_TEST_TOKEN}").unwrap(),
+            expand_env_refs("Bearer ${EVO_MCP_B23_TEST_TOKEN}").unwrap(),
             "Bearer secret-value"
         );
         assert_eq!(expand_env_refs("plain").unwrap(), "plain");
-        assert!(expand_env_refs("${B23_TEST_MISSING_VAR_X}").is_err());
+        assert!(expand_env_refs("${EVO_MCP_B23_MISSING_VAR_X}").is_err());
         assert!(expand_env_refs("unclosed ${VAR").is_err());
         assert!(expand_env_refs("${}").is_err());
+    }
+    #[test]
+    fn expand_env_refs_confined_to_evo_mcp_namespace() {
+        // 命名空间收窄：宿主任意键不可达（凭据外带通道封死）
+        const REF_MISSING: &str = "${EVO_MCP_MISSING}";
+        let err = expand_env_refs_with("Bearer ${ANTHROPIC_API_KEY}", &|_k| {
+            Some("secret".to_string())
+        })
+        .expect_err("非 EVO_MCP_ 前缀引用必须拒绝");
+        assert!(err.contains("EVO_MCP_"), "{err}");
+        // EVO_MCP_ 前缀键正常展开（声明式凭据通道保持）
+        let ok = expand_env_refs_with("Bearer ${EVO_MCP_GITHUB_TOKEN}", &|k| {
+            if k == "EVO_MCP_GITHUB_TOKEN" {
+                Some("tok".to_string())
+            } else {
+                None
+            }
+        })
+        .expect("EVO_MCP_ 前缀引用必须展开");
+        assert_eq!(ok, "Bearer tok");
+        // 缺变量 fail-closed 语义保持
+        assert!(expand_env_refs_with(REF_MISSING, &|_k| None).is_err());
     }
 }

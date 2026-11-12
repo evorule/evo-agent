@@ -143,6 +143,36 @@ async fn call_tool(state: &AgentApiState, params: &Value) -> Result<Value, Strin
             .map_err(|_| "toolkit lock poisoned".to_string())?;
         guard.clone()
     };
+    // P2 意图裁决闸（fail-closed）：治理分级命中（Sentineled/Sensitive，
+    // is_p2_adjudicated_runtime 静态优先防降级判定）的工具依赖 evorule
+    // 裁决会话通道——本面无该通道在场，直接拒绝而非静默跳过裁决（意图
+    // 必报语义对面级调用不可打折）；file_write/edit_file/delegate 等
+    // AutoPolicy 写面/派发面工具由此不可被外部客户端免裁决直跑。可调面
+    // =Standard 工具（只读/查账/技能读等）+人工降档后的动态源工具；
+    // candidate 形态另由下方⑤同源评估短路。
+    if crate::agent::tool_manifest::is_p2_adjudicated_runtime(
+        &name,
+        toolkit.manifest(&name).as_ref(),
+    ) {
+        warn!(tool = %name, "MCP tools/call governance-adjudicated tool; no adjudication channel on this face; not executed");
+        state
+            .mcp_ledger()
+            .record_tool_completion(
+                &name,
+                false,
+                0,
+                Some(
+                    "governance-adjudicated tool requires session-face adjudication; not executed",
+                ),
+            )
+            .await;
+        return Ok(json!({
+            "content": [
+                {"type": "text", "text": "tool requires governance adjudication which is not available on this interface; use the agent session face (workbench/agent session)"},
+            ],
+            "isError": true,
+        }));
+    }
     // 管道⑤同源评估(治理等价核心):candidate 工具先走与 LLM 完全相同的
     // 提案评估原语(evaluate_proposal_for,评估与执行永远同源),needs_approval
     // 即短路不执行——/mcp 面不新增任何免审批通道,审批决策仍归 G8 人工面
@@ -266,6 +296,45 @@ mod tests {
             .expect("file_list static manifest must exist");
         let mut toolkit = state.toolkit_lock().write().unwrap();
         toolkit.register(manifest, std::sync::Arc::new(Echo));
+    }
+
+    #[tokio::test]
+    async fn test_p2_adjudicated_tool_refused_without_adjudication_channel() {
+        // P2 治理分级工具（file_write=Sentineled）在 /mcp server 面必须被
+        // 拒绝执行：本面无 evorule 裁决会话通道，意图必报语义不可打折
+        // （fail-closed），不得成为外部客户端的免裁决直跑面
+        let state = state_with_toolkit();
+        {
+            use crate::io_handlers::tool_handler::ToolFunction;
+            struct Echo;
+            #[async_trait::async_trait]
+            impl ToolFunction for Echo {
+                async fn call(&self, args: &Value) -> crate::io_handler::IoResult {
+                    Ok(json!({"echo": args}))
+                }
+            }
+            let manifest = crate::agent::tool_manifest::lookup_static("file_write")
+                .expect("file_write static manifest must exist");
+            let mut toolkit = state.toolkit_lock().write().unwrap();
+            toolkit.register(manifest, std::sync::Arc::new(Echo));
+        }
+        let resp = mcp_post(
+            State(state),
+            post_body(
+                "tools/call",
+                json!(9),
+                json!({"name": "file_write", "arguments": {"path": "x.txt", "content": "v"}}),
+            ),
+        )
+        .await;
+        let v = parse_json(resp).await;
+        assert_eq!(v["result"]["isError"], json!(true), "治理工具必须拒执行");
+        let text = v["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.to_lowercase().contains("adjudication")
+                || text.to_lowercase().contains("governance"),
+            "拒执文案必须点名治理裁决缺失: {text}"
+        );
     }
 
     fn post_body(method: &str, id: Value, params: Value) -> String {
