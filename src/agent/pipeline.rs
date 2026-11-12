@@ -571,94 +571,102 @@ impl ToolExecutionPipeline {
         // 调用不会到达此处。pre_tool deny=显式拒绝回喂（UserHook 阶段）；
         // rewrite=参数改写进⑦；运行性故障（超时/生成失败）按 fail-open
         // 放行+留痕。None=未配置零开销直通（既有路径零变化）。
-        let hook_rewrite: Option<Value> = match deps.user_hooks.clone() {
-            Some(wired) => {
-                let session = req.caller.session_id.as_deref().unwrap_or("");
-                let (verdict, outcomes) = wired
-                    .hooks
-                    .pre_tool_verdict(req.tool_name, req.args, session, &wired.workdir)
-                    .await;
-                for out in &outcomes {
-                    if let Some(err) = &out.error {
-                        tracing::warn!(
-                            tool = %req.tool_name, rule = out.rule_index, error = %err,
-                            "user pre_tool hook failed (fail-open)"
-                        );
-                    } else if !out.exited_ok {
-                        tracing::warn!(
-                            tool = %req.tool_name, rule = out.rule_index,
-                            "user pre_tool hook exited non-zero (fail-open)"
-                        );
+        // o77 观测去重：缓存命中臂（precomputed=Some）是同一逻辑调用的第二次
+        // 管道穿越——执行侧观测（hooks/轨迹/指标）归属预执行臂（其已完整穿越含
+        // hooks），命中臂跳过以消除 hooks 双发（副作用面）与轨迹/指标双记；
+        // 裁决信号与 journal 账面双提交保守保留（fail-closed 方向，每次穿越照常）。
+        let cache_hit = req.precomputed.is_some();
+        let hook_rewrite: Option<Value> = if cache_hit {
+            None
+        } else {
+            match deps.user_hooks.clone() {
+                Some(wired) => {
+                    let session = req.caller.session_id.as_deref().unwrap_or("");
+                    let (verdict, outcomes) = wired
+                        .hooks
+                        .pre_tool_verdict(req.tool_name, req.args, session, &wired.workdir)
+                        .await;
+                    for out in &outcomes {
+                        if let Some(err) = &out.error {
+                            tracing::warn!(
+                                tool = %req.tool_name, rule = out.rule_index, error = %err,
+                                "user pre_tool hook failed (fail-open)"
+                            );
+                        } else if !out.exited_ok {
+                            tracing::warn!(
+                                tool = %req.tool_name, rule = out.rule_index,
+                                "user pre_tool hook exited non-zero (fail-open)"
+                            );
+                        }
                     }
-                }
-                match verdict {
-                    crate::agent::user_hooks::PreToolVerdict::Deny(reason) => {
-                        ledger.denial = Some(DenialStage::UserHook);
-                        return PipelineOutcome {
-                            result: Err(PipelineFailure::Denial(PipelineDenial::new(
-                                DenialStage::UserHook,
-                                reason,
-                            ))),
-                            ledger,
-                        };
-                    }
-                    crate::agent::user_hooks::PreToolVerdict::Rewrite(rewritten) => {
-                        // 回炉：改写产物才是实际将执行的参数——重过 R1/P2 治理
-                        // 通道 + exfil 事前裁决（此前改写产物直接进⑦，规则层对
-                        // 真实意图失明）。任一拦截=显式拒绝，不执行。
-                        if let Err(denial) = governance_channels(
-                            req.tool_name,
-                            &rewritten,
-                            req.caller.session_id.as_deref(),
-                            &deps,
-                            &mut ledger,
-                            &manifest,
-                        )
-                        .await
-                        {
-                            ledger.denial = Some(denial.stage);
+                    match verdict {
+                        crate::agent::user_hooks::PreToolVerdict::Deny(reason) => {
+                            ledger.denial = Some(DenialStage::UserHook);
                             return PipelineOutcome {
-                                result: Err(PipelineFailure::Denial(denial)),
+                                result: Err(PipelineFailure::Denial(PipelineDenial::new(
+                                    DenialStage::UserHook,
+                                    reason,
+                                ))),
                                 ledger,
                             };
                         }
-                        if let Err(denial) = exfil_egress_adjudication(
-                            req.tool_name,
-                            &rewritten,
-                            req.caller.session_id.as_deref(),
-                            crate::builtin_tools::exfil_scan::guard_mode(),
-                            &deps,
-                            &mut ledger,
-                        )
-                        .await
-                        {
-                            ledger.denial = Some(denial.stage);
-                            return PipelineOutcome {
-                                result: Err(PipelineFailure::Denial(denial)),
-                                ledger,
-                            };
-                        }
-                        // ⑤重评（决策漂移防线）：审批preset是对原始 args 的
-                        // proposal 做出的——改写后不复用。重评出 proposal：
-                        // 有 preset（批准后重执行路径）=显式拒绝（防止批准-
-                        // 改写-再批准的循环；人工以改写后参数重新发起）；
-                        // 无 preset（首次调用）=暂停等新决策（pending 携带
-                        // 改写后 proposal）。
-                        if manifest.approval_policy != ApprovalPolicy::AlwaysDeny {
-                            if let Some(mut proposal) = deps
-                                .proposal_of
-                                .and_then(|evaluate| evaluate(req.tool_name, &rewritten))
+                        crate::agent::user_hooks::PreToolVerdict::Rewrite(rewritten) => {
+                            // 回炉：改写产物才是实际将执行的参数——重过 R1/P2 治理
+                            // 通道 + exfil 事前裁决（此前改写产物直接进⑦，规则层对
+                            // 真实意图失明）。任一拦截=显式拒绝，不执行。
+                            if let Err(denial) = governance_channels(
+                                req.tool_name,
+                                &rewritten,
+                                req.caller.session_id.as_deref(),
+                                &deps,
+                                &mut ledger,
+                                &manifest,
+                            )
+                            .await
                             {
-                                let proposal_id = crate::agent::approval::new_proposal_id();
-                                if let Some(obj) = proposal.as_object_mut() {
-                                    obj.insert(
-                                        "proposal_id".to_string(),
-                                        Value::from(proposal_id.clone()),
-                                    );
-                                }
-                                if req.approval_preset.is_some() {
-                                    ledger.denial = Some(DenialStage::ApprovalDenied);
-                                    return PipelineOutcome {
+                                ledger.denial = Some(denial.stage);
+                                return PipelineOutcome {
+                                    result: Err(PipelineFailure::Denial(denial)),
+                                    ledger,
+                                };
+                            }
+                            if let Err(denial) = exfil_egress_adjudication(
+                                req.tool_name,
+                                &rewritten,
+                                req.caller.session_id.as_deref(),
+                                crate::builtin_tools::exfil_scan::guard_mode(),
+                                &deps,
+                                &mut ledger,
+                            )
+                            .await
+                            {
+                                ledger.denial = Some(denial.stage);
+                                return PipelineOutcome {
+                                    result: Err(PipelineFailure::Denial(denial)),
+                                    ledger,
+                                };
+                            }
+                            // ⑤重评（决策漂移防线）：审批preset是对原始 args 的
+                            // proposal 做出的——改写后不复用。重评出 proposal：
+                            // 有 preset（批准后重执行路径）=显式拒绝（防止批准-
+                            // 改写-再批准的循环；人工以改写后参数重新发起）；
+                            // 无 preset（首次调用）=暂停等新决策（pending 携带
+                            // 改写后 proposal）。
+                            if manifest.approval_policy != ApprovalPolicy::AlwaysDeny {
+                                if let Some(mut proposal) = deps
+                                    .proposal_of
+                                    .and_then(|evaluate| evaluate(req.tool_name, &rewritten))
+                                {
+                                    let proposal_id = crate::agent::approval::new_proposal_id();
+                                    if let Some(obj) = proposal.as_object_mut() {
+                                        obj.insert(
+                                            "proposal_id".to_string(),
+                                            Value::from(proposal_id.clone()),
+                                        );
+                                    }
+                                    if req.approval_preset.is_some() {
+                                        ledger.denial = Some(DenialStage::ApprovalDenied);
+                                        return PipelineOutcome {
                                         result: Err(PipelineFailure::Denial(PipelineDenial {
                                             stage: DenialStage::ApprovalDenied,
                                             reason: format!(
@@ -672,15 +680,20 @@ impl ToolExecutionPipeline {
                                         })),
                                         ledger,
                                     };
-                                }
-                                if let Some(tt) = deps.traces {
-                                    if let Ok(mut tt) = tt.lock() {
-                                        tt.record(req.tool_name, &rewritten, "approval_pending", 0);
                                     }
-                                }
-                                ledger.effective_args = Some(rewritten.clone());
-                                ledger.denial = Some(DenialStage::ApprovalPending);
-                                return PipelineOutcome {
+                                    if let Some(tt) = deps.traces {
+                                        if let Ok(mut tt) = tt.lock() {
+                                            tt.record(
+                                                req.tool_name,
+                                                &rewritten,
+                                                "approval_pending",
+                                                0,
+                                            );
+                                        }
+                                    }
+                                    ledger.effective_args = Some(rewritten.clone());
+                                    ledger.denial = Some(DenialStage::ApprovalPending);
+                                    return PipelineOutcome {
                                     result: Err(PipelineFailure::Denial(PipelineDenial {
                                         stage: DenialStage::ApprovalPending,
                                         reason: format!(
@@ -691,15 +704,16 @@ impl ToolExecutionPipeline {
                                     })),
                                     ledger,
                                 };
+                                }
                             }
+                            ledger.effective_args = Some(rewritten.clone());
+                            Some(rewritten)
                         }
-                        ledger.effective_args = Some(rewritten.clone());
-                        Some(rewritten)
+                        crate::agent::user_hooks::PreToolVerdict::Allow => None,
                     }
-                    crate::agent::user_hooks::PreToolVerdict::Allow => None,
                 }
+                None => None,
             }
-            None => None,
         };
         let exec_args: &Value = hook_rewrite.as_ref().unwrap_or(req.args);
         let pre = req.precomputed.clone();
@@ -750,7 +764,7 @@ impl ToolExecutionPipeline {
             ok: tool_ok,
             duration_ms: tool_duration.as_millis() as u64,
         });
-        if let Some(m) = deps.metrics {
+        if let (false, Some(m)) = (cache_hit, deps.metrics) {
             m.observe_tool_call(req.tool_name, tool_duration, tool_ok);
         }
         // 轨迹采集（脱敏+截断在 collector 内；std Mutex 临界区无 await）。
@@ -758,11 +772,12 @@ impl ToolExecutionPipeline {
         // 但执行已发生且真实结局必须回喂（此处拒绝会诱导 LLM 对已执行工具
         // 重试，重复执行险大于账面缺口），故豁免 Ledger 拒绝、仅显式留痕
         // 账面缺口（轨迹缺失以 error 日志为信号，不做静默跳过）。
-        if let Some(tt) = deps.traces {
+        if let (false, Some(tt)) = (cache_hit, deps.traces) {
             match tt.lock() {
                 Ok(mut tt) => {
                     // 审计口径：轨迹记录实际执行参数（hooks rewrite 发生时=
-                    // exec_args；未改写=与 req.args 同值）——账面与执行一致
+                    // exec_args；未改写=与 req.args 同值）——账面与执行一致；
+                    // 缓存命中臂跳过（执行臂已 record 同一逻辑调用）
                     tt.record(
                         req.tool_name,
                         exec_args,
@@ -2399,5 +2414,53 @@ mod tests {
         assert!(out.result.is_ok(), "执行结局必须回喂");
         let exec = out.ledger.execution.as_ref().expect("执行结局必须入账");
         assert!(exec.ok);
+    }
+    // ── 批 G o77：缓存命中臂观测去重（hooks/轨迹归属执行臂）──
+
+    #[tokio::test]
+    async fn cache_hit_skips_hooks_and_trace_replay() {
+        // 命中臂=同一逻辑调用的第二次穿越：hooks（副作用面）与轨迹由预执行臂
+        // 负责并已发生——命中臂跳过两者，仅复核①-⑤⑧与账面
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["file_read"]);
+        let args = serde_json::json!({"path": "a.txt"});
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("hook_marker.txt");
+        let hook_cmd = if cfg!(target_os = "windows") {
+            format!(r#"echo done > {}"#, marker.display())
+        } else {
+            format!("echo done > {}", marker.display())
+        };
+        let hooks = wired_for(
+            dir.path(),
+            vec![crate::agent::user_hooks::HookRule {
+                tool: "file_read".into(),
+                command: hook_cmd,
+                timeout_secs: Some(15),
+                env_keys: Vec::new(),
+            }],
+        );
+        let exec = CountingExecutor::new();
+        let traces = std::sync::Mutex::new(ToolTraceCollector::default());
+        let mut deps = hooks_deps_for(&exec, &adj, &manifests, hooks);
+        deps.traces = Some(&traces);
+        let mut req = req_for("file_read", &args, &focus);
+        req.precomputed = Some(Value::from("cached-result"));
+
+        let out = ToolExecutionPipeline.execute(req, deps).await;
+        assert_eq!(
+            out.result.expect("缓存命中必须回喂"),
+            Value::from("cached-result")
+        );
+        assert!(
+            !marker.exists(),
+            "缓存命中臂不得重放 hooks（副作用归属执行臂）"
+        );
+        let tseq = traces.lock().expect("traces").drain();
+        assert!(
+            tseq.is_empty(),
+            "缓存命中臂不得重记轨迹（执行臂已 record）: {tseq:?}"
+        );
     }
 }
