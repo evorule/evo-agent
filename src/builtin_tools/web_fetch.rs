@@ -472,7 +472,10 @@ impl ToolFunction for WebFetchTool {
         if super::net_guard::check_denied_network_target(url).is_err() {
             return None;
         }
-        match HttpGetTool::classify(url) {
+        // 与 call 同一分类器（classify_for_agent 实例配置同源）——静态
+        // classify 在 G7 放宽配置下与执行臂分叉，approved 旗标直通分支
+        // 经预执行臂可达（免审批窗口），与 http_get 同修
+        match self.fetcher.classify_for_agent(url) {
             HostCategory::Candidate { host } => {
                 Some(Self::make_proposal(url, &host).expect("proposal construction is infallible"))
             }

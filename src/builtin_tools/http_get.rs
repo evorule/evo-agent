@@ -564,8 +564,11 @@ impl ToolFunction for HttpGetTool {
         }
     }
 
-    /// 管道⑤评估单源(PR-4 收编):candidate 分类钩子——复刻 call 的判定
-    /// 次序(net_guard 红线 → classify),仅 Candidate 形态返回 proposal。
+    /// 管道⑤评估单源(PR-4 收编):candidate 分类钩子——与 call **同一分类器**
+    /// (classify_for_agent:实例 G7 放宽配置+extra allowlist 同源)。此前用
+    /// 静态 classify(恒 (false,false)):放宽配置下执行臂判 Candidate 而
+    /// 评估臂判 Blocked→None 直通,approved 旗标直通分支在预执行臂可达
+    /// (免审批窗口)——分类器同源后评估/执行永不分叉。
     /// 纯函数:无网络请求。call 内保留的 approved 旗标检查降级为人工面
     /// 直调旗标 + 防御双保险(评估与执行同源,agent 面正常路径不会再触达
     /// 该分支)。
@@ -574,7 +577,7 @@ impl ToolFunction for HttpGetTool {
         if super::net_guard::check_denied_network_target(url).is_err() {
             return None;
         }
-        match Self::classify(url) {
+        match self.classify_for_agent(url) {
             HostCategory::Candidate { host } => {
                 Some(Self::make_proposal(url, &host).expect("proposal construction is infallible"))
             }
@@ -651,6 +654,28 @@ fn ipv6_to_ipv4(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
+    /// 分类器同源红验（评估臂=执行臂）：G7 放宽实例下 evaluate_proposal
+    /// 必须与 call 同判——私有段 IP 在放宽实例是 Candidate（出 proposal），
+    /// 静态 classify（恒 (false,false)）判 Blocked（None 直通）即评估/执行
+    /// 分叉，G13 预执行臂由此形成免审批窗口
+    #[test]
+    fn test_evaluate_proposal_symmetric_with_call_under_relaxed_config() {
+        let tool = HttpGetTool::new().with_allow_private_hosts(true);
+        let args = serde_json::json!({"url": "https://127.0.0.1:8080/admin"});
+        let eval = tool
+            .evaluate_proposal(&args)
+            .map(|p| p["status"].to_string());
+        let call_would_propose = match tool.classify_for_agent("https://127.0.0.1:8080/admin") {
+            HostCategory::Candidate { .. } => true,
+            _ => false,
+        };
+        assert!(call_would_propose, "放宽实例下执行臂判 Candidate");
+        assert!(
+            eval.is_some(),
+            "评估臂必须与执行臂同判（同源）：got {eval:?}"
+        );
+    }
+
     use super::*;
 
     #[test]
