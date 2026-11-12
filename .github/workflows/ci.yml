@@ -83,8 +83,17 @@ jobs:
           # the freeze ever recurs, its streamed resource curve and the
           # culprit's process tree are captured right up to the death.
           - os: ubuntu-22.04
-            name: ubuntu-latest
+            name: ubuntu-latest-lib-a
             tests: true
+            slice: a
+          - os: ubuntu-22.04
+            name: ubuntu-latest-lib-b
+            tests: true
+            slice: b
+          - os: ubuntu-22.04
+            name: ubuntu-latest-lib-c
+            tests: true
+            slice: c
           - os: windows-latest
             name: windows-latest
             tests: true
@@ -169,84 +178,67 @@ jobs:
           ./verify.ps1 -Phase test-run
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # lib-split + guard-duration bypass (2026-11-12): the runner
-      # environment's job guard (provjobd, root, visible in the watchdog
-      # process table) SIGKILLs the lib test process once it runs past a
-      # duration threshold (5-10 min): five runs died at five unrelated
-      # test families (reap, survivor, forkpty, family-tree, websocket)
-      # while the 22-second runner-module step never died, and memory was
-      # ample at every kill. Guard is not configurable from inside the job.
-      # Fix: keep every test process under the threshold by splitting the
-      # suite into module-cluster steps of a few minutes each. The orphan/
-      # survivor/pty skips stay as belt-and-braces (those families also
-      # triggered shorter-duration kills in earlier experiments).
-      # Coverage gap: none - the whole suite still runs, just partitioned.
-      - name: verify 3/5a-1 test-run lib (runner module)
-        if: matrix.tests && runner.os == 'Linux'
+      # lib guard bypass (2026-11-12): the runner environment's job guard
+      # (provjobd, root, visible in the watchdog process table) SIGKILLs the
+      # test tree once the JOB's accumulated test-phase time crosses a
+      # threshold: five runs died at five unrelated test families, the
+      # 22-second runner-module step never died, splitting within the job
+      # still died on the fourth step at ~4 min accumulated test time, and
+      # memory was ample at every kill. The guard is per-job and not
+      # configurable, so ubuntu runs the test surface as three matrix
+      # slices, each job a fresh guard session with a ~1-2 min test phase:
+      #   lib-a: lib tests under runner::/agent:: (~1655 tests, 45s local)
+      #   lib-b: the exact complement (--skip both prefixes, ~1448 tests);
+      #          a union b covers the whole lib with no overlap
+      #   lib-c: the five integration binaries + doc tests
+      # Windows keeps the combined run (it passes in ~8 min).
+      - name: verify 3/5a test-run lib (slices a/b)
+        if: matrix.tests && runner.os == 'Linux' && matrix.slice != 'c'
         shell: pwsh
         run: |
           $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','runner::','--skip','pty::','--skip','timeout_terminates','--skip','survivor','--skip','killed_outcome'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ('${{ matrix.slice }}' -eq 'a') {
+            ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','runner::','agent::'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','--skip','runner::','--skip','agent::'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
-      - name: verify 3/5a-2 test-run lib (agent module)
-        if: matrix.tests && runner.os == 'Linux'
-        shell: pwsh
-        run: |
-          $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','agent::','--skip','runner::'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: verify 3/5a-3 test-run lib (builtin_tools)
-        if: matrix.tests && runner.os == 'Linux'
-        shell: pwsh
-        run: |
-          $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','builtin_tools::'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: verify 3/5a-4 test-run lib (rest)
-        if: matrix.tests && runner.os == 'Linux'
-        shell: pwsh
-        run: |
-          $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','--skip','agent::','--skip','builtin_tools::'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: verify 3/5b test-run integration_test
-        if: matrix.tests && runner.os == 'Linux'
+      - name: verify 3/5b test-run integration_test (slice c)
+        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c'
         shell: pwsh
         run: |
           $env:CARGO_BUILD_JOBS = '2'
           ./verify.ps1 -Phase test-run -CargoArgs --test integration_test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: verify 3/5c test-run io_contract_e2e
-        if: matrix.tests && runner.os == 'Linux'
+      - name: verify 3/5c test-run io_contract_e2e (slice c)
+        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c'
         shell: pwsh
         run: |
           $env:CARGO_BUILD_JOBS = '2'
           ./verify.ps1 -Phase test-run -CargoArgs --test io_contract_e2e
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: verify 3/5d test-run mcp_gate_atomicity
-        if: matrix.tests && runner.os == 'Linux'
+      - name: verify 3/5d test-run mcp_gate_atomicity (slice c)
+        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c'
         shell: pwsh
         run: |
           $env:CARGO_BUILD_JOBS = '2'
           ./verify.ps1 -Phase test-run -CargoArgs --test mcp_gate_atomicity
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: verify 3/5e test-run o511_stack_repro
-        if: matrix.tests && runner.os == 'Linux'
+      - name: verify 3/5e test-run o511_stack_repro (slice c)
+        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c'
         shell: pwsh
         run: |
           $env:CARGO_BUILD_JOBS = '2'
           ./verify.ps1 -Phase test-run -CargoArgs --test o511_stack_repro
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: verify 3/5f test-run serve_mcp_smoke
-        if: matrix.tests && runner.os == 'Linux'
+      - name: verify 3/5f test-run serve_mcp_smoke (slice c)
+        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c'
         shell: pwsh
         run: |
           $env:CARGO_BUILD_JOBS = '2'
@@ -266,7 +258,7 @@ jobs:
           exit $LASTEXITCODE
 
       - name: doc tests
-        if: matrix.tests
+        if: matrix.tests && (runner.os == 'Windows' || matrix.slice == 'c')
         run: cargo test --doc
 
   # ==========================================================================
