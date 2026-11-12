@@ -112,6 +112,15 @@ pub enum ExfilGuardMode {
 }
 
 impl ExfilGuardMode {
+    /// 状态名（钉版日志/观测面用）
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Observe => "observe",
+            Self::Enforce => "enforce",
+            Self::Off => "off",
+        }
+    }
+
     /// env 解析；缺省 observe
     fn from_env() -> Self {
         Self::parse(std::env::var("EVORULE_EXFIL_GUARD").ok().as_deref())
@@ -139,9 +148,21 @@ impl ExfilGuardMode {
 }
 
 /// 当前门禁模式（进程级一次解析）
+///
+/// serve 长驻进程启动后改动 EVORULE_EXFIL_GUARD **不生效**——解析在首次
+/// 调用时钉版并存进程级缓存（热路径零开销），钉版落档以 info 留痕（设置面
+/// 可见性：改档需重启进程，此前无任何提示面）。
 pub fn guard_mode() -> ExfilGuardMode {
     static MODE: std::sync::OnceLock<ExfilGuardMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(ExfilGuardMode::from_env)
+    *MODE.get_or_init(|| {
+        let mode = ExfilGuardMode::from_env();
+        tracing::info!(
+            target: "exfil_scan",
+            mode = mode.as_str(),
+            "EVORULE_EXFIL_GUARD resolved (pinned for the process lifetime; env changes need a restart)"
+        );
+        mode
+    })
 }
 
 /// 工具名单门控（外传能力面单一事实源查询）
@@ -310,6 +331,23 @@ pub fn egress_intent_submission(
     }
     let command = egress_intent_signal(tool_name, egress_target(args).as_deref(), &hits);
     Some((command, hits))
+}
+
+#[cfg(test)]
+mod guard_mode_str_tests {
+    use super::*;
+
+    #[test]
+    fn guard_mode_str_roundtrip_and_pinned_read() {
+        // as_str 与 parse 词表一致(钉版日志可读);guard_mode 进程级钉版:
+        // 同进程重复读取同值(OnceLock 契约;设置面可见性:改档需重启)
+        assert_eq!(ExfilGuardMode::Observe.as_str(), "observe");
+        assert_eq!(ExfilGuardMode::Enforce.as_str(), "enforce");
+        assert_eq!(ExfilGuardMode::Off.as_str(), "off");
+        let a = guard_mode();
+        let b = guard_mode();
+        assert_eq!(a.as_str(), b.as_str(), "guard_mode is pinned per process");
+    }
 }
 
 #[cfg(test)]

@@ -286,14 +286,43 @@ async fn list_services_with_readiness_retry(
     }
 }
 
+/// 服务代理结果上限(bytes;与 MCP 面 100KB 同口径):LLM 上下文保护
+const MAX_SERVICE_RESULT_BYTES: usize = 100 * 1024;
+
+/// 结果截断(纯函数可测):限内原样返回(Value 形态不变,存量调用零变化);
+/// 超限按 UTF-8 字符边界截断+原始字节数留痕(截断产物为文本形态,与 MCP
+/// 面超限语义一致)
+fn truncate_service_result(result: Value) -> Value {
+    let text = match serde_json::to_string(&result) {
+        Ok(t) => t,
+        Err(_) => return result,
+    };
+    if text.len() <= MAX_SERVICE_RESULT_BYTES {
+        return result;
+    }
+    let original = text.len();
+    let mut cut = MAX_SERVICE_RESULT_BYTES;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Value::from(format!(
+        "{}
+
+[truncated: original service result was {original} bytes, showing first {cut} bytes (service invoke result limit 100KB)]",
+        &text[..cut]
+    ))
+}
+
 #[async_trait::async_trait]
 impl ToolFunction for ServiceProxyTool {
     async fn call(&self, args: &Value) -> IoResult {
         let serde_args = args.clone();
-        self.ev
+        let result = self
+            .ev
             .invoke_service(&self.service_name, &serde_args)
             .await
-            .map_err(|e| format!("service {} invoke failed: {e}", self.service_name))
+            .map_err(|e| format!("service {} invoke failed: {e}", self.service_name))?;
+        Ok(truncate_service_result(result))
     }
 }
 
@@ -433,6 +462,28 @@ async fn register_service_tools_with_delays(
 mod tests {
     use super::*;
     use crate::io_handlers::tool_handler::ToolHandler;
+
+    #[test]
+    fn truncate_service_result_within_limit_untouched() {
+        // 限内原样返回(Value 形态不变,存量调用零变化)
+        let v = serde_json::json!({"ok": true, "data": "small"});
+        assert_eq!(truncate_service_result(v.clone()), v);
+    }
+
+    #[test]
+    fn truncate_service_result_caps_oversized() {
+        // 超限截断+原始字节数留痕(与 MCP 面 100KB 同口径)
+        let big = "x".repeat(200 * 1024);
+        let v = serde_json::json!({"data": big});
+        let out = truncate_service_result(v);
+        let s = out.as_str().unwrap();
+        assert!(
+            s.contains("[truncated: original service result was"),
+            "oversized result must carry the truncation marker"
+        );
+        assert!(s.contains("100KB"));
+        assert!(s.len() < 110 * 1024, "truncated result must be capped");
+    }
 
     #[test]
     fn empty_whitelist_registers_nothing() {

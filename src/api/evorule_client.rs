@@ -12,6 +12,11 @@ use serde_json::Value;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// 服务直调整体预算(秒):api_core 共享客户端缺省 30s 对 browser/export 类
+/// 长计算触顶——本端点按长计算形态单点放宽(每请求覆盖,不放大全局预算)
+const SERVICE_INVOKE_TIMEOUT_SECS: u64 = 300;
+
+
 /// io_response 提交载荷护栏上限:工具结果经 call_service 回写引擎时,超大
 /// 结果(典型=查询/读取命中海量数据)整体提交会被服务端载荷上限拒收(413),
 /// 引擎侧 io_request 永久悬挂。与消息落库护栏(512KB)同值同构——两条通路
@@ -419,6 +424,8 @@ impl EvoruleApiClient {
     ///
     /// body = 服务 args;响应 = 服务执行结果。服务侧错误以 HTTP 状态透传
     /// (401 未认证 / 403 敏感守卫 / 404 未知服务 / 502 执行失败),经 check_response fail-fast。
+    ///
+    /// 整体预算 [`SERVICE_INVOKE_TIMEOUT_SECS`](每请求覆盖,单点放宽)
     pub async fn invoke_service(
         &self,
         service_name: &str,
@@ -430,6 +437,9 @@ impl EvoruleApiClient {
         let resp = self
             .core
             .auth_header(self.core.client().post(&url))
+            // 单点放宽(api_core 缺省 30s 对 browser/export 类长计算触顶):
+            // 每请求覆盖,不放大全局预算;常量见文件尾 SERVICE_INVOKE_TIMEOUT_SECS
+            .timeout(std::time::Duration::from_secs(SERVICE_INVOKE_TIMEOUT_SECS))
             .json(args)
             .send()
             .await?;

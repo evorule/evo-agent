@@ -1341,14 +1341,7 @@ impl WorkflowEngine {
         skipped: &HashSet<String>,
     ) -> String {
         if let Some(tmpl) = &node.task_template {
-            let mut task = tmpl.clone();
-            for (id, content) in results {
-                task = task.replace(&format!("{{{}}}", id), content);
-            }
-            for id in skipped {
-                task = task.replace(&format!("{{{}}}", id), "");
-            }
-            task
+            render_task_template(tmpl, results, skipped)
         } else {
             node.task.clone()
         }
@@ -2062,6 +2055,46 @@ pub struct NodeCheckpointReplay {
 /// 其它计划锚的检查点跳过(各归各版本的恢复域;同锚粒无论落在哪个计划
 /// 检查点前后都有效,二次恢复不丢粒级进度);调用方锚定了一个账内不存在的
 /// 版本(匹配数 0 而账内有检查点)=拒绝,防错版本续跑。
+/// task_template 渲染(单遍扫描替换;纯函数可测)
+///
+/// 单遍扫描:占位符替换为上游结果时,插入内容**不参与**后续匹配——迭代
+/// `str::replace` 会把上游结果里形如 `{id}` 的文本当占位符二次插值(上游
+/// 内容可借此改写下游任务文本的注入面)。未知占位符保留字面量;被跳过
+/// 节点占位符替换为空串(语义与既有一致)。
+pub(crate) fn render_task_template(
+    template: &str,
+    results: &BTreeMap<String, String>,
+    skipped: &HashSet<String>,
+) -> String {
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut i = 0usize;
+    while i < template.len() {
+        if bytes[i] == b'{' {
+            if let Some(close_rel) = template[i..].find('}') {
+                let key = &template[i + 1..i + close_rel];
+                if let Some(content) = results.get(key) {
+                    out.push_str(content);
+                    i += close_rel + 1;
+                    continue;
+                }
+                if skipped.contains(key) {
+                    i += close_rel + 1; // 替换为空串
+                    continue;
+                }
+            }
+        }
+        let ch = template[i..].chars().next().expect("non-empty scan");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// 同锚检查点回放状态表:node_id → (status, result hash)——重复检查点的
+/// 全等/冲突判别数据源
+type SeenCheckpoints = std::collections::HashMap<String, (String, String, String)>;
+
 pub fn replay_node_checkpoints(
     lines: &[JournalLine],
     plan_hash: &str,
@@ -2070,6 +2103,7 @@ pub fn replay_node_checkpoints(
     // blob 全文检索表先建满(blob 载体在检查点之后落账,单遍消费会扑空),
     // 再逐检查点解析
     let mut blobs: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut seen_checkpoints: SeenCheckpoints = SeenCheckpoints::new();
     for line in lines {
         if let JournalEvent::CheckpointBlob {
             node_id,
@@ -2101,6 +2135,21 @@ pub fn replay_node_checkpoints(
             continue;
         }
         matched += 1;
+        // 同锚重复检查点显式化:全等重复(同状态同结果 hash)=幂等重检查点,
+        // 容忍;冲突(状态或内容 hash 分岔)=账面歧义,拒绝恢复(重跑是安全
+        // 方向)——此前静默取末条,歧义不可见
+        let checkpoint_key = (node_id.clone(), status.clone(), result_ref.hash.clone());
+        match seen_checkpoints.get(node_id) {
+            Some(prev) if *prev == checkpoint_key => continue,
+            Some(_) => {
+                return Err(format!(
+                    "conflicting duplicate checkpoints for node '{node_id}'                      (status or result hash diverge between ledger lines)                      - refusing recovery (rerun is the safe direction)"
+                ));
+            }
+            None => {
+                seen_checkpoints.insert(node_id.clone(), checkpoint_key);
+            }
+        }
         let content = match &result_ref.inline {
             Some(text) => text.clone(),
             None => blobs
@@ -2397,6 +2446,59 @@ mod tests {
             other => panic!("expected node_checkpointed, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_task_template_single_pass_no_secondary_interpolation() {
+        // 迭代替换缺陷形态:上游内容里的 {b} 会被后续 replace 二次插值成 B
+        // (输出 BB);单遍扫描后插入内容不参与匹配(输出 {b}B)
+        let mut results = BTreeMap::new();
+        results.insert("a".to_string(), "{b}".to_string());
+        results.insert("b".to_string(), "B".to_string());
+        let skipped = HashSet::new();
+        let out = render_task_template("{a}{b}", &results, &skipped);
+        assert_eq!(out, "{b}B", "inserted content must not be re-interpolated");
+        // 未知占位符保留字面量
+        let out2 = render_task_template("x{nope}y", &results, &skipped);
+        assert_eq!(out2, "x{nope}y");
+        // 被跳过节点占位符替换为空串;已替换内容不受影响
+        let mut sk = HashSet::new();
+        sk.insert("gone".to_string());
+        let out3 = render_task_template("p{gone}q{a}", &results, &sk);
+        assert_eq!(out3, "pq{b}");
+    }
+
+    #[test]
+    fn replay_conflicting_duplicate_checkpoints_refuse_recovery() {
+        use crate::agent::journal::{CheckpointResultRef, JournalEvent, JournalLine, evorule_digest};
+        let mk = |node: &str, status: &str, content: &str| JournalLine {
+            seq: 0,
+            ts: 0,
+            hashes: None,
+            event: JournalEvent::NodeCheckpointed {
+                workflow_id: "wf".to_string(),
+                plan_hash: "P".to_string(),
+                node_id: node.to_string(),
+                status: status.to_string(),
+                result_ref: CheckpointResultRef {
+                    hash: evorule_digest(content),
+                    len: content.len(),
+                    inline: Some(content.to_string()),
+                },
+            },
+        };
+        // 冲突重复:同节点两检查点内容 hash 分岔 = 账面歧义,拒绝恢复
+        // (此前静默取末条,歧义不可见)
+        let lines = vec![mk("n1", "completed", "content-a"), mk("n1", "completed", "content-b")];
+        let err = replay_node_checkpoints(&lines, "P").unwrap_err();
+        assert!(err.contains("conflicting duplicate checkpoints"), "{err}");
+        // 全等重复(幂等重检查点):容忍,取该值
+        let lines2 = vec![mk("n1", "completed", "content-a"), mk("n1", "completed", "content-a")];
+        let replay = replay_node_checkpoints(&lines2, "P").unwrap();
+        assert_eq!(
+            replay.results.get("n1").map(String::as_str),
+            Some("content-a")
+        );
     }
 
     #[tokio::test]

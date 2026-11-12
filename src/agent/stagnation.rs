@@ -16,6 +16,7 @@ pub const WARN_AFTER_REPEATS: u32 = 3;
 pub const EXHAUST_AFTER_WARNINGS: u32 = 2;
 
 /// 停滞检测结论
+#[derive(Debug)]
 pub enum StagnationVerdict {
     /// 有进展或未达阈值
     Normal,
@@ -113,9 +114,13 @@ impl SequenceLoopDetector {
                 repeat_count: self.repeat_count,
             };
         }
-        // 新指纹=有进展：计数全重置并推进滑动窗（保留最近 2 轮）
+        // 新指纹=有进展：计数全重置并推进滑动窗（保留最近 3 轮）
+        //
+        // 窗宽 3:周期 >=3 的轮级循环(A,B,C,A,...)此前在窗宽 2 下永不命中
+        // (任一指纹两次出现均出窗)——3 覆盖周期 2 与 3;更长周期仍由
+        // max_steps 兜底(整轮预算上限)
         self.window.push_back(fingerprint.to_string());
-        while self.window.len() > 2 {
+        while self.window.len() > 3 {
             self.window.pop_front();
         }
         self.repeat_count = 1;
@@ -200,6 +205,26 @@ mod tests {
     }
 
     // ---------- 轮级序列循环检测（补 F2 三盲区：结果抖动/ABA 交替/轮级组合） ----------
+
+    #[test]
+    fn test_period_three_cycle_is_detected() {
+        // 周期 >=3 的轮级循环(A,B,C,A,B,C,...)此前在窗宽 2 下永不命中
+        // (任一指纹两次出现均出窗)——窗宽 3 后第 4 轮(A 复现)即入重复路径
+        let mut det = SequenceLoopDetector::new();
+        let mut verdicts = Vec::new();
+        for r in 0..8 {
+            let fp = ["A", "B", "C"][r % 3];
+            verdicts.push(match det.observe_round(fp) {
+                StagnationVerdict::Normal => None,
+                other => Some(format!("{:?}", other)),
+            });
+        }
+        assert!(
+            verdicts.iter().any(|v| v.is_some()),
+            "period-3 cycle must be detected within 8 rounds, got: {:?}",
+            verdicts
+        );
+    }
 
     #[test]
     fn test_sequence_immediate_repeat_warns_then_exhausts() {

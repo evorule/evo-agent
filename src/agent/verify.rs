@@ -230,6 +230,20 @@ impl VerifyOrchestrator {
                         diags_digest: crate::agent::journal::evorule_digest(&e),
                         output_digest: crate::agent::journal::evorule_digest(&e),
                     };
+                    // journal 逐命令入账(best-effort;失败不阻塞回喂):
+                    // 观测文本只有计数账,明细以 VerifyRan 事件为准——
+                    // 短路前先前命令的 pass 判定也各有一条独立账目
+                    if let Some(j) = journal {
+                        let _ = j.verify_ran(
+                            &v.name,
+                            &v.command,
+                            v.exit_code,
+                            v.error_count,
+                            &v.diags_digest,
+                            &v.verdict,
+                            &v.output_digest,
+                        );
+                    }
                     last = Some(v);
                     break;
                 }
@@ -237,6 +251,19 @@ impl VerifyOrchestrator {
             let verdict = build_command_verdict(cmd, &out);
             let is_fail = verdict.verdict == "fail";
             let is_unknown = verdict.verdict == "unknown";
+            // journal 逐命令入账(best-effort):此前只记短路后最后一条,
+            // 先前 pass 命令无独立账目(观测文本有计数账面无明细)
+            if let Some(j) = journal {
+                let _ = j.verify_ran(
+                    &verdict.name,
+                    &verdict.command,
+                    verdict.exit_code,
+                    verdict.error_count,
+                    &verdict.diags_digest,
+                    &verdict.verdict,
+                    &verdict.output_digest,
+                );
+            }
             last = Some(verdict);
             if is_fail || is_unknown {
                 break; // 短路:首个含 Error(或不可判)的命令后停
@@ -245,18 +272,6 @@ impl VerifyOrchestrator {
         }
 
         let v = last.expect("at least one command executed");
-        // journal 全量入账(best-effort;失败不阻塞回喂)
-        if let Some(j) = journal {
-            let _ = j.verify_ran(
-                &v.name,
-                &v.command,
-                v.exit_code,
-                v.error_count,
-                &v.diags_digest,
-                &v.verdict,
-                &v.output_digest,
-            );
-        }
 
         // 增量回流基线:fail 写入本轮行集(下轮 diff),pass 清零(下波全量)
         let prev = {
@@ -774,6 +789,47 @@ mod tests {
         assert_eq!(verdict, "fail");
         assert_eq!(error_count, 1);
         assert_eq!(exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn journal_records_every_command_not_only_last_short_circuit() {
+        // 逐命令入账:2 pass + 1 fail(短路)= 3 条 VerifyRan——此前只记
+        // 最后一条,先前 pass 命令无独立账目(观测文本有计数账面无明细)
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        let journal = JournalWriter::open(&journal_dir, "s-verify-all").unwrap();
+
+        let orch = VerifyOrchestrator::new(
+            config(vec![
+                ("p1", "echo one", "$rustc"),
+                ("p2", "echo two", "$rustc"),
+                ("f1", "cargo check", "$rustc"),
+            ]),
+            Arc::new(StubRunner::new(vec![
+                ok_output("all good"),
+                ok_output("still good"),
+                ok_output("src/a.rs:3:7: error[E0308]: mismatched types"),
+            ])),
+        );
+        orch.note_write_success();
+        let report = orch.run_pending(Some(&journal)).await.unwrap();
+        assert_eq!(report.verdict, "fail");
+
+        let path = JournalWriter::path_for(&journal_dir, "s-verify-all");
+        let lines = crate::agent::journal::read_all(&path).unwrap();
+        let names: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| match &l.event {
+                JournalEvent::VerifyRan { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["p1", "p2", "f1"],
+            "every executed command needs its own VerifyRan entry"
+        );
     }
 
     #[test]
