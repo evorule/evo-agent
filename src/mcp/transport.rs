@@ -42,8 +42,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, warn};
 
@@ -194,21 +194,45 @@ fn canonical_id(v: &Value) -> Option<String> {
     }
 }
 
+/// stdout 单行读取上限(bytes):防恶意/缺陷 server 回超长单行把客户端内存
+/// 撑爆(spawn 闸白名单缓解启动面,运行面由此界兜底)。合法 JSON-RPC 帧
+/// (大 schema 集的 tools/list 响应)远低于此界;超限=协议错误,reader 退出
+/// 并给全部 pending 回传真实结局(fail-visible 下架)。
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 /// reader loop:逐行读 stdout,解析 JSON-RPC response,按 id 路由到 pending channel
 ///
 /// - 成功响应(`{"result":...}`)→ 发送 `Ok(result)`
 /// - 错误响应(`{"error":{"message":...}}`)→ 发送 `Err(message)`
 /// - 通知(无 `id`)→ 仅 debug 日志(P1 不处理 server→client 通知)
-/// - EOF / 解析失败 → 退出 loop;剩余 pending 由 oneshot 关闭自动报错
-async fn reader_loop(
-    stdout: ChildStdout,
+/// - EOF / 解析失败 / 单行超限 → 退出 loop;剩余 pending 由 oneshot 关闭自动报错
+///
+/// 泛型读端:生产传子进程 stdout,测试可传内存 reader(单行上限行为可测)。
+async fn reader_loop<R: AsyncRead + Unpin + Send>(
+    stdout: R,
     pending: Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<PendingResult>>>>,
 ) {
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
+    let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
+        // 有界读取:take 限定本次单行最大字节(read_until 至多消费该预算,
+        // 内存增量有界);超限=协议错误,不尝试再同步
+        let mut taken = reader.take((MAX_LINE_BYTES + 1) as u64);
+        let read = taken.read_until(b'\n', &mut line).await;
+        reader = taken.into_inner();
+        if let Ok(n) = read {
+            if n > MAX_LINE_BYTES {
+                warn!(
+                    bytes = n,
+                    limit = MAX_LINE_BYTES,
+                    "MCP stdout line exceeds size limit, reader loop exiting (oversized frame)"
+                );
+                drain_pending(&pending, "MCP server sent an oversized frame");
+                return;
+            }
+        }
+        match read {
             Ok(0) => {
                 // EOF:server 关闭了 stdout
                 debug!("MCP server stdout EOF, reader loop exiting");
@@ -216,7 +240,8 @@ async fn reader_loop(
                 return;
             }
             Ok(_) => {
-                let trimmed = line.trim();
+                let owned = String::from_utf8_lossy(&line);
+                let trimmed = owned.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
@@ -757,6 +782,46 @@ pub mod tests {
             .await
             .unwrap();
         assert_eq!(result["tools"].as_array().map(|a| a.len()), Some(0));
+    }
+
+    // ===== stdout 单行上限(o101):超长单行内存膨胀防线 =====
+
+    fn pending_map_with(
+        id: u64,
+    ) -> (
+        Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<PendingResult>>>>,
+        oneshot::Receiver<PendingResult>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        let map: Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<PendingResult>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        map.lock().unwrap().insert(id, tx);
+        (map, rx)
+    }
+
+    #[tokio::test]
+    async fn test_reader_loop_oversized_line_drains_pending() {
+        // 超限单行:reader 退出并给 pending 回传 oversized-frame 真实结局
+        // (不再无界缓冲)
+        let (pending, rx) = pending_map_with(1);
+        let oversized = format!("{{\"id\":1}}{}\n", "a".repeat(MAX_LINE_BYTES + 1));
+        reader_loop(std::io::Cursor::new(oversized.into_bytes()), pending.clone()).await;
+        let outcome = rx.await.unwrap();
+        assert!(
+            outcome.unwrap_err().contains("oversized"),
+            "pending waiter must receive the oversized-frame error"
+        );
+        assert!(pending.lock().unwrap().is_empty(), "pending map drained");
+    }
+
+    #[tokio::test]
+    async fn test_reader_loop_normal_line_within_limit_routes() {
+        // 控制面:限额内的正常帧照常路由(上限不误伤合法流量)
+        let (pending, rx) = pending_map_with(7);
+        let frame = "{\"id\":7,\"result\":{\"ok\":true}}\n";
+        reader_loop(std::io::Cursor::new(frame.as_bytes().to_vec()), pending.clone()).await;
+        let outcome = rx.await.unwrap();
+        assert_eq!(outcome.unwrap()["ok"], serde_json::Value::Bool(true));
     }
 
     #[tokio::test]

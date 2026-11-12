@@ -168,6 +168,63 @@ impl ToolHandler {
         Arc::make_mut(&mut self.tools).insert(name, ToolEntry { manifest, func });
     }
 
+    /// 注册工具（来源防覆盖变体）：同名注册仅在**同来源**时放行（装配期
+    /// 重绑/重启重注册的正当形态），跨来源同名注册一律拒绝。
+    ///
+    /// 结构化封堵同名冒名覆盖：`ToolSource` 不同的两个工具同名时，后者
+    /// `register` 会静默顶替前者的治理元数据与执行器（审批策略/裁决分级
+    /// 随 manifest 整体换血），此防线把「不变式依赖调用方自觉」升格为
+    /// 「handler 层结构保证」——动态注册面（服务代理/MCP）一律走本口；
+    /// 静态重绑路径（同来源刷新）继续用 [`Self::register`]。
+    ///
+    /// 返回 `Err` = 拒绝注册（既有条目保持原样，调用方决定失败语义）。
+    pub fn register_guarded(
+        &mut self,
+        manifest: ToolManifest,
+        func: Arc<dyn ToolFunction>,
+    ) -> Result<(), String> {
+        let name = manifest.name.clone();
+        let new_source = manifest.source;
+        if let Some(existing) = self.tools.get(&name) {
+            if existing.manifest.source != new_source {
+                return Err(format!(
+                    "tool '{name}' already registered with source {:?}; refusing \
+                     cross-source shadow registration from {:?} (approval policy / \
+                     adjudication class must not be silently swapped)",
+                    existing.manifest.source, new_source
+                ));
+            }
+        }
+        self.register(manifest, func);
+        Ok(())
+    }
+
+    /// 按名注销工具（存在返回 true）。
+    ///
+    /// 动态面（MCP server 重启/重载、服务清单刷新）移除既有注册条目用；
+    /// 静态工具不走注销（装配期 fail-fast 面）。
+    pub fn unregister(&mut self, name: &str) -> bool {
+        Arc::make_mut(&mut self.tools).remove(name).is_some()
+    }
+
+    /// 按来源注销全部工具，返回被移除的名字列表（按名字序）。
+    ///
+    /// 全量重载语义的清除半边：MCP 重载先按来源清空动态条目再重注册，
+    /// 「只加不删」的滞留工具（移除的 server/重连失败的 server/工具集
+    /// 收缩后的旧名）不再滞留至进程重启。
+    pub fn unregister_source(&mut self, source: crate::agent::tool_manifest::ToolSource) -> Vec<String> {
+        let map = Arc::make_mut(&mut self.tools);
+        let removed: Vec<String> = map
+            .iter()
+            .filter(|(_, e)| e.manifest.source == source)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &removed {
+            map.remove(name);
+        }
+        removed
+    }
+
     /// 注册静态工具（按名查静态 manifest 表，硬规则 1 启动期 fail-fast）
     ///
     /// 查不到静态条目 = panic（启动期装配失败可见，禁止无契约工具上线）。
@@ -476,6 +533,92 @@ mod tests {
             m.spec,
             crate::agent::tool_manifest::SpecSource::Inline { .. }
         ));
+    }
+
+    #[test]
+    fn test_register_guarded_refuses_cross_source_shadow() {
+        // 来源防覆盖防线:同名跨来源注册必须显式拒绝,既有条目保持原样
+        // (治理元数据/执行器不得随覆盖换血)
+        let mut handler = ToolHandler::new();
+        let mcp_manifest = dynamic_manifest(
+            "shared_name",
+            ToolSource::Mcp,
+            "mcp tool".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        handler.register(mcp_manifest, Arc::new(EchoTool));
+        let before = handler.manifest("shared_name").unwrap();
+        let svc_manifest = dynamic_manifest(
+            "shared_name",
+            ToolSource::ServiceProxy,
+            "service proxy shadow".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        let err = handler
+            .register_guarded(svc_manifest, Arc::new(EchoTool))
+            .expect_err("cross-source shadow registration must be refused");
+        assert!(err.contains("shared_name"), "{err}");
+        let after = handler.manifest("shared_name").unwrap();
+        assert_eq!(after.source, before.source, "existing entry must be intact");
+    }
+
+    #[test]
+    fn test_register_guarded_allows_same_source_rebind() {
+        // 同来源重注册放行(装配期重绑/重启重注册的正当形态)
+        let mut handler = ToolHandler::new();
+        let m1 = dynamic_manifest(
+            "mcp_a",
+            ToolSource::Mcp,
+            "v1".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        handler.register_guarded(m1, Arc::new(EchoTool)).unwrap();
+        let m2 = dynamic_manifest(
+            "mcp_a",
+            ToolSource::Mcp,
+            "v2 refreshed".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        handler.register_guarded(m2, Arc::new(EchoTool)).unwrap();
+        let refreshed = handler.manifest("mcp_a").unwrap();
+        match refreshed.spec {
+            crate::agent::tool_manifest::SpecSource::Inline { description, .. } => {
+                assert_eq!(description, "v2 refreshed", "rebind must take effect");
+            }
+            other => panic!("expected inline spec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unregister_and_unregister_source() {
+        // 注销原语(重载/重启的清除半边):按名单个移除 + 按来源批量移除
+        let mut handler = ToolHandler::new();
+        for name in ["mcp_a", "mcp_b", "svc_c"] {
+            let source = if name.starts_with("mcp_") {
+                ToolSource::Mcp
+            } else {
+                ToolSource::ServiceProxy
+            };
+            let m = dynamic_manifest(
+                name,
+                source,
+                format!("{name} desc"),
+                serde_json::json!({"type": "object", "properties": {}}),
+            )
+            .unwrap();
+            handler.register(m, Arc::new(EchoTool));
+        }
+        assert!(handler.unregister("mcp_a"));
+        assert!(!handler.unregister("mcp_a"), "double remove is false");
+        assert!(!handler.has_tool("mcp_a"));
+        let removed = handler.unregister_source(ToolSource::Mcp);
+        assert_eq!(removed, vec!["mcp_b".to_string()]);
+        assert!(!handler.has_tool("mcp_b"));
+        assert!(handler.has_tool("svc_c"), "other sources must survive");
     }
 
     // === 执行器生命周期契约:超时档分派 + 钩子 + 终止宽限 ===
