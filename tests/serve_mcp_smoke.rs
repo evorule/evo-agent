@@ -40,7 +40,10 @@ for line in sys.stdin:
         result = {"tools": [{"name": "echo", "description": "echo back the msg argument",
                              "inputSchema": {"type": "object",
                                              "properties": {"msg": {"type": "string"}},
-                                             "required": ["msg"]}}]}
+                                             "required": ["msg"]}},
+                            {"name": "deny_probe", "description": "never whitelisted; used by the smoke guard to assert adjudicated rejection",
+                             "inputSchema": {"type": "object",
+                                             "properties": {"msg": {"type": "string"}}}}]}
     elif method == "tools/call":
         args = (msg.get("params") or {}).get("arguments") or {}
         result = {"content": [{"type": "text",
@@ -278,5 +281,33 @@ fn smoke_serve_with_stdio_mcp_reaches_listening_and_client_face_works() {
     assert!(
         text.contains("o513-smoke"),
         "echo must round-trip through the stdio MCP client face, got: {text}"
+    );
+
+    // 判据 4（裁决闸回归锁·双通裁定的 fail-closed 半边）：白名单内工具直跑
+    // 放行（判据 3 已证），白名单外的 Sensitive 工具必须仍被裁决闸拒执
+    // （fail-closed 不因豁免半边打折；tools/list 照常广告但 tools/call 拒绝）
+    let listed = tools["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .any(|t| t["name"] == "mcp_mock_deny_probe");
+    assert!(
+        listed,
+        "deny_probe must be listed (gate rejects at call time, not list time)"
+    );
+    let denied = rpc(
+        port,
+        4,
+        "tools/call",
+        serde_json::json!({"name": "mcp_mock_deny_probe", "arguments": {"msg": "must-not-run"}}),
+    );
+    assert_eq!(
+        denied["isError"], true,
+        "non-whitelisted adjudicated tool must be rejected on the /mcp face: {denied}"
+    );
+    let denied_text = denied["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        denied_text.contains("governance adjudication"),
+        "rejection must state the adjudication requirement, got: {denied_text}"
     );
 }

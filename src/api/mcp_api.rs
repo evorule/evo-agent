@@ -22,7 +22,7 @@
 //! Send **不得跨 await**——所有重载路径走两段式:async 段先完成连接
 //! ([`McpManager::reconnect`](crate::mcp::McpManager::reconnect),不持
 //! handler 引用),同步段再持写锁注册
-//! ([`register_client_tools`](crate::mcp::register_client_tools)),临界区内无 await。
+//! ([`register_server_tools_checked`](crate::mcp::McpManager::register_server_tools_checked)),临界区内无 await。
 //!
 //! ## 未启用态
 //!
@@ -39,7 +39,7 @@ use tracing::info;
 
 use crate::api::agent_api::AgentApiState;
 use crate::config::{McpConfig, McpServerConfig};
-use crate::mcp::{register_client_tools, McpConfigStore, McpManager, McpServerStatus};
+use crate::mcp::{McpConfigStore, McpManager, McpServerStatus};
 
 /// MCP 面未启用(serve 启动未注入管理器)→ 503
 fn not_enabled() -> (StatusCode, Json<Value>) {
@@ -113,7 +113,15 @@ fn validate(cfg: &McpConfig) -> Result<(), String> {
 }
 
 /// 单 server 合并视图条目(配置面 + 运行态)
-fn server_view(s: &McpServerConfig, snap: &HashMap<String, crate::mcp::McpServerEntry>) -> Value {
+///
+/// `mcp_downgraded` = `agentTools.mcpAdjudication=="standard"` 降档在档——
+/// `allowed` 口径与 /mcp 面实际可执行性同源（白名单直跑 ∨ 降档后免裁决），
+/// 防配置面报 allowed=true 而 /mcp 面 tools/call 拒执的口径分裂。
+fn server_view(
+    s: &McpServerConfig,
+    snap: &HashMap<String, crate::mcp::McpServerEntry>,
+    mcp_downgraded: bool,
+) -> Value {
     let entry = snap.get(&s.name);
     let status = if s.disabled {
         "disabled".to_string()
@@ -140,7 +148,7 @@ fn server_view(s: &McpServerConfig, snap: &HashMap<String, crate::mcp::McpServer
                     "server_tool": t.name,
                     "description": t.description,
                     "input_schema": t.input_schema,
-                    "allowed": s.always_allow.contains(&t.name),
+                    "allowed": s.always_allow.contains(&t.name) || mcp_downgraded,
                 })
             })
             .collect(),
@@ -163,12 +171,30 @@ fn server_view(s: &McpServerConfig, snap: &HashMap<String, crate::mcp::McpServer
     })
 }
 
+/// mcpAdjudication 降档判定（settings 键消费面；与 serve_tools 降档原语同键同判据）
+fn mcp_adjudication_downgraded(workdir: &std::path::Path) -> bool {
+    crate::api::settings::WorkbenchSettingsStore::new(workdir)
+        .map(|store| store.merged().0)
+        .map(|settings| {
+            settings
+                .get(crate::agent::tool_manifest::AGENT_TOOLS_MCP_ADJUDICATION)
+                .and_then(|v| v.as_str())
+                == Some("standard")
+        })
+        .unwrap_or(false)
+}
+
 /// 合并视图(配置 store.load() + 管理器 snapshot();GET 与 PUT 共用响应形)
-fn merged_view(manager: &McpManager, store: &McpConfigStore) -> Value {
+fn merged_view(manager: &McpManager, store: &McpConfigStore, workdir: &std::path::Path) -> Value {
     let cfg = store.load();
     let snap: HashMap<String, crate::mcp::McpServerEntry> =
         manager.snapshot().into_iter().collect();
-    let servers: Vec<Value> = cfg.servers.iter().map(|s| server_view(s, &snap)).collect();
+    let mcp_downgraded = mcp_adjudication_downgraded(workdir);
+    let servers: Vec<Value> = cfg
+        .servers
+        .iter()
+        .map(|s| server_view(s, &snap, mcp_downgraded))
+        .collect();
     json!({
         "servers": servers,
         "config_path": store.path().display().to_string(),
@@ -185,7 +211,7 @@ pub async fn list_servers(
     let Some(store) = state.mcp_store() else {
         return Err(not_enabled());
     };
-    Ok(Json(merged_view(manager, store)))
+    Ok(Json(merged_view(manager, store, state.workdir())))
 }
 
 /// PUT 请求单 server 条目(与 [`McpServerConfig`] 同形,仅 env 可选)
@@ -339,12 +365,11 @@ pub async fn put_servers(
             );
         }
         for (s, client, tools) in &connections {
-            match register_client_tools(
+            match manager.register_server_tools_checked(
                 &mut toolkit,
-                &s.name,
+                s,
                 client,
                 tools,
-                &s.always_allow,
                 s.timeout_secs,
             ) {
                 Ok(n) => {
@@ -357,6 +382,15 @@ pub async fn put_servers(
                 }
             }
         }
+        // 重注册条目缺省 Sensitive（dynamic_manifest 缺省），降档在档时重应用
+        // （降档语义跨 face 同源：/mcp 面 tools/call 与此处 allowed 口径一致）
+        let settings = crate::api::settings::WorkbenchSettingsStore::new(state.workdir())
+            .map(|store| store.merged().0)
+            .unwrap_or_default();
+        crate::api::serve_tools::apply_dynamic_source_adjudication_downgrade(
+            &mut toolkit,
+            &settings,
+        );
     }
     info!(
         servers = registered_servers,
@@ -365,7 +399,7 @@ pub async fn put_servers(
         "MCP servers reloaded via workbench PUT"
     );
 
-    Ok(Json(merged_view(manager, store)))
+    Ok(Json(merged_view(manager, store, state.workdir())))
 }
 
 /// `POST /api/mcp/servers/{name}/restart` 断连重连重注册单 server
@@ -414,20 +448,25 @@ pub async fn restart_server(
         )
     })?;
 
-    // 同步段:持写锁先清旧名(工具集可能收缩)后重注册
+    // 同步段:持写锁先清旧名(工具集可能收缩)后重注册（碰撞检测闸）
     let count = {
         let mut toolkit = state.toolkit_lock().write().expect("toolkit lock poisoned");
         for name in &stale {
             toolkit.unregister(name);
         }
-        register_client_tools(
-            &mut toolkit,
-            &s.name,
-            &client,
-            &tools,
-            &s.always_allow,
-            s.timeout_secs,
-        )
+        let registered =
+            manager.register_server_tools_checked(&mut toolkit, s, &client, &tools, s.timeout_secs);
+        if registered.is_ok() {
+            // 重注册条目缺省 Sensitive，降档在档时重应用（跨 face 同源）
+            let settings = crate::api::settings::WorkbenchSettingsStore::new(state.workdir())
+                .map(|store| store.merged().0)
+                .unwrap_or_default();
+            crate::api::serve_tools::apply_dynamic_source_adjudication_downgrade(
+                &mut toolkit,
+                &settings,
+            );
+        }
+        registered
     };
     let count = match count {
         Ok(n) => n,
@@ -523,6 +562,48 @@ mod tests {
         .is_ok());
         // 非法 transport 值
         assert!(validate(&one(mk(Some("websocket"), None, "npx"))).is_err());
+    }
+
+    #[test]
+    fn test_server_view_allowed_reflects_whitelist_or_downgrade() {
+        // allowed 口径与 /mcp 面可执行性同源：白名单直跑 ∨ mcpAdjudication
+        // 降档在档（此前 allowed=true 而 /mcp tools/call 拒执的口径分裂面）
+        let spec = |tool: &str| crate::mcp::McpToolSpec {
+            name: tool.to_string(),
+            description: "d".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let mut s = McpServerConfig {
+            name: "mock".to_string(),
+            command: "python".to_string(),
+            ..Default::default()
+        };
+        s.always_allow = vec!["echo".to_string()];
+        let mgr = McpManager::new();
+        mgr.seed_connected_entry("mock", vec![spec("echo"), spec("other")]);
+        let snap: HashMap<String, crate::mcp::McpServerEntry> =
+            mgr.snapshot().into_iter().collect();
+        let allowed_of = |view: &Value, tool: &str| {
+            view["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["server_tool"] == tool)
+                .unwrap()["allowed"]
+                .clone()
+        };
+        // 未降档：白名单内 true、白名单外 false
+        let view = server_view(&s, &snap, false);
+        assert_eq!(allowed_of(&view, "echo"), serde_json::json!(true));
+        assert_eq!(allowed_of(&view, "other"), serde_json::json!(false));
+        // 降档在档：整源免裁决 → 全部可执行
+        let view = server_view(&s, &snap, true);
+        assert_eq!(allowed_of(&view, "echo"), serde_json::json!(true));
+        assert_eq!(
+            allowed_of(&view, "other"),
+            serde_json::json!(true),
+            "downgraded mcp source makes non-whitelisted tools callable on the /mcp face"
+        );
     }
 
     /// 构造注入 MCP 管理器 + 配置存储的测试 state(空 toolkit)

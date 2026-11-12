@@ -2066,6 +2066,15 @@ async fn patrol_build_runner(
     let union = evo_agent::api::serve_tools::build_union_toolkit(workdir, &ws_client, client);
     let whitelist: Vec<String> = allowed_tools.iter().map(|s| s.to_string()).collect();
     let mut tool_handler = evo_agent::api::serve_tools::build_filtered_toolkit(&union, &whitelist);
+    // 动态源降档键在本面同样消费（跨 face 同源：patrol 面与 serve 会话面
+    // 共用同一裁决降档语义，无 workbench settings 时缺省=维持 Sensitive）
+    let patrol_settings = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+        .map(|store| store.merged().0)
+        .unwrap_or_default();
+    evo_agent::api::serve_tools::apply_dynamic_source_adjudication_downgrade(
+        &mut tool_handler,
+        &patrol_settings,
+    );
     // def.tools 与本轮工具面同步收窄:from_definition 会 fail-fast 校验 def.tools
     // 每个名字都已在 tool_handler 注册,只窄 handler 不窄 def 会直接启动失败。
     def.tools.retain(|t| whitelist.contains(t));
@@ -3424,12 +3433,14 @@ fn cmd_serve(
         config.mcp.clone(),
     ));
     let mcp_cfgs = mcp_store.load();
+    // 工作台 settings 合并视图（MCP 开关 + 动态源降档键共用一次装载；
+    // store 缺席/损坏降级空 map = 全缺省语义）
+    let workbench_settings = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+        .map(|store| store.merged().0)
+        .unwrap_or_default();
     let mut mcp_enabled = false;
     if !mcp_cfgs.servers.is_empty() {
-        let (merged, _) = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
-            .map(|store| store.merged())
-            .unwrap_or_else(|_| (serde_json::Map::new(), serde_json::Map::new()));
-        let enabled = merged
+        let enabled = workbench_settings
             .get("agentTools.mcp")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
@@ -3454,6 +3465,13 @@ fn cmd_serve(
             );
         }
     }
+    // 动态源降档键贯通 /mcp 面（union 直装此前不读 settings，降档键对该面
+    // 不可达）：连接注册后统一应用——注册条目缺省 Sensitive，运行期每次
+    // 重注册由各消费点（reap 重启监督/mcp_api reload+restart）重应用同一原语
+    evo_agent::api::serve_tools::apply_dynamic_source_adjudication_downgrade(
+        &mut toolkit,
+        &workbench_settings,
+    );
     let toolkit_tool_count = toolkit.tool_names().len();
     // B16:RwLock 包装 —— serve 运行期 MCP 重载/restart 端点需向 union
     // 注册新工具(读路径经 state.toolkit() 取读锁,写路径 mcp_api 取写锁)
@@ -3462,15 +3480,18 @@ fn cmd_serve(
         "[tools] union toolkit assembled: {} tool(s)",
         toolkit_tool_count
     );
-    // 资源边界设计（L1）：生命周期收割通知 → 退避重启监督。restart_on_reap 显式
-    // 开启才自动重启（重走装载门=许可重新核验 + toolkit 写锁内重注册——写锁
-    // 为同步 guard，不跨 await 持有）；缺省=收割落 failed 态等待运维处置。
+    // 资源边界设计（L1）：生命周期收割通知 → 收割落账 + 退避重启监督。restart_on_reap
+    // 显式开启才自动重启（重走装载门=许可重新核验 + toolkit 写锁内重注册——写锁
+    // 为同步 guard，不跨 await 持有）；缺省=收割落 failed 态等待运维处置（收割
+    // 即经 mark_reaped 落账 + toolkit 侧注销死条目，状态面不再报 connected 假活）。
     // 重启成功后取新 client 的监控端，维持监督链不断。
     {
         let cfgs: Vec<evo_agent::config::McpServerConfig> = mcp_cfgs.servers.clone();
+        let restart_settings = workbench_settings.clone();
         for (name, mut reap_rx) in mcp_manager.take_reap_receivers() {
             let manager = mcp_manager.clone();
             let toolkit = toolkit.clone();
+            let restart_settings = restart_settings.clone();
             let Some(cfg) = cfgs.iter().find(|c| c.name == name).cloned() else {
                 continue;
             };
@@ -3479,6 +3500,17 @@ fn cmd_serve(
                     let Some(notice) = reap_rx.recv().await else {
                         return;
                     };
+                    // 收割落账：运行态条目落 Failed（状态面不再假活）+ toolkit 侧
+                    // 按注册名清单注销死 client 执行器条目（在途调用即得明确错误
+                    // 而非撞死连接）
+                    let stale = manager.mark_reaped(&notice.server_name, &notice.reason);
+                    if !stale.is_empty() {
+                        if let Ok(mut guard) = toolkit.write() {
+                            for tool_name in &stale {
+                                guard.unregister(tool_name);
+                            }
+                        }
+                    }
                     eprintln!(
                         "[mcp] server '{}' reaped ({}); {}",
                         notice.server_name,
@@ -3509,14 +3541,21 @@ fn cmd_serve(
                                         eprintln!("[mcp] toolkit lock poisoned, restart aborted");
                                         break;
                                     };
-                                    evo_agent::mcp::register_client_tools(
+                                    let n = manager.register_server_tools_checked(
                                         &mut guard,
-                                        &cfg.name,
+                                        &cfg,
                                         &client,
                                         &tools,
-                                        &cfg.always_allow,
                                         cfg.timeout_secs,
-                                    )
+                                    );
+                                    if n.is_ok() {
+                                        // 重注册条目缺省 Sensitive，降档在档时重应用
+                                        evo_agent::api::serve_tools::apply_dynamic_source_adjudication_downgrade(
+                                            &mut guard,
+                                            &restart_settings,
+                                        );
+                                    }
+                                    n
                                 };
                                 match registered {
                                     Ok(n) => {
