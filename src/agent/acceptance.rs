@@ -83,13 +83,35 @@ pub async fn apply_acceptance_gate(acceptance_command: Option<&str>, args: &Valu
     }
 }
 
+/// 验收命令整体预算(秒):挂起判据 = 判据不返回即不存在 done 路径,task_done
+/// 被永久楔死。预算到期 kill_on_drop 终止子进程并报超时(按不过形态归因,
+/// fail-visible)
+const ACCEPTANCE_COMMAND_TIMEOUT_SECS: u64 = 120;
+
 /// 执行验收命令(windows=cmd /C,其余=sh -c;tokio 异步执行不阻塞执行器线程)。
-/// spawn 失败按"未通过"处理(Err 携带原因)。
+/// spawn 失败按"未通过"处理(Err 携带原因)。整体受
+/// [`ACCEPTANCE_COMMAND_TIMEOUT_SECS`] 预算约束(超时 = 终止,非放弃)。
 async fn run_acceptance_command(cmd: &str) -> Result<std::process::Output, String> {
+    run_acceptance_command_with_budget(
+        cmd,
+        std::time::Duration::from_secs(ACCEPTANCE_COMMAND_TIMEOUT_SECS),
+    )
+    .await
+}
+
+/// 预算参数化主体(测试注入短预算实测超时/终止路径)
+async fn run_acceptance_command_with_budget(
+    cmd: &str,
+    budget: std::time::Duration,
+) -> Result<std::process::Output, String> {
     #[cfg(windows)]
     let mut command = {
         let mut c = tokio::process::Command::new("cmd");
-        c.args(["/C", cmd]);
+        // raw_arg 直传(与 workflow 判据执行同语义):arg() 按 MSVCRT 约定对
+        // 内层引号做反斜杠转义而 cmd 不认转义——含引号判据串经 arg() 必被
+        // 搅碎(实锤:python -c "exit(7)" 退出码偏离);直传让 cmd 收到与
+        // 声明一致的串
+        c.raw_arg("/C").raw_arg(cmd);
         c
     };
     #[cfg(not(windows))]
@@ -98,10 +120,60 @@ async fn run_acceptance_command(cmd: &str) -> Result<std::process::Output, Strin
         c.args(["-c", cmd]);
         c
     };
-    command
-        .output()
-        .await
-        .map_err(|e| format!("acceptance command spawn failed: {e}"))
+    // 预算=终止(非放弃):Unix 独立进程组 + 到期进程族终止(shell_exec 同款
+    // 原语)——windows cmd /C 中间层下的孙进程一并回收,kill_on_drop 仅作
+    // 直杀兜底
+    #[cfg(unix)]
+    command.process_group(0);
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    command.kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("acceptance command spawn failed: {e}"))?;
+    let child_pid = child.id();
+    // 管道并发排空(防满管阻塞子进程);内容收进缓冲,自然退出臂组装 Output。
+    // 树级/组级终止必须在树存活时进行(kill_on_drop 的 drop 直杀会先断树,
+    // taskkill /T 即扑空),故用借用式 wait + 前置 pid 快照
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let out_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(s) = stdout_pipe.as_mut() {
+            let _ = tokio::io::AsyncReadExt::read_to_end(s, &mut buf).await;
+        }
+        buf
+    });
+    let err_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(s) = stderr_pipe.as_mut() {
+            let _ = tokio::io::AsyncReadExt::read_to_end(s, &mut buf).await;
+        }
+        buf
+    });
+    match tokio::time::timeout(budget, child.wait()).await {
+        Ok(Ok(status)) => {
+            let stdout = out_task.await.unwrap_or_default();
+            let stderr = err_task.await.unwrap_or_default();
+            Ok(std::process::Output { status, stdout, stderr })
+        }
+        Ok(Err(e)) => Err(format!("acceptance command spawn failed: {e}")),
+        Err(_) => {
+            // 进程族终止(树级/组级,树存活时链条完整)+ 直杀兜底 + reap
+            if let Some(pid) = child_pid {
+                crate::builtin_tools::shell_exec::terminate_family_by_pid(pid);
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = out_task.await;
+            let _ = err_task.await;
+            Err(format!(
+                "acceptance command timed out after {}s (process tree terminated)",
+                budget.as_secs()
+            ))
+        }
+    }
 }
 
 /// 取字符串尾部 n 个字符(字符边界安全;workflow 判据门禁复用)
@@ -183,6 +255,42 @@ pub(crate) fn extract_criteria(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== 验收命令整体预算与引号保真(o85) =====
+
+    #[cfg(windows)]
+    const HUNG_ACCEPTANCE_CMD: &str = "ping -n 120 127.0.0.1 >nul";
+    #[cfg(not(windows))]
+    const HUNG_ACCEPTANCE_CMD: &str = "sleep 120";
+
+    #[tokio::test]
+    async fn test_acceptance_command_budget_bounds_hung_command() {
+        // 验收命令挂起原为无界 await——判据不返回即不存在 done 路径,task_done
+        // 被永久楔死。预算到期必须报超时(fail-visible,按不过形态归因)
+        let t0 = std::time::Instant::now();
+        let err =
+            run_acceptance_command_with_budget(HUNG_ACCEPTANCE_CMD, std::time::Duration::from_secs(1))
+                .await
+                .expect_err("hung acceptance command must hit the budget");
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "budget must fire near 1s, took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_acceptance_command_windows_quote_preserved() {
+        // Windows /C 引号保真回归(workflow 判据同型缺陷在此复发过):/C 参数
+        // 未用 raw_arg 时 arg() 按 MSVCRT 约定转义内层引号而 cmd 不认——
+        // python -c "exit(7)" 被搅碎后退出码偏离;直传后必得真实退出码 7
+        let out = run_acceptance_command("python -c \"exit(7)\"")
+            .await
+            .expect("python 须成功 spawn");
+        assert_eq!(out.status.code(), Some(7));
+    }
 
     #[tokio::test]
     async fn test_gate_passes_on_exit_zero() {
