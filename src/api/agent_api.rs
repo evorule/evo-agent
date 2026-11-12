@@ -4924,6 +4924,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_transcript_falls_back_to_snapshot_on_engine_404() {
+        // 引擎侧无此会话(facts 404——重启后无 WAL 归档/TTL 回收)时,
+        // transcript 须回落 serve 本地快照(source=snapshot,authoritative=false),
+        // 而非裸 502——否则 IDE 历史恢复失败(换线/深链全量炸)。
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/sessions/snap-404/facts(\?.*)?$".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"session archive not found"}"#)
+            .create_async()
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = AgentApiState::new_with_metrics(
+            AgentDefinitionManager::with_default_dir(),
+            EvoruleApiClient::new(&server.url()),
+            Arc::new(Metrics::new().unwrap()),
+            tmp.path().to_path_buf(),
+            Arc::new(WorkspaceApiClient::new(&server.url())),
+            Arc::new(std::sync::RwLock::new(ToolHandler::new())),
+        );
+        // 预置本地快照(TurnEnd 落盘口径)
+        state.snapshots().ensure_dir();
+        let record = |idx: usize, role: &str, content: &str| crate::agent::memory::MessageRecord {
+            idx,
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_name: None,
+            reasoning: None,
+            timestamp: (idx + 1) as u64,
+            fact_id: None,
+        };
+        let msgs = vec![
+            record(0, "user", "历史问题"),
+            record(1, "assistant", "历史回答"),
+        ];
+        state
+            .snapshots()
+            .save("snap-404", "general", &msgs)
+            .unwrap();
+
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/snap-404/transcript")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["source"], "snapshot");
+        assert_eq!(body["authoritative"], false);
+        assert_eq!(body["session_id"], "snap-404");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_atif_export_missing_journal_is_404() {
         // fail-visible:无 journal 的会话不产半截轨迹
         let state = make_test_state();

@@ -549,10 +549,16 @@ pub async fn capture_checkpoint(
     store.save_checkpoint(session_id, agent_type, &messages, label, engine_version)
 }
 
-/// evorule 会话是否已不可达(30min 闲置 TTL 回收 → facts 查询 404 →
-/// `ApiError::SessionNotFound` → Display `"Session not found"`)
+/// evorule 会话是否已不可达。两种形态:
+/// 1. 30min 闲置 TTL 回收 → facts 查询 404 → `ApiError::SessionNotFound`
+///    → Display `"Session not found"`
+/// 2. 错误面全量迁移后 404 不再特判 SessionNotFound,引擎侧
+///    「会话不存在/无归档可复活」以 `ApiError::ApiError{status:404}` 形态
+///    透出(Display=`"API returned error: 404 {message}"`)——语义等价于
+///    会话消亡,快照回落/续聊重建须同样触发(重启后历史会话 404 实证)
 pub fn is_session_gone(err: &str) -> bool {
-    err.to_ascii_lowercase().contains("session not found")
+    let e = err.to_ascii_lowercase();
+    e.contains("session not found") || e.contains("api returned error: 404")
 }
 
 // =============================================================================
@@ -669,7 +675,20 @@ mod tests {
     fn test_is_session_gone() {
         assert!(is_session_gone("fetch facts failed: Session not found"));
         assert!(is_session_gone("SESSION NOT FOUND"));
+        // 引擎 404 形态:错误面全量迁移后 404 不再特判 SessionNotFound,
+        // Display = "API returned error: 404 {message}"——重启后无归档会话、
+        // TTL 回收后归档缺失均以此形态透出,快照回落/续聊重建须认得
+        assert!(is_session_gone(
+            "fetch facts failed: API returned error: 404 session archive not found"
+        ));
+        assert!(is_session_gone("API returned error: 404 session not found"));
+        // 非 404 的 API 错误(4xx/5xx 其他码)不算会话消亡
+        assert!(!is_session_gone(
+            "fetch facts failed: API returned error: 400 bad request"
+        ));
         assert!(!is_session_gone("fetch facts failed: connection refused"));
+        // 引擎不可达(网络层)不触发回落,保持 fail-visible
+        assert!(!is_session_gone("HTTP request failed: engine offline"));
     }
 
     #[test]
