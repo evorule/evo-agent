@@ -5948,18 +5948,19 @@ impl AgentRunner {
         // 审批留痕:仅本轮发生过审批时为 Some(内嵌进 io_response.result)
         // PR-3 缓存收口:命中值=预执行管道实例的已过闸产物——命中调用仍走
         // 完整管道(①-⑤⑧照常,仅⑦免重执行),意图/裁决/账面逐调用在场。
+        // LLM 自带的 approved 旗标强制剥离（决策门唯一控制权归 runner）——
+        // 剥离后的 args 是缓存键域与管道入参的统一形态（此前查询键用原始
+        // args 而写入键自预执行臂起剥旗标，两侧键域不一致可致缓存 miss 双执行）
+        let first_args = strip_approved_flag(&args);
         let (tool_result, approval_record) = if let Some(cached) =
-            self.check_parallel_cache(tool_name, &args)
+            self.check_parallel_cache(tool_name, &first_args)
         {
             info!(%session_id, tool = %tool_name, "G13: call_service cache hit, serving gated result (gates re-run, execution memoized)");
-            self.execute_tool_call_gated(session_id, tool_name, &args, None, Some(cached))
+            self.execute_tool_call_gated(session_id, tool_name, &first_args, None, Some(cached))
                 .await?
         } else {
             // 缓存未命中:统一走 gated 入口——candidate 由管道⑤评估臂先行
             // 拦截(PR-4 收编,暂停→决策端),遗留 proposal 形态由兼容臂承接。
-            // 第一次调用(不带 approved flag):LLM 自带的 approved 旗标
-            // 强制剥离,决策门唯一控制权归 runner。
-            let first_args = strip_approved_flag(&args);
             self.execute_tool_call_gated(session_id, tool_name, &first_args, None, None)
                 .await?
         };
@@ -6253,7 +6254,13 @@ impl AgentRunner {
             .await;
         // M4 post-commit:⑦ 出口统一收口(快照入账/丢弃 + undo 入账 +
         // verify deferred 置位与附注)
-        self.checkpoint_post_commit(tool_name, pending_snapshot, &mut outcome, journal);
+        self.checkpoint_post_commit(
+            tool_name,
+            pending_snapshot,
+            &mut outcome,
+            journal,
+            Some(args),
+        );
         outcome
     }
 
@@ -6295,6 +6302,7 @@ impl AgentRunner {
         pending: Option<Result<crate::agent::workspace_checkpoint::PendingSnapshot, String>>,
         outcome: &mut crate::agent::pipeline::PipelineOutcome,
         journal: Option<&crate::agent::journal::JournalWriter>,
+        original_args: Option<&Value>,
     ) {
         if tool_name == crate::builtin_tools::workspace_undo::WORKSPACE_UNDO_TOOL {
             if let (Some(j), Ok(value)) = (journal, outcome.result.as_ref()) {
@@ -6318,6 +6326,29 @@ impl AgentRunner {
         };
         match pending {
             Ok(p) => {
+                // hooks rewrite 防线：快照按原始 args 的 path 抓取——改写后
+                // 实际写入的是另一个文件，撤销语义不成立。显式丢弃快照并
+                // 附注（fail-visible），不假装覆盖改写后路径。
+                if let (Some(orig), Some(eff)) =
+                    (original_args, outcome.ledger.effective_args.as_ref())
+                {
+                    let op = orig.get("path").and_then(Value::as_str);
+                    let ep = eff.get("path").and_then(Value::as_str);
+                    if let (Some(op), Some(ep)) = (op, ep) {
+                        if op != ep {
+                            let Ok(value) = outcome.result.as_mut() else {
+                                store.discard(&p);
+                                return;
+                            };
+                            store.discard(&p);
+                            attach_failed(
+                                value,
+                                "skipped: args rewritten by user hook (undo snapshot                                  does not cover the rewritten path)",
+                            );
+                            return;
+                        }
+                    }
+                }
                 // ⑦ 失败 = 无写落盘(工具原子写语义),丢弃 pending 快照
                 let Ok(value) = outcome.result.as_mut() else {
                     store.discard(&p);
@@ -6560,10 +6591,14 @@ impl AgentRunner {
         // 直接返回缓存结果,跳过重复执行 + 审批;candidate 工具不缓存)
         // PR-3 缓存收口:命中调用仍走完整管道(①-⑤⑧照常,仅⑦免重执行——
         // 缓存值=预执行管道实例的已过闸产物),意图/裁决/账面逐调用在场。
-        if let Some(cached) = self.check_parallel_cache(tool_name, args) {
+        // G8:第一次调用(不带 approved flag)。LLM 自带 approved 旗标强制
+        // 剥离(决策门唯一控制权归 runner)——剥离后的 args 是缓存键域与
+        // 管道入参的统一形态(与写入侧预执行臂同键域,查询/写入不再分叉)
+        let first_args = strip_approved_flag(args);
+        if let Some(cached) = self.check_parallel_cache(tool_name, &first_args) {
             info!(%session_id, tool = %tool_name, "G13: cache hit, serving gated result (gates re-run, execution memoized)");
             let (final_result, _record) = self
-                .execute_tool_call_gated(session_id, tool_name, args, journal, Some(cached))
+                .execute_tool_call_gated(session_id, tool_name, &first_args, journal, Some(cached))
                 .await?;
             Self::record_handover_written(journal, session_id, tool_name, &final_result);
             Self::record_session_spawned(journal, session_id, tool_name, &final_result);
@@ -6575,9 +6610,6 @@ impl AgentRunner {
             }));
         }
 
-        // G8:第一次调用(不带 approved flag)。LLM 自带 approved 旗标强制
-        // 剥离(决策门唯一控制权归 runner)。
-        let first_args = strip_approved_flag(args);
         let outcome = self
             .run_pipeline(
                 tool_name,
@@ -6961,10 +6993,14 @@ impl AgentRunner {
     ///
     /// 观测由管道⑦⑧统一采集(G17 同点同规格),此处不再手工记账。
     async fn execute_single_tool(&self, tc: &crate::agent::translator::ToolCall) -> Value {
+        // LLM 自带 approved 旗标在预执行臂同样强制剥离——决策门唯一控制权
+        // 归 runner，预执行不例外（此前未剥离：LLM 声明 approved:true 的
+        // candidate 调用可经预执行臂直接触发工具内旗标直通分支）
+        let stripped_args = strip_approved_flag(&tc.arguments);
         let outcome = self
             .run_pipeline(
                 &tc.name,
-                &tc.arguments,
+                &stripped_args,
                 None,
                 None,
                 crate::agent::pipeline::PipelineEntry::ParallelPreflight,
@@ -7090,13 +7126,18 @@ impl AgentRunner {
             .map(|s| s.expect("every tool_call slot filled"))
             .collect();
 
-        // 缓存 active 工具结果(非 proposal)——缓存键=「已过门禁的证据」
+        // 缓存 active 工具结果(非 proposal)——缓存键=「已过门禁的证据」。
+        // 键域统一为 strip 后 args（与 call_service/流式查询侧同键域——
+        // 此前写入用 LLM 原始 arguments、查询用剥离后 args，键域分叉可致
+        // 缓存 miss 双执行）
         for (name, args, result) in &results {
+            let stripped = strip_approved_flag(args);
             let result_str = result.to_string();
             // 检查是否是 proposal(candidate 工具)
-            let is_proposal = parse_approval_request(session_id, name, args, &result_str).is_some();
+            let is_proposal =
+                parse_approval_request(session_id, name, &stripped, &result_str).is_some();
             if !is_proposal {
-                let key = Self::parallel_cache_key(name, args);
+                let key = Self::parallel_cache_key(name, &stripped);
                 self.parallel_cache_put(key, result.clone());
             } else {
                 info!(%session_id, tool = %name, "G13: tool returned proposal, not caching (will go through call_service approval)");

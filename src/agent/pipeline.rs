@@ -295,6 +295,9 @@ pub struct LedgerRecord {
     pub execution: Option<ExecutionFact>,
     /// 拒绝（无静默路径）
     pub denial: Option<DenialStage>,
+    /// 实际执行参数（hooks rewrite 发生时=改写后 args；否则 None=与调用
+    /// args 相同）。审计口径：轨迹与执行消费本字段所指参数。
+    pub effective_args: Option<Value>,
 }
 
 impl LedgerRecord {
@@ -309,6 +312,7 @@ impl LedgerRecord {
             adjudication: Vec::new(),
             execution: None,
             denial: None,
+            effective_args: None,
         }
     }
 }
@@ -380,210 +384,24 @@ impl ToolExecutionPipeline {
         }
         ledger.in_focus = true;
 
-        // ── ③ 意图信号 + ④ 规则裁决 ──
-        // R1 通道（M5-c）：file_read/file_write 的 target_scope 随意图指令进链，
-        // 由协作验收规则 enforce 裁决。原 execute_tool_call 内联逻辑逐字迁入。
-        if let Some(scope) = resolve_target_scope(req.tool_name, req.args, deps.boundary) {
-            let allowed = match deps
-                .adjudicator
-                .lock()
-                .await
-                .await_verdict(&intent_signal(scope), req.caller.session_id.as_deref())
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    // fail-closed 语义保持：通道故障显式上抛（原 map_err(AgentError::Internal)?）
-                    ledger.denial = Some(DenialStage::Channel);
-                    return PipelineOutcome {
-                        result: Err(PipelineFailure::Denial(PipelineDenial::new(
-                            DenialStage::Channel,
-                            format!("adjudication channel error: {e}"),
-                        ))),
-                        ledger,
-                    };
-                }
-            };
-            ledger.adjudication.push(AdjudicationFact {
-                channel: "target_scope_r1",
-                allowed,
-                evidence: format!("{tool} target_scope={scope}", tool = req.tool_name),
-            });
-            // B21:policy_judged（fail-visible——§七.6 账写不掉=错误显式化；
-            // 原 `let _ =` fail-soft 消灭）
-            if let Some(j) = deps.journal {
-                if let Err(e) = j.policy_judged(
-                    if allowed { "allowed" } else { "blocked" },
-                    &format!("{} target_scope={}", req.tool_name, scope),
-                ) {
-                    ledger.denial = Some(DenialStage::Ledger);
-                    return PipelineOutcome {
-                        result: Err(PipelineFailure::Denial(PipelineDenial::new(
-                            DenialStage::Ledger,
-                            format!("journal policy_judged write failed: {e}"),
-                        ))),
-                        ledger,
-                    };
-                }
-            }
-            if !allowed {
-                tracing::warn!(
-                    main_session = ?req.caller.session_id, tool = %req.tool_name, scope = %scope,
-                    "tool intent blocked by governance rule (collab acceptance, adjudication channel)"
-                );
-                // 被治理拦截的调用也是真实执行史——进轨迹(status=blocked)。
-                // 轨迹锁显式处理：中毒=前持锁 panic，轨迹账面组件不可用=显式
-                // 失败（此时尚未执行，Ledger 拒绝无重复执行险）。
-                if let Some(tt) = deps.traces {
-                    match tt.lock() {
-                        Ok(mut tt) => {
-                            tt.record(req.tool_name, req.args, "blocked_by_governance", 0);
-                        }
-                        Err(_) => {
-                            tracing::error!(
-                                main_session = ?req.caller.session_id, tool = %req.tool_name,
-                                "tool trace lock poisoned at blocked_by_governance record"
-                            );
-                            ledger.denial = Some(DenialStage::Ledger);
-                            return PipelineOutcome {
-                                result: Err(PipelineFailure::Denial(PipelineDenial::new(
-                                    DenialStage::Ledger,
-                                    format!(
-                                        "tool trace write failed (poisoned lock): {} \
-                                         blocked_by_governance",
-                                        req.tool_name
-                                    ),
-                                ))),
-                                ledger,
-                            };
-                        }
-                    }
-                }
-                ledger.denial = Some(DenialStage::Governance);
-                return PipelineOutcome {
-                    result: Err(PipelineFailure::Denial(PipelineDenial {
-                        stage: DenialStage::Governance,
-                        reason: "governance rule rejected target scope".to_string(),
-                        llm_payload: Some(r1_blocked_payload(
-                            req.tool_name,
-                            scope,
-                            req.args,
-                            deps.boundary,
-                        )),
-                    })),
-                    ledger,
-                };
-            }
-        }
-        // P2 通道：治理级工具事前意图裁决（分级=manifest 派生）。与 R1 通道
-        // 并存互不干扰；裁决会话轮内复用。原内联逻辑逐字迁入。D6 终态：
-        // runtime manifest 传阶段①查得条目——动态源（MCP/ServiceProxy，
-        // 默认 Sensitive）入 P2；静态名防降级由 is_p2_adjudicated_runtime
-        // 的静态优先判定序保证（不直接消费 handler 优先的 manifest_of 结果
-        // 做静态判定）。
-        if let Some(mut intent) =
-            resolve_tool_intent(req.tool_name, req.args, deps.boundary, Some(&manifest))
+        // ── ③④ 意图信号 + 规则裁决（governance_channels 统一封装）──
+        // R1 通道（M5-c）+ P2 通道（治理级工具）共用通道函数——主路径与
+        // hooks-rewrite 回炉段同源（裁决对象=实际将执行的参数）。
+        if let Err(denial) = governance_channels(
+            req.tool_name,
+            req.args,
+            req.caller.session_id.as_deref(),
+            &deps,
+            &mut ledger,
+            &manifest,
+        )
+        .await
         {
-            // 契约 session_ref 补齐：主会话 id 由调用方上下文写入解析输出，
-            // tool_intent_signal 派生 tool_intent.v1 契约时随 value 落链
-            // （裁决账面审计关联）。
-            if let Some(sid) = req.caller.session_id.as_deref() {
-                intent["session_ref"] = Value::from(sid);
-            }
-            // 账面证据统一契约形态：裁决事实与 journal 留痕均落 tool_intent.v1
-            // 契约 JSON（schema_ver/args_digest 锚点在账，摘要可从轨迹 args 复算）。
-            let contract = crate::agent::tool_intent::ToolIntentV1::from_resolved(&intent);
-            let contract_json = serde_json::to_string(&contract).unwrap_or_default();
-            let allowed = match deps
-                .adjudicator
-                .lock()
-                .await
-                .await_verdict(
-                    &tool_intent_signal(&intent),
-                    req.caller.session_id.as_deref(),
-                )
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    ledger.denial = Some(DenialStage::Channel);
-                    return PipelineOutcome {
-                        result: Err(PipelineFailure::Denial(PipelineDenial::new(
-                            DenialStage::Channel,
-                            format!("adjudication channel error: {e}"),
-                        ))),
-                        ledger,
-                    };
-                }
+            ledger.denial = Some(denial.stage);
+            return PipelineOutcome {
+                result: Err(PipelineFailure::Denial(denial)),
+                ledger,
             };
-            ledger.adjudication.push(AdjudicationFact {
-                channel: "tool_intent_p2",
-                allowed,
-                evidence: contract_json.clone(),
-            });
-            if let Some(j) = deps.journal {
-                if let Err(e) = j.policy_judged(
-                    if allowed { "allowed" } else { "blocked" },
-                    &format!("{} intent={}", req.tool_name, contract_json),
-                ) {
-                    ledger.denial = Some(DenialStage::Ledger);
-                    return PipelineOutcome {
-                        result: Err(PipelineFailure::Denial(PipelineDenial::new(
-                            DenialStage::Ledger,
-                            format!("journal policy_judged write failed: {e}"),
-                        ))),
-                        ledger,
-                    };
-                }
-            }
-            if !allowed {
-                tracing::warn!(
-                    main_session = ?req.caller.session_id, tool = %req.tool_name,
-                    "tool intent blocked by governance rule (tool intent adjudication, adjudication channel)"
-                );
-                if let Some(tt) = deps.traces {
-                    // 轨迹锁显式处理（同 R1 拦截臂：账面组件不可用=显式失败）
-                    match tt.lock() {
-                        Ok(mut tt) => {
-                            tt.record(req.tool_name, req.args, "blocked_by_governance", 0);
-                        }
-                        Err(_) => {
-                            tracing::error!(
-                                main_session = ?req.caller.session_id, tool = %req.tool_name,
-                                "tool trace lock poisoned at blocked_by_governance record"
-                            );
-                            ledger.denial = Some(DenialStage::Ledger);
-                            return PipelineOutcome {
-                                result: Err(PipelineFailure::Denial(PipelineDenial::new(
-                                    DenialStage::Ledger,
-                                    format!(
-                                        "tool trace write failed (poisoned lock): {} \
-                                         blocked_by_governance",
-                                        req.tool_name
-                                    ),
-                                ))),
-                                ledger,
-                            };
-                        }
-                    }
-                }
-                ledger.denial = Some(DenialStage::Governance);
-                return PipelineOutcome {
-                    result: Err(PipelineFailure::Denial(PipelineDenial {
-                        stage: DenialStage::Governance,
-                        reason: "governance rule rejected tool intent".to_string(),
-                        llm_payload: Some(serde_json::json!({
-                            "status": "blocked_by_governance_rule",
-                            "tool": req.tool_name,
-                            "intent": intent,
-                            "reason": "tool intent rejected by governance rule \
-                                       (tool intent adjudication; see adjudication session \
-                                       audit Violation for rule attribution)",
-                        })),
-                    })),
-                    ledger,
-                };
-            }
         }
 
         // ── ③④b SG-3 家族①敏感数据外传事前裁决（enforce 态）──
@@ -784,7 +602,100 @@ impl ToolExecutionPipeline {
                             ledger,
                         };
                     }
-                    crate::agent::user_hooks::PreToolVerdict::Rewrite(args) => Some(args),
+                    crate::agent::user_hooks::PreToolVerdict::Rewrite(rewritten) => {
+                        // 回炉：改写产物才是实际将执行的参数——重过 R1/P2 治理
+                        // 通道 + exfil 事前裁决（此前改写产物直接进⑦，规则层对
+                        // 真实意图失明）。任一拦截=显式拒绝，不执行。
+                        if let Err(denial) = governance_channels(
+                            req.tool_name,
+                            &rewritten,
+                            req.caller.session_id.as_deref(),
+                            &deps,
+                            &mut ledger,
+                            &manifest,
+                        )
+                        .await
+                        {
+                            ledger.denial = Some(denial.stage);
+                            return PipelineOutcome {
+                                result: Err(PipelineFailure::Denial(denial)),
+                                ledger,
+                            };
+                        }
+                        if let Err(denial) = exfil_egress_adjudication(
+                            req.tool_name,
+                            &rewritten,
+                            req.caller.session_id.as_deref(),
+                            crate::builtin_tools::exfil_scan::guard_mode(),
+                            &deps,
+                            &mut ledger,
+                        )
+                        .await
+                        {
+                            ledger.denial = Some(denial.stage);
+                            return PipelineOutcome {
+                                result: Err(PipelineFailure::Denial(denial)),
+                                ledger,
+                            };
+                        }
+                        // ⑤重评（决策漂移防线）：审批preset是对原始 args 的
+                        // proposal 做出的——改写后不复用。重评出 proposal：
+                        // 有 preset（批准后重执行路径）=显式拒绝（防止批准-
+                        // 改写-再批准的循环；人工以改写后参数重新发起）；
+                        // 无 preset（首次调用）=暂停等新决策（pending 携带
+                        // 改写后 proposal）。
+                        if manifest.approval_policy != ApprovalPolicy::AlwaysDeny {
+                            if let Some(mut proposal) = deps
+                                .proposal_of
+                                .and_then(|evaluate| evaluate(req.tool_name, &rewritten))
+                            {
+                                let proposal_id = crate::agent::approval::new_proposal_id();
+                                if let Some(obj) = proposal.as_object_mut() {
+                                    obj.insert(
+                                        "proposal_id".to_string(),
+                                        Value::from(proposal_id.clone()),
+                                    );
+                                }
+                                if req.approval_preset.is_some() {
+                                    ledger.denial = Some(DenialStage::ApprovalDenied);
+                                    return PipelineOutcome {
+                                        result: Err(PipelineFailure::Denial(PipelineDenial {
+                                            stage: DenialStage::ApprovalDenied,
+                                            reason: format!(
+                                                "tool '{}' args were rewritten by a user hook                                                  after approval; the approved decision does not                                                  cover the rewritten arguments — re-approval                                                  required",
+                                                req.tool_name
+                                            ),
+                                            llm_payload: Some(serde_json::json!({
+                                                "status": "rejected",
+                                                "message": "args rewritten after approval; re-approval required",
+                                            })),
+                                        })),
+                                        ledger,
+                                    };
+                                }
+                                if let Some(tt) = deps.traces {
+                                    if let Ok(mut tt) = tt.lock() {
+                                        tt.record(req.tool_name, &rewritten, "approval_pending", 0);
+                                    }
+                                }
+                                ledger.effective_args = Some(rewritten.clone());
+                                ledger.denial = Some(DenialStage::ApprovalPending);
+                                return PipelineOutcome {
+                                    result: Err(PipelineFailure::Denial(PipelineDenial {
+                                        stage: DenialStage::ApprovalPending,
+                                        reason: format!(
+                                            "tool '{}' candidate action (rewritten args) awaits                                              approval decision",
+                                            req.tool_name
+                                        ),
+                                        llm_payload: Some(proposal),
+                                    })),
+                                    ledger,
+                                };
+                            }
+                        }
+                        ledger.effective_args = Some(rewritten.clone());
+                        Some(rewritten)
+                    }
                     crate::agent::user_hooks::PreToolVerdict::Allow => None,
                 }
             }
@@ -850,9 +761,11 @@ impl ToolExecutionPipeline {
         if let Some(tt) = deps.traces {
             match tt.lock() {
                 Ok(mut tt) => {
+                    // 审计口径：轨迹记录实际执行参数（hooks rewrite 发生时=
+                    // exec_args；未改写=与 req.args 同值）——账面与执行一致
                     tt.record(
                         req.tool_name,
-                        req.args,
+                        exec_args,
                         if tool_ok { "ok" } else { "error" },
                         tool_duration.as_millis() as u64,
                     );
@@ -908,6 +821,182 @@ impl ToolExecutionPipeline {
             ledger,
         }
     }
+}
+
+/// ③④ 治理通道（R1 target_scope + P2 tool_intent 的统一封装）——主路径与
+/// hooks-rewrite 回炉段共用（裁决对象=实际将执行的参数）。`Ok(())`=两道
+/// 均放行（或未触发）；`Err(denial)`=拦截/通道故障/账面失败（调用方包成
+/// PipelineOutcome 并盖章 ledger.denial）。exfil 事前裁决走独立函数
+/// [`exfil_egress_adjudication`]（回炉段同样复用）。
+async fn governance_channels(
+    tool_name: &str,
+    args: &Value,
+    session_id: Option<&str>,
+    deps: &PipelineDeps<'_>,
+    ledger: &mut LedgerRecord,
+    manifest: &ToolManifest,
+) -> Result<(), PipelineDenial> {
+    // ── ③ 意图信号 + ④ 规则裁决 ──
+    // R1 通道（M5-c）：file_read/file_write 的 target_scope 随意图指令进链，
+    // 由协作验收规则 enforce 裁决。原 execute_tool_call 内联逻辑逐字迁入。
+    if let Some(scope) = resolve_target_scope(tool_name, args, deps.boundary) {
+        let allowed = match deps
+            .adjudicator
+            .lock()
+            .await
+            .await_verdict(&intent_signal(scope), session_id)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // fail-closed 语义保持：通道故障显式上抛（原 map_err(AgentError::Internal)?）
+                return Err(PipelineDenial::new(
+                    DenialStage::Channel,
+                    format!("adjudication channel error: {e}"),
+                ));
+            }
+        };
+        ledger.adjudication.push(AdjudicationFact {
+            channel: "target_scope_r1",
+            allowed,
+            evidence: format!("{tool} target_scope={scope}", tool = tool_name),
+        });
+        // B21:policy_judged（fail-visible——§七.6 账写不掉=错误显式化）
+        if let Some(j) = deps.journal {
+            if let Err(e) = j.policy_judged(
+                if allowed { "allowed" } else { "blocked" },
+                &format!("{} target_scope={}", tool_name, scope),
+            ) {
+                return Err(PipelineDenial::new(
+                    DenialStage::Ledger,
+                    format!("journal policy_judged write failed: {e}"),
+                ));
+            }
+        }
+        if !allowed {
+            tracing::warn!(
+                main_session = ?session_id, tool = %tool_name, scope = %scope,
+                "tool intent blocked by governance rule (collab acceptance, adjudication channel)"
+            );
+            // 被治理拦截的调用也是真实执行史——进轨迹(status=blocked)。
+            // 轨迹锁显式处理：中毒=前持锁 panic，轨迹账面组件不可用=显式
+            // 失败（此时尚未执行，Ledger 拒绝无重复执行险）。
+            if let Some(tt) = deps.traces {
+                match tt.lock() {
+                    Ok(mut tt) => {
+                        tt.record(tool_name, args, "blocked_by_governance", 0);
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            main_session = ?session_id, tool = %tool_name,
+                            "tool trace lock poisoned at blocked_by_governance record"
+                        );
+                        return Err(PipelineDenial::new(
+                            DenialStage::Ledger,
+                            format!(
+                                "tool trace write failed (poisoned lock): {} \
+                                 blocked_by_governance",
+                                tool_name
+                            ),
+                        ));
+                    }
+                }
+            }
+            return Err(PipelineDenial {
+                stage: DenialStage::Governance,
+                reason: "governance rule rejected target scope".to_string(),
+                llm_payload: Some(r1_blocked_payload(tool_name, scope, args, deps.boundary)),
+            });
+        }
+    }
+    // P2 通道：治理级工具事前意图裁决（分级=manifest 派生）。与 R1 通道
+    // 并存互不干扰；裁决会话轮内复用。D6 终态：runtime manifest 传阶段①
+    // 查得条目——动态源（MCP/ServiceProxy，默认 Sensitive）入 P2；静态名
+    // 防降级由 is_p2_adjudicated_runtime 的静态优先判定序保证。
+    if let Some(mut intent) = resolve_tool_intent(tool_name, args, deps.boundary, Some(manifest)) {
+        // 契约 session_ref 补齐：主会话 id 由调用方上下文写入解析输出，
+        // tool_intent_signal 派生 tool_intent.v1 契约时随 value 落链
+        // （裁决账面审计关联）。
+        if let Some(sid) = session_id {
+            intent["session_ref"] = Value::from(sid);
+        }
+        // 账面证据统一契约形态：裁决事实与 journal 留痕均落 tool_intent.v1
+        // 契约 JSON（schema_ver/args_digest 锚点在账，摘要可从轨迹 args 复算）。
+        let contract = crate::agent::tool_intent::ToolIntentV1::from_resolved(&intent);
+        let contract_json = serde_json::to_string(&contract).unwrap_or_default();
+        let allowed = match deps
+            .adjudicator
+            .lock()
+            .await
+            .await_verdict(&tool_intent_signal(&intent), session_id)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(PipelineDenial::new(
+                    DenialStage::Channel,
+                    format!("adjudication channel error: {e}"),
+                ));
+            }
+        };
+        ledger.adjudication.push(AdjudicationFact {
+            channel: "tool_intent_p2",
+            allowed,
+            evidence: contract_json.clone(),
+        });
+        if let Some(j) = deps.journal {
+            if let Err(e) = j.policy_judged(
+                if allowed { "allowed" } else { "blocked" },
+                &format!("{} intent={}", tool_name, contract_json),
+            ) {
+                return Err(PipelineDenial::new(
+                    DenialStage::Ledger,
+                    format!("journal policy_judged write failed: {e}"),
+                ));
+            }
+        }
+        if !allowed {
+            tracing::warn!(
+                main_session = ?session_id, tool = %tool_name,
+                "tool intent blocked by governance rule (tool intent adjudication, adjudication channel)"
+            );
+            if let Some(tt) = deps.traces {
+                // 轨迹锁显式处理（同 R1 拦截臂：账面组件不可用=显式失败）
+                match tt.lock() {
+                    Ok(mut tt) => {
+                        tt.record(tool_name, args, "blocked_by_governance", 0);
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            main_session = ?session_id, tool = %tool_name,
+                            "tool trace lock poisoned at blocked_by_governance record"
+                        );
+                        return Err(PipelineDenial::new(
+                            DenialStage::Ledger,
+                            format!(
+                                "tool trace write failed (poisoned lock): {} \
+                                 blocked_by_governance",
+                                tool_name
+                            ),
+                        ));
+                    }
+                }
+            }
+            return Err(PipelineDenial {
+                stage: DenialStage::Governance,
+                reason: "governance rule rejected tool intent".to_string(),
+                llm_payload: Some(serde_json::json!({
+                    "status": "blocked_by_governance_rule",
+                    "tool": tool_name,
+                    "intent": intent,
+                    "reason": "tool intent rejected by governance rule \
+                               (tool intent adjudication; see adjudication session \
+                               audit Violation for rule attribution)",
+                })),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// SG-3 家族①敏感数据外传 enforce 臂（模式显式注入：接线点只做 mode 传递）
@@ -2038,6 +2127,198 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── 批B o68：hooks rewrite 回炉（改写产物重过治理通道+审批漂移防线）──
+
+    #[tokio::test]
+    async fn user_hook_rewrite_out_of_sandbox_path_is_re_adjudicated_and_blocked() {
+        // file_write 原始 path 合法（P2 裁决放行），hook rewrite 把 path 改成
+        // 绝对路径（out_of_sandbox）——回炉 R1 提交越界 scope，规则层拦截
+        // （version 不推进）→ Governance 拒绝，⑦不触达。
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_body(r#"{"session_id": 91}"#)
+            .create_async()
+            .await;
+        // P2 首轮：before=v0 → command → poll=v1（放行）
+        server
+            .mock("GET", "/api/sessions/91/state")
+            .with_status(200)
+            .with_body(r#"{"version": 0}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/sessions/91/state")
+            .with_status(200)
+            .with_body(r#"{"version": 1}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        // 回炉 R1：before=v1 → command → poll 恒 v1（拦截）
+        server
+            .mock("GET", "/api/sessions/91/state")
+            .with_status(200)
+            .with_body(r#"{"version": 1}"#)
+            .expect(21)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/sessions/91/command")
+            .with_status(200)
+            .with_body("{}")
+            .expect(2)
+            .create_async()
+            .await;
+
+        let adj = tokio::sync::Mutex::new(AdjudicationChannel::new(
+            crate::api::evorule_client::EvoruleApiClient::new(&server.url()),
+            "default",
+        ));
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["file_write"]);
+        let args = serde_json::json!({"path": "ok.txt", "content": "x"});
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = wired_for(
+            dir.path(),
+            vec![crate::agent::user_hooks::HookRule {
+                tool: "file_write".into(),
+                command:
+                    r#"echo {"decision":"rewrite","args":{"path":"C:\\outside.txt","content":"x"}}"#
+                        .into(),
+                timeout_secs: Some(15),
+                env_keys: Vec::new(),
+            }],
+        );
+        let traces = std::sync::Mutex::new(ToolTraceCollector::default());
+        let mut deps = deps_for(&UnreachableExecutor, &adj, &manifests);
+        deps.traces = Some(&traces);
+        deps.user_hooks = Some(hooks);
+        let out = ToolExecutionPipeline
+            .execute(req_for("file_write", &args, &focus), deps)
+            .await;
+        let denial = denial_of(&out);
+        assert_eq!(
+            denial.stage,
+            DenialStage::Governance,
+            "改写后的越界意图必须被回炉裁决拦截"
+        );
+        // 账面：主路径 P2 放行 + 回炉拦截两笔裁决事实在案
+        assert!(out.ledger.adjudication.len() >= 2);
+        assert!(out.ledger.adjudication[0].allowed, "首轮 P2 放行");
+        assert!(!out.ledger.adjudication.last().unwrap().allowed, "回炉拦截");
+        // 拦截路径无实际执行——effective_args 保持 None（实际执行参数语义）
+        assert!(out.ledger.effective_args.is_none());
+    }
+
+    #[tokio::test]
+    async fn hook_rewrite_after_approval_does_not_reuse_preset() {
+        // 批准后重执行（preset=approved）路径上 hook rewrite 改写 args——
+        // preset 只覆盖原始 proposal，改写后重评出 proposal 必须显式拒绝
+        // （防批准-改写-再批准循环），⑦不触达。
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["shell_exec"]);
+        let args = serde_json::json!({"command": "cargo build"});
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = wired_for(
+            dir.path(),
+            vec![crate::agent::user_hooks::HookRule {
+                tool: "shell_exec".into(),
+                command: r#"echo {"decision":"rewrite","args":{"command":"rm -rf old_dir"}}"#
+                    .into(),
+                timeout_secs: Some(15),
+                env_keys: Vec::new(),
+            }],
+        );
+        let exec = CountingExecutor::new();
+        let mut deps = hooks_deps_for(&exec, &adj, &manifests, hooks);
+        // ⑤评估臂注入：rm 族命令=candidate（对齐 shell_exec 分类语义——
+        // hooks_deps_for 缺省 proposal_of=None，本测试需要重评出 proposal）
+        let evaluate = |_name: &str, a: &Value| {
+            let cmd = a.get("command").and_then(Value::as_str).unwrap_or("");
+            if cmd.starts_with("rm") {
+                Some(serde_json::json!({
+                    "status": "needs_approval",
+                    "command": cmd,
+                }))
+            } else {
+                None
+            }
+        };
+        deps.proposal_of = Some(&evaluate);
+        let mut req = req_for("shell_exec", &args, &focus);
+        req.approval_preset = Some(crate::agent::approval::ApprovalDecision {
+            approved: true,
+            approver: "human".to_string(),
+            verified: true,
+            reason: "ok".to_string(),
+            auto_rejected: false,
+            verdict_json: None,
+        });
+        // hooks_deps_for 不带 preset 注入面——直接改 deps 的请求即可
+        let out = ToolExecutionPipeline.execute(req, deps).await;
+        let denial = denial_of(&out);
+        assert_eq!(
+            denial.stage,
+            DenialStage::ApprovalDenied,
+            "改写后不得复用 preset：必须显式拒绝等人工重批"
+        );
+        assert!(
+            denial.reason.contains("rewritten"),
+            "拒绝原因必须点名改写漂移: {}",
+            denial.reason
+        );
+        assert_eq!(exec.call_count(), 0, "拒绝路径不得执行");
+    }
+
+    #[tokio::test]
+    async fn trace_records_effective_args_after_rewrite() {
+        // 放行路径：file_read（非治理裁决面）+ hook rewrite path——⑦执行与
+        // ⑧轨迹都必须以改写后 args 为准（审计口径=实际执行参数）。
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["file_read"]);
+        let args = serde_json::json!({"path": "a.txt"});
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = wired_for(
+            dir.path(),
+            vec![crate::agent::user_hooks::HookRule {
+                tool: "file_read".into(),
+                command: r#"echo {"decision":"rewrite","args":{"path":"rewritten.txt"}}"#.into(),
+                timeout_secs: Some(15),
+                env_keys: Vec::new(),
+            }],
+        );
+        let exec = CountingExecutor::new();
+        let traces = std::sync::Mutex::new(ToolTraceCollector::default());
+        let mut deps = hooks_deps_for(&exec, &adj, &manifests, hooks.clone());
+        deps.traces = Some(&traces);
+        let out = ToolExecutionPipeline
+            .execute(req_for("file_read", &args, &focus), deps)
+            .await;
+        assert!(out.result.is_ok(), "放行路径应执行: {:?}", out.result.err());
+        assert_eq!(
+            out.ledger
+                .effective_args
+                .as_ref()
+                .expect("effective_args")
+                .get("path")
+                .and_then(|v| v.as_str()),
+            Some("rewritten.txt")
+        );
+        let tseq = traces.lock().expect("traces").drain();
+        assert_eq!(tseq.len(), 1);
+        assert_eq!(
+            tseq[0]["args"]["path"],
+            serde_json::json!("rewritten.txt"),
+            "轨迹记录=实际执行参数（改写后）"
+        );
+        // 执行器收到的也是改写后 args
+        assert!(exec.seen()[0].contains("rewritten.txt"));
     }
 
     // ----- 轨迹锁中毒显式处理（账面组件不可用=显式失败）-----
