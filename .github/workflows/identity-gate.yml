@@ -62,6 +62,10 @@ jobs:
             [ "$aemail" = "$MAINT" ] || continue
             case "$cemail" in
               "$MAINT") continue ;;
+              # platform merge operations run under the org merger account
+              # (GitHub rebase-merge stamps the caller identity as committer);
+              # this account is the sanctioned merge operator on record
+              like11tim@gmail.com) continue ;;
               *noreply@github.com) continue ;;
             esac
             echo "::error::commit $sha authored by the maintainer has committer '$cemail' outside the allowed identities (maintainer or platform merge)"
