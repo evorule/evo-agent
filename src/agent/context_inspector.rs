@@ -394,13 +394,28 @@ fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
-/// 分区切分(带起始偏移版,γ 批 B-268 跨消息归因消费):按机制标记首次
-/// 出现位置切段;首个标记前的文本=基底段(含 F-101 身份段);返回有序
-/// (起始偏移, 分区名, 文本) 表,标记未出现则跳过。
-fn split_sections_with_pos(text: &str) -> Vec<(usize, String, String)> {
+/// 分区切分(带起始偏移版,γ 批 B-268 跨消息归因消费):按机制标记切段;
+/// G11(B-316)锚定收口——标记仅在行首(位置 0 或前导 '\n')或消息边界
+/// (msg_bounds:跨消息拼接缝处的机制消息起始偏移)生效,行中嵌入/中和
+/// 后的同形子串(条目标题伪造面)不再切段;首个锚定标记前的文本=基底段
+/// (含 F-101 身份段);返回有序(起始偏移, 分区名, 文本)表,标记未出现
+/// 则跳过。
+fn split_sections_with_pos(text: &str, msg_bounds: &[usize]) -> Vec<(usize, String, String)> {
+    let anchored_find = |marker: &str| -> Option<usize> {
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(marker) {
+            let pos = from + rel;
+            let at_line_start = pos == 0 || text.as_bytes()[pos - 1] == b'\n';
+            if at_line_start || msg_bounds.contains(&pos) {
+                return Some(pos);
+            }
+            from = pos + marker.len();
+        }
+        None
+    };
     let mut cuts: Vec<(usize, &str)> = MECHANISM_SECTION_MARKERS
         .iter()
-        .filter_map(|m| text.find(m).map(|p| (p, *m)))
+        .filter_map(|m| anchored_find(m).map(|p| (p, *m)))
         .collect();
     cuts.sort_by_key(|(p, _)| *p);
     let mut out = Vec::with_capacity(cuts.len() + 1);
@@ -477,7 +492,8 @@ pub fn inspect_system_sections_with(
         bounds.push((combined.len(), format!("(机制消息#{i})")));
         combined.push_str(msg);
     }
-    let sections: Vec<(String, String)> = split_sections_with_pos(&combined)
+    let msg_bounds: Vec<usize> = bounds.iter().map(|(s, _)| *s).collect();
+    let sections: Vec<(String, String)> = split_sections_with_pos(&combined, &msg_bounds)
         .into_iter()
         .map(|(start, name, text)| {
             let suffix = bounds
@@ -538,15 +554,44 @@ mod tests {
     #[test]
     fn split_sections_base_and_markers() {
         let sp = "你是助手。\n\n## Stable Facts\n- a\n\n【能力边界声明】\n- b";
-        let secs = split_sections_with_pos(sp);
+        let secs = split_sections_with_pos(sp, &[]);
         assert_eq!(secs[0].1, "(基底段)");
         assert!(secs[0].2.starts_with("你是助手"));
         assert!(secs.iter().any(|(_, n, _)| n == "## Stable Facts"));
         assert!(secs.iter().any(|(_, n, _)| n == "【能力边界声明】"));
         // 无标记文本 = 仅基底段
-        let only_base = split_sections_with_pos("plain prompt");
+        let only_base = split_sections_with_pos("plain prompt", &[]);
         assert_eq!(only_base.len(), 1);
         assert_eq!(only_base[0].1, "(基底段)");
+    }
+
+    /// G11(B-316):切段行首/消息边界锚定——记忆条目中和后的同形子串
+    /// (前置空格/行中嵌入)不得再切段;真分区标题(行首或机制消息起始
+    /// 位置)仍切段。
+    #[test]
+    fn test_g11_marker_cut_requires_line_start_or_message_bound() {
+        // 行中同形(记忆条目中和后的形态:前置空格)不切段
+        let indented = "基底段\n- 条目: x\n ## Stable Facts\n- y";
+        let secs = split_sections_with_pos(indented, &[]);
+        assert_eq!(
+            secs.len(),
+            1,
+            "前置空格的同形标记不得切段(中和后形态): {secs:?}"
+        );
+        // 行中嵌入(无空格无换行前导)不切段
+        let inline = "基底段前文## Stable Facts\n- y";
+        assert_eq!(split_sections_with_pos(inline, &[]).len(), 1);
+        // 机制消息边界(消息起始位置,无前导换行)仍切段
+        let combined = "system尾段## Stable Facts\n- a";
+        let bound = "system尾段".len();
+        let secs_bound = split_sections_with_pos(combined, &[0, bound]);
+        assert!(
+            secs_bound.iter().any(|(_, n, _)| n == "## Stable Facts"),
+            "消息边界处的真分区标题仍切段: {secs_bound:?}"
+        );
+        // 行首(既有形态)仍切段
+        let classic = "基底段\n\n## Stable Facts\n- a";
+        assert!(split_sections_with_pos(classic, &[]).len() > 1);
     }
 
     #[test]
