@@ -1301,6 +1301,7 @@ mod tests {
                 tool: "file_read".into(),
                 command: deny_cmd(&decision_file),
                 timeout_secs: Some(15),
+                env_keys: Vec::new(),
             }],
         );
         let exec = CountingExecutor::new();
@@ -1334,6 +1335,7 @@ mod tests {
                 tool: "file_read".into(),
                 command: rewrite_cmd(&decision_file),
                 timeout_secs: Some(15),
+                env_keys: Vec::new(),
             }],
         );
         let exec = CountingExecutor::new();
@@ -1370,6 +1372,7 @@ mod tests {
                 tool: "grep_files".into(),
                 command: "echo ran > hook_ran.txt".to_string(),
                 timeout_secs: Some(15),
+                env_keys: Vec::new(),
             }],
         );
         let exec = CountingExecutor::new();
