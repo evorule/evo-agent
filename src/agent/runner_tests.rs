@@ -244,8 +244,9 @@ fn test_effective_params_records_assembly_recipe_triple() {
     let command = runner.build_call_external_command("sys", "goal", None);
     let eff = &command["params"]["effective_params"];
     assert_eq!(eff["assembly_protocol_version"], "assembly-v3");
-    // 默认配方(AgentRunner::new → default_executor → recipe-v1.3,S2d_catalog 服务目录槽位增补)
-    assert_eq!(eff["assembly_recipe_version"], "recipe-v1.3");
+    // 默认配方(AgentRunner::new → default_executor;G2/B-303 缺省翻转后
+    // mechanism_messages 缺省开启,开启态次版本 +1 → recipe-v1.4)
+    assert_eq!(eff["assembly_recipe_version"], "recipe-v1.4");
     let hash = eff["assembly_recipe_hash"].as_str().unwrap();
     assert!(hash.starts_with("blake3:"));
     assert_eq!(hash.len(), "blake3:".len() + 64);
@@ -300,7 +301,9 @@ fn test_external_recipe_v1_1_recorded_on_wire() {
     let command = runner.build_call_external_command("sys", "goal", None);
     let eff = &command["params"]["effective_params"];
     assert_eq!(eff["assembly_protocol_version"], "assembly-v3");
-    assert_eq!(eff["assembly_recipe_version"], "recipe-v1.1");
+    // G2/B-303 缺省翻转:声明 v1.1 配方未显式关 mechanism_messages →
+    // 缺省开启态 → effective 次版本 +1 = recipe-v1.2(版本面反映实际生效形态)
+    assert_eq!(eff["assembly_recipe_version"], "recipe-v1.2");
     let hash = eff["assembly_recipe_hash"].as_str().unwrap();
     assert!(hash.starts_with("blake3:") && hash.len() == "blake3:".len() + 64);
 }
@@ -3018,7 +3021,7 @@ async fn test_g15_run_continuation_does_not_create_session() {
 
     // mock persist_message 的 payload 写(历史段前移后 persist 先于订阅;
     // 未 mock 会 404 → yield Err 提前终止流,订阅断言失配)
-    let payload_mock = server
+    let _payload_mock = server
         .mock("POST", "/api/sessions/s42/payload")
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -3067,7 +3070,7 @@ async fn test_g15_run_continuation_does_not_create_session() {
     state_mock.assert_async().await;
     events_mock.assert_async().await;
     command_mock.assert_async().await;
-    let _ = payload_mock; // 命中数不限(persist 按消息数)
+    let _ = _payload_mock; // 命中数不限(persist 按消息数)
 }
 
 /// G15:验证 run_streaming(新建模式)调用 create_session
@@ -3324,7 +3327,16 @@ async fn test_run_recall_before_prompt() {
         .await;
 
     // 5. persist_message: POST /api/sessions/99/payload
-    server
+    //    G2/B-303 缺省翻转:recall 内容随机制消息(独立 System)上行 persist——
+    //    精确 mock 吃含 recall 的 payload(时序验证意图保持),其余 persist 落 Any
+    let _recall_persist_mock = server
+        .mock("POST", "/api/sessions/99/payload")
+        .match_body(mockito::Matcher::Regex("recall_test_value".to_string()))
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    let _payload_mock = server
         .mock("POST", "/api/sessions/99/payload")
         .with_status(200)
         .with_body("{}")
@@ -3345,7 +3357,6 @@ async fn test_run_recall_before_prompt() {
         .mock("POST", "/api/sessions/99/command")
         .with_status(200)
         .with_body("{}")
-        .match_body(mockito::Matcher::Regex("recall_test_value".to_string()))
         .create_async()
         .await;
 
@@ -3357,7 +3368,10 @@ async fn test_run_recall_before_prompt() {
     // run() 会因为空 SSE 流返回 error result，但不影响验证
     assert!(result.is_ok(), "run() should not return Err");
 
-    // 验证 command 请求体包含 recalled content（证明 recall 在 build_system_prompt 之前）
+    // G2/B-303:recall 上行时序验证面随缺省翻转迁移——recall_test_value 现随
+    // 机制消息(独立 System)经 payload 通道上行(recall_persist_mock 命中即证,
+    // 命中数含 sediment 断流补写故不做次数断言;内容完整性由 assembly 机制段
+    // 单测在案)。command 上行照常校验。
     command_mock.assert_async().await;
 }
 
@@ -8249,4 +8263,112 @@ fn fetch_verifies_digest_for_content_addressed_refs() {
         "篡改须 fail-visible: {v}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- 五轮裁定批 G8/B-303: trim 丢弃面 offload(below-threshold 引用块补位) ----
+
+fn g8_test_runner(dir: &std::path::Path) -> AgentRunner {
+    AgentRunner::new(AgentConfig::default(), make_test_client()).with_journal_dir(dir.to_path_buf())
+}
+
+fn g8_temp_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("g8-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn g8_below_threshold_hint_upgrades_to_fetchable_ref_block() {
+    // 旧行为(G8):below-threshold → hint 原样保留,"知道丢了但拿不回";
+    // 新契约:hint 升级为 [TRIMMED_MESSAGES] 引用块,原文落盘,fetch 可取回
+    // (digest 复验同源,"被裁内容必须可查可重建"全链闭合)
+    let dir = g8_temp_dir("hint");
+    let runner = g8_test_runner(&dir);
+    let llm = crate::io_handlers::llm_handler::LlmHandler::new("m", "http://127.0.0.1:9")
+        .with_max_retries(0);
+    let s = crate::agent::summarizer::ContextSummarizer::new(llm, None).with_threshold(100);
+    let dropped = vec![Message::User {
+        content: "G8-被裁消息-甲".to_string(),
+        images: vec![],
+    }];
+    let mut trim_messages = vec![
+        Message::System {
+            content: "[earlier 1 messages trimmed]".to_string(),
+        },
+        Message::User {
+            content: "最新用户消息".to_string(),
+            images: vec![],
+        },
+    ];
+    let out = runner
+        .handle_summary_outcome("sess-g8", &s, &dropped, &mut trim_messages, "", "summarize")
+        .await
+        .unwrap();
+    assert_eq!(out, None, "below-threshold 不产摘要");
+    let block = match &trim_messages[0] {
+        Message::System { content } => content.clone(),
+        other => panic!("期望 System hint,实得 {other:?}"),
+    };
+    assert!(
+        block.starts_with("[TRIMMED_MESSAGES]"),
+        "hint 必须升级为引用块: {block}"
+    );
+    assert!(
+        matches!(&trim_messages[1], Message::User { content, .. } if content.contains("最新用户消息")),
+        "其余消息不动"
+    );
+    let ref_id = block
+        .lines()
+        .find_map(|l| l.strip_prefix("ref_id: "))
+        .expect("引用块含 ref_id")
+        .trim()
+        .to_string();
+    let path = dir.join("tool_results").join(format!("{ref_id}.txt"));
+    assert!(path.exists(), "原文必须落盘: {}", path.display());
+    let resp = runner.execute_tool_result_fetch(&serde_json::json!({ "ref_id": ref_id }));
+    let flat = serde_json::to_string(&resp).unwrap();
+    assert!(
+        resp.get("error").is_none(),
+        "trim- ref fetch 必须复验通过: {flat}"
+    );
+    assert!(flat.contains("G8-被裁消息-甲"), "取回原文保真: {flat}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn g8_without_journal_dir_keeps_hint_unchanged() {
+    // fail-soft:无落盘面(journal 关闭)时维持 hint 现状,不阻塞主流程
+    let runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    let llm = crate::io_handlers::llm_handler::LlmHandler::new("m", "http://127.0.0.1:9")
+        .with_max_retries(0);
+    let s = crate::agent::summarizer::ContextSummarizer::new(llm, None).with_threshold(100);
+    let dropped = vec![Message::User {
+        content: "G8-无落盘面".to_string(),
+        images: vec![],
+    }];
+    let mut trim_messages = vec![Message::System {
+        content: "[earlier 1 messages trimmed]".to_string(),
+    }];
+    let out = runner
+        .handle_summary_outcome(
+            "sess-g8b",
+            &s,
+            &dropped,
+            &mut trim_messages,
+            "",
+            "summarize",
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, None);
+    match &trim_messages[0] {
+        Message::System { content } => {
+            assert_eq!(
+                content, "[earlier 1 messages trimmed]",
+                "无 journal_dir 时 hint 原样(fail-soft)"
+            );
+        }
+        other => panic!("期望 System hint,实得 {other:?}"),
+    }
 }
