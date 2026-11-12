@@ -775,6 +775,51 @@ fn render_handoff_base(h: &crate::agent::definition::HandoffPackage) -> String {
     seg
 }
 
+/// G5/B-311:组装入参对象(15 槽位源命名对齐原位置参数语义;统帅 2026-11-12
+/// 裁定 B 案收拢,推翻 L894 原注释"参数对象反损槽位可读性"取舍——37 处
+/// 调用点逐点核语义改写,行为零变化)
+pub struct AssemblyInputs<'a> {
+    /// S1_base 源(definition.system_prompt)
+    pub base_prompt: &'a str,
+    /// F-101 身份资产段(None = 未声明,S1 槽仅基底块;声明后 S1 槽内拼接序
+    /// = 基底块→"\n\n"→身份段)
+    pub identity_segment: Option<&'a str>,
+    /// C-4 北极星锚(S1 槽内紧随身份段;None = 未声明,跳过)
+    pub north_star: Option<&'a str>,
+    /// S3_memory 源载体(None = memory 未启用,槽位静默跳过 = 现状 memory
+    /// none 分支行为)
+    pub memory: Option<&'a crate::agent::memory::MemoryManager>,
+    /// S3_memory 内容(已在调用侧完成召回;预算裁剪在渲染器内)
+    pub recall: &'a crate::agent::memory::RecallContext,
+    /// 记忆区预算基准的原始输入(默认配方 `base: input` 扣除响应预留后作
+    /// 基数;显式 `base: total_window` 直接作基数=兼容口径)
+    pub total_window: usize,
+    /// S4_boundary 边界感知段(None = 未声明,槽位跳过;分隔前缀由配方
+    /// separator 声明)
+    pub boundary_segment: Option<&'a str>,
+    /// S4b_skills 技能清单数据(None/空 = 清单段不注入,槽位静默跳过)
+    pub skills: Option<&'a [crate::agent::definition::SkillManifestEntry]>,
+    /// S4b_skills 清单尾注提示段(None = 未声明,不注入;与清单段以 "\n\n"
+    /// 相接)
+    pub skills_notice: Option<&'a str>,
+    /// S3 槽内尾随交接底座包(None = 未声明,跳过)
+    pub handoff: Option<&'a crate::agent::definition::HandoffPackage>,
+    /// S2_governance 源(None = 未声明,槽位跳过)
+    pub governance_segment: Option<&'a str>,
+    /// S2b_knowledge 源(None/空 = 未声明治理知识数据集,槽位跳过 =
+    /// 既有定义零影响)
+    pub knowledge_segment: Option<&'a str>,
+    /// S2c_agents_md 项目记忆段(AGENTS.md 层级;None/空 = 未启用,槽位
+    /// 静默跳过)
+    pub agents_md: Option<&'a str>,
+    /// S3c_todo 源(None = 无清单/开关关,槽位静默跳过;runner 侧确定性
+    /// 渲染,小体量不占记忆预算)
+    pub todo_summary: Option<&'a str>,
+    /// S2d_catalog 源(None/空 = 服务注册为空,槽位静默跳过;service_tools
+    /// 启动期注册面渲染,进程内跨轮字节级稳定)
+    pub service_catalog: Option<&'a str>,
+}
+
 /// 组装执行器:配方 → system_prompt 与预算参数的**单一确定性纯函数组**
 ///
 /// 双路径一致性由代码结构保证(run/流式两组装点收敛为同一次 `assemble` 调用,
@@ -872,45 +917,12 @@ impl AssemblyExecutor {
 
     /// 组装 system_prompt(按配方槽位序拼接)
     ///
-    /// - `base_prompt`:S1_base 源(definition.system_prompt)
-    /// - `identity_segment`:F-101 身份资产段(None = 未声明,S1 槽仅基底块;
-    ///   声明后 S1 槽内拼接序 = 基底块→"\n\n"→身份段)
-    /// - `memory`:S3_memory 源载体(None = memory 未启用,槽位静默跳过 =
-    ///   现状 memory none 分支行为)
-    /// - `recall`:S3_memory 内容(已在调用侧完成召回;预算裁剪在渲染器内)
-    /// - `total_window`:记忆区预算基准的原始输入(默认配方 `base: input`
-    ///   扣除响应预留后作基数;显式 `base: total_window` 直接作基数=兼容口径)
-    /// - `handoff`:S3 槽内尾随交接底座包(None = 未声明,跳过)
-    /// - `governance_segment`:S2_governance 源(None = 未声明,槽位跳过)
-    /// - `knowledge_segment`:S2b_knowledge 源(None/空 = 未声明治理知识
-    ///   数据集,槽位跳过 = 既有定义零影响)
-    /// - `todo_summary`:S3c_todo 源(None = 无清单/开关关,槽位静默跳过;
-    ///   runner 侧确定性渲染,小体量不占记忆预算)
-    /// - `service_catalog`:S2d_catalog 源(None/空 = 服务注册为空,槽位
-    ///   静默跳过;service_tools 启动期注册面渲染,进程内跨轮字节级稳定)
-    ///
+    /// 槽位源逐参数说明随 [`AssemblyInputs`] 字段注释收拢迁移(G5/B-311)。
     /// Err 仅当配方声明了执行器不认识的预算基准(budget.base——validate 白名单
     /// 应已拦截,此处运行时兜底 fail-fast),不做静默降级。
-    #[allow(clippy::too_many_arguments)] // 槽位源逐一声明的组装面,收拢为参数对象反损槽位可读性
-    pub fn assemble(
-        &self,
-        base_prompt: &str,
-        identity_segment: Option<&str>,
-        north_star: Option<&str>,
-        memory: Option<&crate::agent::memory::MemoryManager>,
-        recall: &crate::agent::memory::RecallContext,
-        total_window: usize,
-        boundary_segment: Option<&str>,
-        skills: Option<&[crate::agent::definition::SkillManifestEntry]>,
-        skills_notice: Option<&str>,
-        handoff: Option<&crate::agent::definition::HandoffPackage>,
-        governance_segment: Option<&str>,
-        knowledge_segment: Option<&str>,
-        agents_md: Option<&str>,
-        todo_summary: Option<&str>,
-        service_catalog: Option<&str>,
-    ) -> Result<String, String> {
-        self.assemble_inner(
+    // G5/B-311:原注释"收拢为参数对象反损槽位可读性"经统帅 2026-11-12 裁定 B 案推翻——37 处调用点逐点核语义改写,行为零变化
+    pub fn assemble(&self, inp: AssemblyInputs<'_>) -> Result<String, String> {
+        let AssemblyInputs {
             base_prompt,
             identity_segment,
             north_star,
@@ -926,6 +938,25 @@ impl AssemblyExecutor {
             agents_md,
             todo_summary,
             service_catalog,
+        } = inp;
+        self.assemble_inner(
+            AssemblyInputs {
+                base_prompt,
+                identity_segment,
+                north_star,
+                memory,
+                recall,
+                total_window,
+                boundary_segment,
+                skills,
+                skills_notice,
+                handoff,
+                governance_segment,
+                knowledge_segment,
+                agents_md,
+                todo_summary,
+                service_catalog,
+            },
             None,
         )
     }
@@ -935,27 +966,11 @@ impl AssemblyExecutor {
     /// 静态区不含任何机制分区标记(跨轮字节级稳定 = 被动前缀缓存命中前提);
     /// 关闭态/无动态内容物时与 [`Self::assemble`] 逐字节一致且机制段 None。
     /// 机制段内序 = 槽位序(记忆分区 → Handoff Base → todo)。
-    #[allow(clippy::too_many_arguments)]
     pub fn assemble_split(
         &self,
-        base_prompt: &str,
-        identity_segment: Option<&str>,
-        north_star: Option<&str>,
-        memory: Option<&crate::agent::memory::MemoryManager>,
-        recall: &crate::agent::memory::RecallContext,
-        total_window: usize,
-        boundary_segment: Option<&str>,
-        skills: Option<&[crate::agent::definition::SkillManifestEntry]>,
-        skills_notice: Option<&str>,
-        handoff: Option<&crate::agent::definition::HandoffPackage>,
-        governance_segment: Option<&str>,
-        knowledge_segment: Option<&str>,
-        agents_md: Option<&str>,
-        todo_summary: Option<&str>,
-        service_catalog: Option<&str>,
+        inp: AssemblyInputs<'_>,
     ) -> Result<(String, Option<String>), String> {
-        let mut mechanism = String::new();
-        let prompt = self.assemble_inner(
+        let AssemblyInputs {
             base_prompt,
             identity_segment,
             north_star,
@@ -971,6 +986,26 @@ impl AssemblyExecutor {
             agents_md,
             todo_summary,
             service_catalog,
+        } = inp;
+        let mut mechanism = String::new();
+        let prompt = self.assemble_inner(
+            AssemblyInputs {
+                base_prompt,
+                identity_segment,
+                north_star,
+                memory,
+                recall,
+                total_window,
+                boundary_segment,
+                skills,
+                skills_notice,
+                handoff,
+                governance_segment,
+                knowledge_segment,
+                agents_md,
+                todo_summary,
+                service_catalog,
+            },
             Some(&mut mechanism),
         )?;
         let mechanism = if mechanism.is_empty() {
@@ -983,26 +1018,28 @@ impl AssemblyExecutor {
 
     /// 组装内核:`mechanism_out = Some` 且配方开启 `mechanism_messages` 时,
     /// 动态区槽位改渲染进机制段;`None` 或关闭态 = 全量嵌入(现行为)。
-    #[allow(clippy::too_many_arguments)]
     fn assemble_inner(
         &self,
-        base_prompt: &str,
-        identity_segment: Option<&str>,
-        north_star: Option<&str>,
-        memory: Option<&crate::agent::memory::MemoryManager>,
-        recall: &crate::agent::memory::RecallContext,
-        total_window: usize,
-        boundary_segment: Option<&str>,
-        skills: Option<&[crate::agent::definition::SkillManifestEntry]>,
-        skills_notice: Option<&str>,
-        handoff: Option<&crate::agent::definition::HandoffPackage>,
-        governance_segment: Option<&str>,
-        knowledge_segment: Option<&str>,
-        agents_md: Option<&str>,
-        todo_summary: Option<&str>,
-        service_catalog: Option<&str>,
+        inp: AssemblyInputs<'_>,
         mut mechanism_out: Option<&mut String>,
     ) -> Result<String, String> {
+        let AssemblyInputs {
+            base_prompt,
+            identity_segment,
+            north_star,
+            memory,
+            recall,
+            total_window,
+            boundary_segment,
+            skills,
+            skills_notice,
+            handoff,
+            governance_segment,
+            knowledge_segment,
+            agents_md,
+            todo_summary,
+            service_catalog,
+        } = inp;
         let mut prompt = String::new();
         // γ 批 B-268:机制段外移模式 = 分叉调用在场 且 配方声明开启。
         // 两者缺一(默认配方/直调 assemble) = 全量嵌入,逐字节现行为。
@@ -1421,23 +1458,23 @@ mod tests {
     fn test_agents_md_slot_sits_between_knowledge_and_volatile_tail() {
         let executor = AssemblyExecutor::new(AssemblyRecipe::default());
         let out = executor
-            .assemble(
-                "BASE",
-                None,
-                None,
-                None,
-                &RecallContext::default(),
-                0,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                Some("GOV"),
-                Some("KNOW"),
-                Some("AGENTSMD"),
-                Some("TODO"),
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "BASE",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &RecallContext::default(),
+                total_window: 0,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: Some("GOV"),
+                knowledge_segment: Some("KNOW"),
+                agents_md: Some("AGENTSMD"),
+                todo_summary: Some("TODO"),
+                service_catalog: None,
+            })
             .unwrap();
         let know = out.find("KNOW").expect("knowledge segment present");
         let agents = out.find("AGENTSMD").expect("agents md segment present");
@@ -1474,23 +1511,23 @@ mod tests {
     fn test_assemble_knowledge_segment_slot_order() {
         let exec = AssemblyExecutor::default_executor();
         let out = exec
-            .assemble(
-                "BASE",
-                None,
-                None,
-                None,
-                &RecallContext::default(),
-                0,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                Some("GOV"),
-                Some("KNOW"),
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "BASE",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &RecallContext::default(),
+                total_window: 0,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: Some("GOV"),
+                knowledge_segment: Some("KNOW"),
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert!(out.starts_with("BASE"));
         let gov = out.find("GOV").expect("governance segment present");
@@ -1502,23 +1539,23 @@ mod tests {
 
         // None → 槽位跳过(未声明数据集的既有定义零影响)
         let out2 = exec
-            .assemble(
-                "BASE",
-                None,
-                None,
-                None,
-                &RecallContext::default(),
-                0,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                Some("GOV"),
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "BASE",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &RecallContext::default(),
+                total_window: 0,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: Some("GOV"),
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert!(out2.contains("GOV"));
         assert!(!out2.contains("KNOW"));
@@ -1722,23 +1759,23 @@ mod tests {
 
         // 场景 1:CJK 长记忆(正常预算 8192×0.25,无降级)
         let out1 = exec
-            .assemble(
-                base,
-                None,
-                None,
-                Some(&mem),
-                &recall,
-                8192,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: base,
+                identity_segment: None,
+                north_star: None,
+                memory: Some(&mem),
+                recall: &recall,
+                total_window: 8192,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert_eq!(
             out1,
@@ -1747,23 +1784,23 @@ mod tests {
 
         // 场景 2:极端小窗口(60 token)强制降级通知
         let out2 = exec
-            .assemble(
-                base,
-                None,
-                None,
-                Some(&mem),
-                &recall,
-                60,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: base,
+                identity_segment: None,
+                north_star: None,
+                memory: Some(&mem),
+                recall: &recall,
+                total_window: 60,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert_eq!(
             out2,
@@ -1778,23 +1815,23 @@ mod tests {
             tools: vec!["file_read".to_string()],
         };
         let out3 = exec
-            .assemble(
-                base,
-                None,
-                None,
-                None,
-                &RecallContext::default(),
-                0,
-                Some(&boundary.awareness_segment()),
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: base,
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &RecallContext::default(),
+                total_window: 0,
+                boundary_segment: Some(&boundary.awareness_segment()),
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert_eq!(
             out3,
@@ -1809,44 +1846,44 @@ mod tests {
         let exec = AssemblyExecutor::default_executor();
         // 无身份段:输出 = 基底块原样
         let out_none = exec
-            .assemble(
-                "base",
-                None,
-                None,
-                None,
-                &Default::default(),
-                0,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &Default::default(),
+                total_window: 0,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert_eq!(out_none, "base");
         // 有身份段:紧跟基底块("\n\n" 分隔),且在边界段之前(S1 槽序 < S4 槽序)
         let out_id = exec
-            .assemble(
-                "base",
-                Some("【身份资产】我是谁/服务谁/边界自述/基调"),
-                None,
-                None,
-                &Default::default(),
-                0,
-                Some("【能力边界声明】boundary"),
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: Some("【身份资产】我是谁/服务谁/边界自述/基调"),
+                north_star: None,
+                memory: None,
+                recall: &Default::default(),
+                total_window: 0,
+                boundary_segment: Some("【能力边界声明】boundary"),
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert!(out_id.starts_with("base\n\n【身份资产】我是谁/服务谁/边界自述/基调"));
         let id_pos = out_id.find("【身份资产】").unwrap();
@@ -1854,23 +1891,23 @@ mod tests {
         assert!(id_pos < boundary_pos, "S1 槽序:基底块→身份段→…→边界段");
         // C-4:身份段+北极星锚:S1 槽内序 = 基底块→身份段→北极星锚(逐字节)
         let out_ns = exec
-            .assemble(
-                "base",
-                Some("【身份资产】identity"),
-                Some("【北极星】north star"),
-                None,
-                &Default::default(),
-                0,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: Some("【身份资产】identity"),
+                north_star: Some("【北极星】north star"),
+                memory: None,
+                recall: &Default::default(),
+                total_window: 0,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert_eq!(
             out_ns,
@@ -1886,23 +1923,23 @@ mod tests {
         let exec = AssemblyExecutor::default_executor();
         // 有摘要:紧随基底块(唯一非空槽,"\n\n" 分隔逐字节);且在边界段之前
         let out = exec
-            .assemble(
-                "base",
-                None,
-                None,
-                None,
-                &Default::default(),
-                0,
-                Some("【能力边界声明】boundary"),
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                Some("【清单】- [*] t1 先做"),
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &Default::default(),
+                total_window: 0,
+                boundary_segment: Some("【能力边界声明】boundary"),
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: Some("【清单】- [*] t1 先做"),
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert_eq!(
             out,
@@ -1916,23 +1953,23 @@ mod tests {
         );
         // None → 槽位静默跳过(输出与 v1.0 逐字节一致)
         let out_none = exec
-            .assemble(
-                "base",
-                None,
-                None,
-                None,
-                &Default::default(),
-                0,
-                Some("【能力边界声明】boundary"),
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &Default::default(),
+                total_window: 0,
+                boundary_segment: Some("【能力边界声明】boundary"),
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert!(!out_none.contains("【清单】"));
     }
@@ -1955,23 +1992,23 @@ mod tests {
     fn test_assemble_manifest_without_skills_not_injected() {
         let exec = AssemblyExecutor::default_executor();
         let out = exec
-            .assemble(
-                "base",
-                None,
-                None,
-                None,
-                &Default::default(),
-                0,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &Default::default(),
+                total_window: 0,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert_eq!(out, "base");
         assert!(!out.contains("可用技能清单"));
@@ -1995,23 +2032,23 @@ mod tests {
         ];
         let exec = AssemblyExecutor::default_executor();
         let out = exec
-            .assemble(
-                "base",
-                None,
-                None,
-                None,
-                &Default::default(),
-                0,
-                None,
-                Some(&skills),
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &Default::default(),
+                total_window: 0,
+                boundary_segment: None,
+                skills: Some(&skills),
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert!(out.starts_with("base\n\n"));
         assert!(out.contains("【可用技能清单】以下技能可经 read_skill 工具装载正文："));
@@ -2031,23 +2068,23 @@ mod tests {
         }];
         let exec = AssemblyExecutor::default_executor();
         let out = exec
-            .assemble(
-                "base",
-                None,
-                None,
-                None,
-                &Default::default(),
-                0,
-                Some("【能力边界声明】boundary"),
-                Some(&skills),
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &Default::default(),
+                total_window: 0,
+                boundary_segment: Some("【能力边界声明】boundary"),
+                skills: Some(&skills),
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         let boundary_pos = out.find("【能力边界声明】").expect("boundary present");
         let manifest_pos = out.find("【可用技能清单】").expect("manifest present");
@@ -2071,23 +2108,23 @@ mod tests {
             }
         }
         let out = AssemblyExecutor::new(recipe)
-            .assemble(
-                "base",
-                None,
-                None,
-                None,
-                &Default::default(),
-                0,
-                None,
-                Some(&skills),
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &Default::default(),
+                total_window: 0,
+                boundary_segment: None,
+                skills: Some(&skills),
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert_eq!(out, "base");
     }
@@ -2097,23 +2134,23 @@ mod tests {
     fn test_assemble_manifest_empty_skills_not_injected() {
         let exec = AssemblyExecutor::default_executor();
         let out = exec
-            .assemble(
-                "base",
-                None,
-                None,
-                None,
-                &Default::default(),
-                0,
-                None,
-                Some(&[]),
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &Default::default(),
+                total_window: 0,
+                boundary_segment: None,
+                skills: Some(&[]),
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert_eq!(out, "base");
     }
@@ -2156,23 +2193,23 @@ mod tests {
 
         // 默认配方(基数=input,完全切换后口径)
         let out_input = AssemblyExecutor::new(AssemblyRecipe::default())
-            .assemble(
-                "base",
-                None,
-                None,
-                Some(&mem),
-                &recall,
-                8192,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: Some(&mem),
+                recall: &recall,
+                total_window: 8192,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         // 显式兼容口径(base=total_window,历史行为)
         let mut total_recipe = AssemblyRecipe::default();
@@ -2184,23 +2221,23 @@ mod tests {
             }
         }
         let out_total = AssemblyExecutor::new(total_recipe)
-            .assemble(
-                "base",
-                None,
-                None,
-                Some(&mem),
-                &recall,
-                8192,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: Some(&mem),
+                recall: &recall,
+                total_window: 8192,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
 
         assert_ne!(out_input, out_total, "口径切换必须改变记忆区预算效果");
@@ -2241,23 +2278,23 @@ mod tests {
         let r10: AssemblyRecipe = serde_json::from_str(v10).unwrap();
         r10.validate().unwrap();
         AssemblyExecutor::new(r10)
-            .assemble(
-                "base",
-                None,
-                None,
-                None,
-                &Default::default(),
-                8192,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &Default::default(),
+                total_window: 8192,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         // 新配方:加载 → validate → 字段落位
         let r11: AssemblyRecipe = serde_json::from_str(&v11).unwrap();
@@ -2275,23 +2312,23 @@ mod tests {
             "input"
         );
         exec11
-            .assemble(
-                "base",
-                None,
-                None,
-                None,
-                &Default::default(),
-                8192,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &Default::default(),
+                total_window: 8192,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
     }
 
@@ -2380,23 +2417,23 @@ mod tests {
             .stable
             .push(MemoryRecord::new("k", "稳定事实内容", 1000));
         let out1 = exec
-            .assemble(
-                "base",
-                None,
-                None,
-                Some(&mem),
-                &recall,
-                8192,
-                None,
-                None,
-                None, // skills_notice
-                Some(&handoff),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: Some(&mem),
+                recall: &recall,
+                total_window: 8192,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: Some(&handoff),
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         let stable_pos = out1
             .find("## Stable Facts")
@@ -2407,46 +2444,46 @@ mod tests {
 
         // 场景 2:纯底座独立续跑(memory None)
         let out2 = exec
-            .assemble(
-                "base",
-                None,
-                None,
-                None,
-                &RecallContext::default(),
-                8192,
-                None,
-                None,
-                None, // skills_notice
-                Some(&handoff),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &RecallContext::default(),
+                total_window: 8192,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: Some(&handoff),
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert!(out2.contains("## Handoff Base"));
         assert!(out2.starts_with("base"));
 
         // 场景 3:handoff None → 零影响
         let out3 = exec
-            .assemble(
-                "base",
-                None,
-                None,
-                None,
-                &RecallContext::default(),
-                8192,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &RecallContext::default(),
+                total_window: 8192,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert_eq!(out3, "base");
         assert!(!out3.contains("Handoff Base"));
@@ -2532,23 +2569,23 @@ mod tests {
 
         // ---- (a) assemble 单体黄金(无治理段;CLI 形态,S2 槽位缺席合法) ----
         let assembly_out = exec
-            .assemble(
-                base,
-                Some(identity),
-                Some(north_star),
-                Some(&mem),
-                &recall,
-                8192,
-                Some(&boundary.awareness_segment()),
-                Some(&skills),
-                None, // skills_notice
-                Some(&handoff),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: base,
+                identity_segment: Some(identity),
+                north_star: Some(north_star),
+                memory: Some(&mem),
+                recall: &recall,
+                total_window: 8192,
+                boundary_segment: Some(&boundary.awareness_segment()),
+                skills: Some(&skills),
+                skills_notice: None, // skills_notice
+                handoff: Some(&handoff),
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
 
         // ---- (b) serve 形态黄金 v2:治理段经 S2 槽位进组装(身份段前于治理段) ----
@@ -2577,23 +2614,23 @@ mod tests {
         );
         governance.push_str(crate::api::serve_tools::REGULATION_INDEX_AWARENESS_SEGMENT);
         let full_v2 = exec
-            .assemble(
-                base,
-                Some(identity),
-                Some(north_star),
-                Some(&mem),
-                &recall,
-                8192,
-                Some(&boundary.awareness_segment()),
-                Some(&skills),
-                None, // skills_notice
-                Some(&handoff),
-                Some(&governance),
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: base,
+                identity_segment: Some(identity),
+                north_star: Some(north_star),
+                memory: Some(&mem),
+                recall: &recall,
+                total_window: 8192,
+                boundary_segment: Some(&boundary.awareness_segment()),
+                skills: Some(&skills),
+                skills_notice: None, // skills_notice
+                handoff: Some(&handoff),
+                governance_segment: Some(&governance),
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
 
         // ---- 写录/比对 ----
@@ -2635,23 +2672,23 @@ mod tests {
     fn test_assemble_service_catalog_slot_order() {
         let executor = AssemblyExecutor::new(AssemblyRecipe::default());
         let out = executor
-            .assemble(
-                "BASE",
-                None,
-                None,
-                None,
-                &RecallContext::default(),
-                0,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                Some("GOV"),
-                Some("KNOW"),
-                Some("AGENTSMD"),
-                Some("TODO"),
-                Some("## 服务能力目录\nCATALOG"),
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "BASE",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &RecallContext::default(),
+                total_window: 0,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: Some("GOV"),
+                knowledge_segment: Some("KNOW"),
+                agents_md: Some("AGENTSMD"),
+                todo_summary: Some("TODO"),
+                service_catalog: Some("## 服务能力目录\nCATALOG"),
+            })
             .unwrap();
         let agents = out.find("AGENTSMD").expect("agents md segment present");
         let catalog = out.find("CATALOG").expect("catalog segment present");
@@ -2659,23 +2696,23 @@ mod tests {
         assert!(agents < catalog, "目录段必须位于项目记忆之后(静态区内)");
         assert!(catalog < todo, "目录段必须位于动态尾区之前");
         let out_none = executor
-            .assemble(
-                "BASE",
-                None,
-                None,
-                None,
-                &RecallContext::default(),
-                0,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                Some("AGENTSMD"),
-                None,
-                None,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "BASE",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &RecallContext::default(),
+                total_window: 0,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: Some("AGENTSMD"),
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert_eq!(out_none, "BASE\n\nAGENTSMD");
     }
@@ -2690,23 +2727,23 @@ mod tests {
             }
         }
         let out = AssemblyExecutor::new(recipe)
-            .assemble(
-                "base",
-                None,
-                None,
-                None,
-                &RecallContext::default(),
-                0,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("CATALOG"),
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &RecallContext::default(),
+                total_window: 0,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: Some("CATALOG"),
+            })
             .unwrap();
         assert_eq!(out, "base");
     }
@@ -2717,23 +2754,23 @@ mod tests {
         let mut recipe = AssemblyRecipe::default();
         recipe.slots.retain(|s| s.id != "S2d_catalog");
         let out = AssemblyExecutor::new(recipe)
-            .assemble(
-                "base",
-                None,
-                None,
-                None,
-                &RecallContext::default(),
-                0,
-                None,
-                None,
-                None, // skills_notice
-                None,
-                None,
-                None,
-                Some("AGENTSMD"),
-                None,
-                Some("CATALOG"),
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &RecallContext::default(),
+                total_window: 0,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: Some("AGENTSMD"),
+                todo_summary: None,
+                service_catalog: Some("CATALOG"),
+            })
             .unwrap();
         assert_eq!(out, "base\n\nAGENTSMD");
     }
@@ -2773,34 +2810,43 @@ mod tests {
         recall
             .stable
             .push(MemoryRecord::new("k", "稳定事实内容", 1000));
-        let args = (
-            "base",
-            None,
-            None,
-            Some(&mem),
-            &recall,
-            8192usize,
-            None,
-            None,
-            None, // skills_notice
-            None,
-            None,
-            None,
-            None,
-            Some("TODO_SEG"),
-            None,
-        );
         let embedded = exec
-            .assemble(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12, args.13, args.14,
-            )
+            .assemble(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: Some(&mem),
+                recall: &recall,
+                total_window: 8192usize,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: Some("TODO_SEG"),
+                service_catalog: None,
+            })
             .unwrap();
         let (static_prompt, mechanism) = exec
-            .assemble_split(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12, args.13, args.14,
-            )
+            .assemble_split(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: Some(&mem),
+                recall: &recall,
+                total_window: 8192usize,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: Some("TODO_SEG"),
+                service_catalog: None,
+            })
             .unwrap();
         assert!(mechanism.is_none(), "关闭态机制段必须为 None");
         assert_eq!(static_prompt, embedded, "关闭态静态区 = 全量组装逐字节一致");
@@ -2829,23 +2875,23 @@ mod tests {
             dead_ends: Vec::new(),
         };
         let (static_prompt, mechanism) = exec
-            .assemble_split(
-                "base",
-                None,
-                None,
-                Some(&mem),
-                &recall,
-                8192,
-                None,
-                None,
-                None, // skills_notice
-                Some(&handoff),
-                None,
-                None,
-                None,
-                Some("## Current TODO\n- t1"),
-                None,
-            )
+            .assemble_split(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: Some(&mem),
+                recall: &recall,
+                total_window: 8192,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None, // skills_notice
+                handoff: Some(&handoff),
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: Some("## Current TODO\n- t1"),
+                service_catalog: None,
+            })
             .unwrap();
         assert!(static_prompt.starts_with("base"), "静态区保留头部基底");
         assert!(
@@ -2870,23 +2916,23 @@ mod tests {
     fn test_assemble_split_enabled_no_dynamic_sources_yields_none() {
         let exec = AssemblyExecutor::new(mechanism_on_recipe());
         let (static_prompt, mechanism) = exec
-            .assemble_split(
-                "base",
-                None,
-                None,
-                None,
-                &RecallContext::default(),
-                8192,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble_split(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: None,
+                recall: &RecallContext::default(),
+                total_window: 8192,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None,
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert!(mechanism.is_none());
         assert_eq!(static_prompt, "base");
@@ -2952,23 +2998,23 @@ mod tests {
         let mut recall1 = RecallContext::default();
         recall1.stable.push(MemoryRecord::new("k", "事实一", 1000));
         let (static1, mech1) = exec
-            .assemble_split(
-                "base",
-                None,
-                None,
-                Some(&mem1),
-                &recall1,
-                8192,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble_split(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: Some(&mem1),
+                recall: &recall1,
+                total_window: 8192,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None,
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         let mem2 = MemoryManager::new(
             "b268-turn2",
@@ -2978,23 +3024,23 @@ mod tests {
         recall2.stable.push(MemoryRecord::new("k", "事实一", 1000));
         recall2.stable.push(MemoryRecord::new("k2", "事实二", 2000));
         let (static2, mech2) = exec
-            .assemble_split(
-                "base",
-                None,
-                None,
-                Some(&mem2),
-                &recall2,
-                8192,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .assemble_split(AssemblyInputs {
+                base_prompt: "base",
+                identity_segment: None,
+                north_star: None,
+                memory: Some(&mem2),
+                recall: &recall2,
+                total_window: 8192,
+                boundary_segment: None,
+                skills: None,
+                skills_notice: None,
+                handoff: None,
+                governance_segment: None,
+                knowledge_segment: None,
+                agents_md: None,
+                todo_summary: None,
+                service_catalog: None,
+            })
             .unwrap();
         assert_eq!(static1, static2, "静态区跨轮字节级稳定");
         assert_ne!(mech1, mech2, "机制段承载动态变化");
