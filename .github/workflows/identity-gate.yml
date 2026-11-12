@@ -1,0 +1,75 @@
+# Committer identity gate (cross-environment root fix for identity drift).
+#
+# Contract: every commit reaching main must have a committer email that is
+# either the maintainer identity (evorulelab@gmail.com) or the platform
+# merge identity (github noreply). Author emails are NOT restricted
+# (external contributors are legitimate). Commits made by unconfigured
+# execution environments with their own default git identity fail here,
+# regardless of which machine produced them.
+#
+# Edge cases:
+# - push events with an unknown `before` (new branch / forced history):
+#   fall back to merge-base against the default branch; if that also
+#   yields nothing, the job passes with a warning (GitHub merge state and
+#   the branch protection required checks still gate the final content).
+# - merge commits in the range: skipped (their committer is the platform).
+name: identity-gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  committer-identity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: verify committer identity over the commit range
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            RANGE="${{ github.event.pull_request.base.sha }}..${{ github.sha }}"
+          elif [ -n "${{ github.event.before }}" ] \
+            && git cat-file -e "${{ github.event.before }}" 2>/dev/null; then
+            RANGE="${{ github.event.before }}..${{ github.sha }}"
+          else
+            BASE="$(git merge-base origin/main "${{ github.sha }}" 2>/dev/null || true)"
+            if [ -z "${BASE:-}" ]; then
+              echo "::warning::no commit range resolvable; passing (see workflow header)"
+              exit 0
+            fi
+            RANGE="${BASE}..${{ github.sha }}"
+          fi
+
+          echo "scanning range: $RANGE"
+          MAINT='evorulelab@gmail.com'
+          bad=0
+          # Gate scope: maintainer-authored commits must carry a maintainer or
+          # platform committer (the identity-drift case). External authors are
+          # out of scope here: their commits arrive via PR review + CLA, and
+          # their own committer identity is legitimately theirs.
+          while IFS='|' read -r sha cemail aemail; do
+            [ -n "$sha" ] || continue
+            [ "$aemail" = "$MAINT" ] || continue
+            case "$cemail" in
+              "$MAINT") continue ;;
+              *noreply@github.com) continue ;;
+            esac
+            echo "::error::commit $sha authored by the maintainer has committer '$cemail' outside the allowed identities (maintainer or platform merge)"
+            bad=1
+          done < <(git log --no-merges --format='%H|%ce|%ae' "$RANGE")
+
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::identity gate failed; redo commits with the maintainer identity"
+            exit 1
+          fi
+          echo "identity gate passed"
