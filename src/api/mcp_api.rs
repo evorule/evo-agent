@@ -324,11 +324,21 @@ pub async fn put_servers(
         }
     }
 
-    // 4. 同步段:持写锁注册全部连接产物(临界区内无 await)
+    // 4. 同步段:持写锁**全量重载 MCP 面**(先清后加:按来源清空旧动态条目,
+    // 移除的 server/重连失败的 server/工具集收缩后的旧名不再滞留 union
+    // toolkit 至进程重启),再注册全部连接产物(临界区内无 await)
     let mut registered_servers = 0usize;
     let mut registered_tools = 0usize;
     {
         let mut toolkit = state.toolkit_lock().write().expect("toolkit lock poisoned");
+        let removed = toolkit
+            .unregister_source(crate::agent::tool_manifest::ToolSource::Mcp);
+        if !removed.is_empty() {
+            info!(
+                tools_removed = removed.len(),
+                "MCP toolkit cleared for full reload"
+            );
+        }
         for (s, client, tools) in &connections {
             match register_client_tools(
                 &mut toolkit,
@@ -388,17 +398,29 @@ pub async fn restart_server(
         ));
     }
 
-    // async 段:断连重连(失败已落 failed 状态)
+    // async 段:旧注册名先快照(disconnect 会清运行态条目)→ 断连重连
+    // (失败已落 failed 状态)
+    let stale = manager.registered_tool_names(&s.name);
     let (client, tools) = manager.reconnect(s).await.map_err(|e| {
+        // 重连失败 = 旧工具一并下架(指向死连接的工具不再滞留 LLM 契约面)
+        if !stale.is_empty() {
+            let mut toolkit = state.toolkit_lock().write().expect("toolkit lock poisoned");
+            for name in &stale {
+                toolkit.unregister(name);
+            }
+        }
         (
             StatusCode::BAD_GATEWAY,
             Json(json!({ "error": format!("MCP server '{}' reconnect failed: {}", s.name, e) })),
         )
     })?;
 
-    // 同步段:持写锁重注册
+    // 同步段:持写锁先清旧名(工具集可能收缩)后重注册
     let count = {
         let mut toolkit = state.toolkit_lock().write().expect("toolkit lock poisoned");
+        for name in &stale {
+            toolkit.unregister(name);
+        }
         register_client_tools(
             &mut toolkit,
             &s.name,
@@ -625,6 +647,136 @@ mod tests {
         );
         // 配置写回落盘
         assert!(tmp.path().join(".evo").join("mcp.toml").exists());
+    }
+
+    /// 构造注入 MCP 管理器 + 配置存储 + **预置 toolkit** 的测试 state
+    fn mcp_state_with_toolkit(
+        dir: &std::path::Path,
+        toolkit: std::sync::Arc<std::sync::RwLock<crate::io_handlers::tool_handler::ToolHandler>>,
+    ) -> AgentApiState {
+        let manager = McpManager::new();
+        let store = McpConfigStore::new(dir, McpConfig::default());
+        AgentApiState::new_with_metrics(
+            crate::agent::AgentDefinitionManager::with_default_dir(),
+            EvoruleApiClient::new("http://localhost:0"),
+            std::sync::Arc::new(Metrics::new().unwrap()),
+            dir.to_path_buf(),
+            std::sync::Arc::new(crate::api::workspace_client::WorkspaceApiClient::new(
+                "http://localhost:0",
+            )),
+            toolkit,
+        )
+        .with_mcp(std::sync::Arc::new(manager), std::sync::Arc::new(store))
+    }
+
+    fn seed_mcp_tool(
+        toolkit: &mut crate::io_handlers::tool_handler::ToolHandler,
+        name: &str,
+    ) {
+        let m = crate::agent::tool_manifest::dynamic_manifest(
+            name,
+            crate::agent::tool_manifest::ToolSource::Mcp,
+            format!("{name} seeded"),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        toolkit.register(m, std::sync::Arc::new(SeedTool));
+    }
+
+    fn seed_svc_tool(
+        toolkit: &mut crate::io_handlers::tool_handler::ToolHandler,
+        name: &str,
+    ) {
+        let m = crate::agent::tool_manifest::dynamic_manifest(
+            name,
+            crate::agent::tool_manifest::ToolSource::ServiceProxy,
+            format!("{name} seeded"),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        toolkit.register(m, std::sync::Arc::new(SeedTool));
+    }
+
+    /// 预置替身:重载/重启清理路径测试用(行为无关)
+    struct SeedTool;
+
+    #[async_trait::async_trait]
+    impl crate::io_handlers::tool_handler::ToolFunction for SeedTool {
+        async fn call(&self, _args: &Value) -> Result<Value, String> {
+            Ok(Value::from("seed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_put_full_reload_removes_stale_tools_only_mcp_source() {
+        // 全量重载只加不删的修复面:PUT 后旧 MCP 工具下架(移除的 server
+        // 不再滞留),非 MCP 来源(服务代理/静态)原样保留
+        let tmp = tempfile::tempdir().unwrap();
+        let toolkit = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::io_handlers::tool_handler::ToolHandler::new(),
+        ));
+        {
+            let mut h = toolkit.write().unwrap();
+            seed_mcp_tool(&mut h, "mcp_old_srv_tool_a");
+            seed_mcp_tool(&mut h, "mcp_old_srv_tool_b");
+            seed_svc_tool(&mut h, "svc_keep_me");
+        }
+        let state = mcp_state_with_toolkit(tmp.path(), toolkit.clone());
+        let a = app(state);
+        // PUT 空配置 = 用户移除全部 server
+        let (status, _) =
+            json_request(a, "PUT", "/api/mcp/servers", Some(json!({"servers": []}))).await;
+        assert_eq!(status, StatusCode::OK);
+        let h = toolkit.read().unwrap();
+        assert!(!h.has_tool("mcp_old_srv_tool_a"), "stale MCP tool must be removed");
+        assert!(!h.has_tool("mcp_old_srv_tool_b"), "stale MCP tool must be removed");
+        assert!(h.has_tool("svc_keep_me"), "non-MCP sources must survive reload");
+    }
+
+    #[tokio::test]
+    async fn test_restart_failure_clears_stale_tools() {
+        // 重连失败 = 该 server 旧工具一并下架(死连接的工具不滞留 LLM 契约面)
+        let tmp = tempfile::tempdir().unwrap();
+        let toolkit = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::io_handlers::tool_handler::ToolHandler::new(),
+        ));
+        {
+            let mut h = toolkit.write().unwrap();
+            seed_mcp_tool(&mut h, "mcp_doomed_stale_x");
+        }
+        let state = mcp_state_with_toolkit(tmp.path(), toolkit.clone());
+        // 所有权清单播种:模拟 connect_and_register_all 之后的 connected 态
+        let mgr = state.mcp().unwrap().clone();
+        mgr.seed_connected_entry(
+            "doomed",
+            vec![crate::mcp::McpToolSpec {
+                name: "stale_x".to_string(),
+                description: "stale".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+        );
+        // 配置落盘:doomed 指向不存在的命令(重启必失败);store 以文件为
+        // 单一事实源(load 优先),写文件即生效
+        std::fs::create_dir_all(tmp.path().join(".evo")).unwrap();
+        std::fs::write(
+            tmp.path().join(".evo").join("mcp.toml"),
+            "[[mcp.servers]]\nname = \"doomed\"\ncommand = \"this-command-does-not-exist-xyz999\"\ntimeout_secs = 60\n",
+        )
+        .unwrap();
+        let a = app(state);
+
+        let (status, v) =
+            json_request(a, "POST", "/api/mcp/servers/doomed/restart", None).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("reconnect failed"),
+            "{v}"
+        );
+        let h = toolkit.read().unwrap();
+        assert!(
+            !h.has_tool("mcp_doomed_stale_x"),
+            "stale tool must be unregistered after failed restart"
+        );
     }
 
     #[tokio::test]

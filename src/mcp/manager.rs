@@ -86,6 +86,17 @@ pub(crate) fn http_url_trusted(url: &str, trust: Option<&str>) -> bool {
         .any(|u| u == url)
 }
 
+/// server 工具全集 → 注册名全集（纯函数可测；`mcp_{server}_{tool}` 逐项映射）
+///
+/// 重启/重载「先清后加」的旧名清单来源：与注册面([`super::tool_adapter::
+/// register_client_tools`])同一命名函数，保证清除集合与注册集合逐字对应。
+pub(crate) fn server_tool_registered_names(server: &str, tools: &[McpToolSpec]) -> Vec<String> {
+    tools
+        .iter()
+        .map(|t| super::tool_adapter::mcp_tool_name(server, &t.name))
+        .collect()
+}
+
 impl McpManager {
     pub fn new() -> Self {
         Self::default()
@@ -274,21 +285,38 @@ impl McpManager {
 
     /// 重启单 server(断连 → 按配置重连重注册进 handler)
     ///
+    /// **先清后加**:旧注册名在断连前快照(条目随 disconnect 清空),重连
+    /// 成功 = 清旧名(工具集可能收缩)后重注册;重连失败 = 旧工具一并下架
+    /// (状态面已落 failed,指向死连接的工具不再滞留 LLM 契约面至进程重启)。
+    ///
     /// 返回注册的工具数;连接失败时错误返回(状态面已落 failed)。
     pub async fn restart(
         &self,
         cfg: &McpServerConfig,
         tool_handler: &mut crate::io_handlers::tool_handler::ToolHandler,
     ) -> Result<usize, String> {
-        let (client, tools) = self.reconnect(cfg).await?;
-        register_client_tools(
-            tool_handler,
-            &cfg.name,
-            &client,
-            &tools,
-            &cfg.always_allow,
-            cfg.timeout_secs,
-        )
+        let stale = self.registered_tool_names(&cfg.name);
+        match self.reconnect(cfg).await {
+            Ok((client, tools)) => {
+                for name in &stale {
+                    tool_handler.unregister(name);
+                }
+                register_client_tools(
+                    tool_handler,
+                    &cfg.name,
+                    &client,
+                    &tools,
+                    &cfg.always_allow,
+                    cfg.timeout_secs,
+                )
+            }
+            Err(e) => {
+                for name in &stale {
+                    tool_handler.unregister(name);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// 连接全部 server 并把工具注册进 union toolkit(serve 启动接入)
@@ -390,6 +418,34 @@ impl McpManager {
             .insert(name, entry);
     }
 
+    /// 单 server 已注册工具名清单(`mcp_{server}_{tool}` 全集;条目缺席=空)
+    ///
+    /// 重启/重载「先清后加」的清除半边数据源:旧名集合必须在 disconnect
+    /// 前快照(disconnect/reconnect 会清运行态条目)。
+    pub fn registered_tool_names(&self, name: &str) -> Vec<String> {
+        self.entries
+            .lock()
+            .expect("mcp manager lock")
+            .get(name)
+            .map(|e| server_tool_registered_names(name, &e.tools))
+            .unwrap_or_default()
+    }
+
+    /// 预置运行态条目(仅测试):模拟 connect_server 之后的 connected 态,
+    /// 供重启/重载清理路径的无真服务器单测播种所有权清单。
+    #[cfg(test)]
+    pub fn seed_connected_entry(&self, name: &str, tools: Vec<McpToolSpec>) {
+        self.set_entry(
+            name.to_string(),
+            McpServerEntry {
+                status: McpServerStatus::Connected,
+                client: None,
+                tools,
+                reap_rx: None,
+            },
+        );
+    }
+
     /// 显式落 failed 状态(B16 PR-2:端点侧注册期失败——连接已成功但工具
     /// 注册被拒/写锁竞争异常时,状态面回落 failed 供工作台可见)
     pub fn mark_failed(&self, name: &str, error: &str) {
@@ -428,6 +484,19 @@ mod tests {
             url: None,
             headers: None,
             ..Default::default()
+        }
+    }
+
+    /// handler 预置替身:重启清理路径测试用(行为无关)
+    struct RebindProbeTool;
+
+    #[async_trait::async_trait]
+    impl crate::io_handlers::tool_handler::ToolFunction for RebindProbeTool {
+        async fn call(
+            &self,
+            _args: &serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::Value::from("probe"))
         }
     }
 
@@ -553,6 +622,72 @@ mod tests {
             McpServerStatus::Failed { error: "x".into() }.as_str(),
             "failed"
         );
+    }
+
+    #[test]
+    fn test_registered_tool_names_maps_and_absent_entry_is_empty() {
+        // 清除半边数据源:条目在场 = mcp_{server}_{tool} 全集;条目缺席 = 空
+        let mgr = McpManager::new();
+        assert!(mgr.registered_tool_names("ghost").is_empty(), "absent entry");
+        let tools = vec![
+            McpToolSpec {
+                name: "read_file".to_string(),
+                description: "r".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            McpToolSpec {
+                name: "write_file".to_string(),
+                description: "w".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        ];
+        mgr.seed_connected_entry("fs", tools.clone());
+        assert_eq!(
+            mgr.registered_tool_names("fs"),
+            vec!["mcp_fs_read_file".to_string(), "mcp_fs_write_file".to_string()]
+        );
+        assert_eq!(
+            server_tool_registered_names("fs", &tools),
+            mgr.registered_tool_names("fs"),
+            "pure helper and accessor must agree"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restart_failure_clears_stale_tools_from_handler() {
+        // 重连失败 = 旧工具一并下架(指向死连接的工具不再滞留 LLM 契约面)
+        let mgr = McpManager::new();
+        let tools = vec![McpToolSpec {
+            name: "stale_tool".to_string(),
+            description: "stale".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        mgr.seed_connected_entry("doomed", tools);
+        let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
+        // 预置 handler:模拟上一轮注册产物(注册名与所有权清单逐字对应)
+        let m = crate::agent::tool_manifest::dynamic_manifest(
+            "mcp_doomed_stale_tool",
+            crate::agent::tool_manifest::ToolSource::Mcp,
+            "stale".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        handler.register(m, std::sync::Arc::new(RebindProbeTool));
+        assert!(handler.has_tool("mcp_doomed_stale_tool"));
+        // 重启一个连不上的 server:重连失败 → stale 清除 → Err 上浮
+        let err = mgr
+            .restart(
+                &cfg("doomed", "this-command-does-not-exist-xyz999"),
+                &mut handler,
+            )
+            .await;
+        assert!(err.is_err(), "reconnect failure must surface");
+        assert!(
+            !handler.has_tool("mcp_doomed_stale_tool"),
+            "stale tool must be unregistered on failed restart"
+        );
+        let snap = mgr.snapshot();
+        assert_eq!(snap[0].1.status.as_str(), "failed");
     }
 }
 

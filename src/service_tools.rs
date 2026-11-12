@@ -387,13 +387,15 @@ async fn register_service_tools_with_delays(
                 })
                 .map_err(|_| "服务参数契约注册表写入失败".to_string())?;
         }
-        handler.register(
+        // 来源防覆盖防线:撞上非 ServiceProxy 来源的既有同名工具即拒绝
+        // (has_tool 预检的 TOCTOU 结构兜底;治理元数据不得随同名覆盖换血)
+        handler.register_guarded(
             manifest,
             Arc::new(ServiceProxyTool {
                 ev: ev.clone(),
                 service_name: want.clone(),
             }),
-        );
+        )?;
         registered += 1;
     }
     // 结构化点名摘要：无论绿红都输出一行，fresh-install/CI 可直接断言

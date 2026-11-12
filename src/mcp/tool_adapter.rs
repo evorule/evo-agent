@@ -124,6 +124,17 @@ impl McpToolAdapter {
     pub fn tool_name(&self) -> &str {
         &self.tool_name
     }
+
+    /// 终止底层传输(stdio=kill 子进程树;http=断开+drain pending)
+    ///
+    /// 执行超时契约的终止半边:超时不再是「放弃等待」,server 进程被杀、
+    /// 其余在飞请求收到 transport-closed 真实结局。
+    fn terminate_transport(&self) {
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let _ = client.close().await;
+        });
+    }
 }
 
 #[async_trait::async_trait]
@@ -148,10 +159,16 @@ impl ToolFunction for McpToolAdapter {
                 .await
             {
                 Ok(r) => r,
-                Err(_) => Err(format!(
-                    "MCP tool '{}' timed out after {}s",
-                    self.tool_name, self.timeout_secs
-                )),
+                Err(_) => {
+                    // 超时=终止并记账(非放弃):断开传输(stdio=kill 子进程树,
+                    // 全部 pending 请求回传 transport-closed),server 不再带着
+                    // 未完成的副作用继续跑
+                    self.terminate_transport();
+                    Err(format!(
+                        "MCP tool '{}' timed out after {}s (server transport closed)",
+                        self.tool_name, self.timeout_secs
+                    ))
+                }
             }
         };
 
@@ -235,6 +252,14 @@ impl ToolFunction for McpToolAdapter {
         }))
     }
 
+    /// 执行超时钩子(执行器生命周期契约):终止在飞 server(缺省 no-op 的
+    /// 未实现方此前让执行超时退化为「放弃等待」——远端副作用可在超时报错
+    /// 后继续完成)。close 对 stdio 传输 kill 子进程树并对全部 pending 请求
+    /// 回传真实结局,[`Self::call`] 的在飞 future 随即收 transport-closed。
+    fn on_execution_timeout(&self) {
+        self.terminate_transport();
+    }
+
     /// 管道⑤评估钩子(G8 接合):MCP 工具缺省
     /// candidate 全审批——非白名单调用返回 needs_approval 提案交 G8 决策端;
     /// `always_allow` 白名单内(active)返回 None 直通执行。
@@ -264,11 +289,52 @@ impl ToolFunction for McpToolAdapter {
     }
 }
 
+/// MCP 标识符(server 名/tool 名)注册边界校验
+///
+/// 字符集 `[A-Za-z0-9_-]`、非空(与工作台 PUT 面校验同语义镜像);tool 名
+/// 另加 64 字节上限——tools/list 透传的 tool 名是**远端(可能不可信)内容
+/// 直达 LLM 契约面/审批卡/日志的名字空间**,无边界即注入面,长度上限防
+/// 组合注册名膨胀。server 名不加长度上限(与 PUT 面口径一致,避免
+/// PUT-合法配置在注册面被二次拒绝)。
+pub fn validate_mcp_identifier(kind: &str, name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(format!("MCP {kind} name must not be empty"));
+    }
+    if kind == "tool" && name.len() > 64 {
+        return Err(format!(
+            "MCP tool name '{}' exceeds the 64-byte limit ({} bytes); \
+             shorten the tool name on the server",
+            name,
+            name.len()
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "MCP {kind} name '{}' contains characters outside [a-zA-Z0-9_-]; \
+             rename it (the name lands verbatim in the LLM contract and approval cards)",
+            name
+        ));
+    }
+    Ok(())
+}
+
 /// 把一个已连接 MCP client 的工具列表注册进 ToolHandler(B16 抽出共用)
 ///
-/// CLI(`register_mcp_tools`)与 serve(`mcp::manager`)两条路径共用:
-/// 逐工具 `mcp_{server}_{tool}` 命名 → manifest 契约校验(description/
-/// inputSchema 透传,一表硬规则 3)→ `McpToolAdapter` 注册(带超时覆盖)。
+/// CLI(`register_mcp_tools`)与 serve(`mcp::manager`)两条路径共用。
+/// **两阶段注册(all-or-nothing)**:阶段一对全部工具做身份边界校验 +
+/// manifest 契约校验 + 名称碰撞检查(零 mutation),任一被拒 = 整 server
+/// 拒绝注册——注册循环中途契约拒绝不再残留前 k-1 工具(状态面 failed
+/// 与实际可用面一致);阶段二统一注册(走 [`ToolHandler::register_guarded`]
+/// 来源防覆盖防线,阶段一已查碰撞,此处 Err 即防线执法可见)。
+///
+/// 名称碰撞防线:`mcp_{server}_{tool}` 组合可撞(server a + tool b_c 与
+/// server a_b + tool c 同产 `mcp_a_b_c`),同名覆盖会静默顶替既有工具
+/// (换执行端点/借 always_allow 名单静默升档)——先注册者胜,后注册者
+/// 显式失败;重启/重载路径由 manager 先清旧名再重注册(见
+/// [`super::manager::McpManager::restart`])。
 ///
 /// 治理接合(G8):manifest 缺省 ManualDefault
 /// (dynamic_manifest Mcp 分支);`always_allow` 名单内工具覆写 AutoPolicy
@@ -282,16 +348,33 @@ pub fn register_client_tools(
     always_allow: &[String],
     timeout_secs: u64,
 ) -> Result<usize, String> {
+    // ---- 阶段一:全量校验(零 mutation;任一被拒 = 整 server 拒绝) ----
+    validate_mcp_identifier("server", server_name)?;
+    let mut prepared: Vec<(
+        crate::agent::tool_manifest::ToolManifest,
+        Arc<dyn crate::io_handlers::tool_handler::ToolFunction>,
+    )> = Vec::with_capacity(tools.len());
+    let mut names_in_batch = std::collections::HashSet::new();
     for tool in tools {
+        validate_mcp_identifier("tool", &tool.name)?;
         let registered_name = mcp_tool_name(server_name, &tool.name);
+        if !names_in_batch.insert(registered_name.clone()) {
+            return Err(format!(
+                "MCP server '{server_name}' exposes duplicate tool name '{}' \
+                 (registered as '{registered_name}')",
+                tool.name
+            ));
+        }
+        if let Some(existing) = tool_handler.manifest(&registered_name) {
+            let existing_source = format!("{:?}", existing.source);
+            return Err(format!(
+                "MCP tool name '{registered_name}' collides with an already-registered \
+                 '{existing_source}' tool (server '{server_name}'); refusing shadow \
+                 registration (first registrant wins; a later server must not swap the \
+                 executor or escalate via always_allow)"
+            ));
+        }
         let active = always_allow.contains(&tool.name);
-        tracing::info!(
-            server = %server_name,
-            mcp_tool = %tool.name,
-            registered_as = %registered_name,
-            active,
-            "registering MCP tool"
-        );
         // 一表硬规则 3:MCP 握手后 tools/list 的 description/inputSchema 透传
         // 进 manifest(Inline 契约)——丢字段即注册失败(设计档 §3.1,消灭
         // MCP 空 schema 降级)
@@ -314,17 +397,33 @@ pub fn register_client_tools(
         if active {
             manifest.approval_policy = crate::agent::tool_manifest::ApprovalPolicy::AutoPolicy;
         }
-        tool_handler.register(
-            manifest,
-            Arc::new(McpToolAdapter::with_governance(
-                client.clone(),
-                tool.name.clone(),
-                registered_name,
-                active,
-                timeout_secs,
-            )),
-        );
+        let adapter = Arc::new(McpToolAdapter::with_governance(
+            client.clone(),
+            tool.name.clone(),
+            registered_name,
+            active,
+            timeout_secs,
+        ));
+        prepared.push((manifest, adapter));
     }
+    // ---- 阶段二:统一注册(来源防覆盖防线兜底;阶段一已查碰撞) ----
+    for (manifest, func) in prepared {
+        tool_handler
+            .register_guarded(manifest, func)
+            .map_err(|e| {
+                tracing::warn!(
+                    server = %server_name,
+                    error = %e,
+                    "MCP tool registration refused by source guard"
+                );
+                e
+            })?;
+    }
+    tracing::info!(
+        server = %server_name,
+        tools_registered = tools.len(),
+        "MCP tools registered (all-or-nothing)"
+    );
     Ok(tools.len())
 }
 
@@ -386,27 +485,35 @@ async fn connect_and_register_one(
 
     let args: Vec<&str> = server_cfg.args.iter().map(|s| s.as_str()).collect();
 
-    let transport = if server_cfg.env.is_empty() {
-        let limits = super::lifecycle::ResourceLimits::from_config(server_cfg);
-        crate::mcp::transport::StdioTransport::spawn_with_env_and_limits(
-            &server_cfg.command,
-            &args,
-            &Default::default(),
-            &limits,
-        )
-        .await?
-    } else {
-        let limits = super::lifecycle::ResourceLimits::from_config(server_cfg);
+    let limits = super::lifecycle::ResourceLimits::from_config(server_cfg);
+    let transport = std::sync::Arc::new(
         crate::mcp::transport::StdioTransport::spawn_with_env_and_limits(
             &server_cfg.command,
             &args,
             &server_cfg.env,
             &limits,
         )
-        .await?
-    };
+        .await?,
+    );
 
-    let client = Arc::new(McpClient::connect(Arc::new(transport)).await?);
+    // CLI 路径握手+工具发现整体受 timeout_secs 约束(manager.connect_inner
+    // 同语义镜像):原无界 await——hang 住的 server 可拖死 agent 启动
+    let deadline = std::time::Duration::from_secs(server_cfg.timeout_secs.max(1));
+    let (client, tools) = tokio::time::timeout(deadline, async {
+        let client = McpClient::connect(transport).await?;
+        let tools = client.list_tools().await?;
+        Ok::<_, String>((client, tools))
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "MCP server '{}' connect/discovery timed out after {}s",
+            server_cfg.name,
+            deadline.as_secs()
+        )
+    })??;
+    let client = Arc::new(client);
+
     // 生命周期监控（资源边界设计（L1）；策略全关=不启用=现行为）。CLI 单发路径无
     // 重启监督——收割通知端就地丢弃（fail-soft：收割与事件面不受影响）
     {
@@ -416,7 +523,6 @@ async fn connect_and_register_one(
         }
     }
 
-    let tools = client.list_tools().await?;
     register_client_tools(
         tool_handler,
         &server_cfg.name,
@@ -798,5 +904,253 @@ mod tests {
         let adapter = McpToolAdapter::new(client, "read_file".to_string());
         let result = adapter.call(&Value::Null).await.unwrap();
         assert_eq!(result.as_str(), Some("small"));
+    }
+
+    // ===== 注册面完整性(o78 all-or-nothing / o79 名称边界与碰撞 / o80 跨来源冒名) =====
+
+    /// 跨来源冒名测试替身:既有非 MCP 来源条目的执行器
+    struct NoopTool;
+
+    #[async_trait::async_trait]
+    impl crate::io_handlers::tool_handler::ToolFunction for NoopTool {
+        async fn call(&self, _args: &Value) -> IoResult {
+            Ok(Value::from("noop"))
+        }
+    }
+
+    #[test]
+    fn test_mcp_identifier_validation_boundaries() {
+        // o79:server/tool 名边界——字符集镜像 PUT 面,tool 名另加 64 字节上限
+        assert!(validate_mcp_identifier("server", "fs").is_ok());
+        assert!(validate_mcp_identifier("server", "web-scraper_v2").is_ok());
+        assert!(validate_mcp_identifier("tool", "read_file").is_ok());
+        assert!(validate_mcp_identifier("tool", "").is_err());
+        assert!(validate_mcp_identifier("server", "").is_err());
+        assert!(validate_mcp_identifier("tool", "a b").is_err());
+        assert!(validate_mcp_identifier("tool", "a\nb").is_err());
+        assert!(validate_mcp_identifier("tool", "中文工具").is_err());
+        assert!(validate_mcp_identifier("tool", "a;b").is_err());
+        let long = "x".repeat(65);
+        assert!(validate_mcp_identifier("tool", &long).is_err());
+        assert!(validate_mcp_identifier("tool", &"x".repeat(64)).is_ok());
+        // server 名不加长度上限(与 PUT 面口径一致)
+        assert!(validate_mcp_identifier("server", &"x".repeat(200)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_register_client_tools_contract_reject_is_all_or_nothing() {
+        // o78:注册循环中途契约拒绝不得残留前 k-1 工具——两阶段注册,
+        // 整 server 拒绝,状态面 failed 与实际可用面一致
+        let (client, _transport) = make_client_with_tool_response().await;
+        let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
+        let good = spec("good_tool");
+        let mut bad = spec("bad_tool");
+        bad.description = String::new(); // 丢字段:manifest 契约拒绝
+        let err = register_client_tools(&mut handler, "fs", &client, &[good, bad], &[], 60)
+            .expect_err("contract rejection must fail the whole server batch");
+        assert!(err.contains("bad_tool"), "{err}");
+        assert!(
+            !handler.has_tool("mcp_fs_good_tool"),
+            "no partial residue allowed (failed server must not keep callable tools)"
+        );
+        assert!(!handler.has_tool("mcp_fs_bad_tool"));
+    }
+
+    #[tokio::test]
+    async fn test_register_client_tools_rejects_nonconforming_names() {
+        // o79:远端 tools/list 透传的非法工具名 = 整 server 拒绝(不留合法子集)
+        let (client, _transport) = make_client_with_tool_response().await;
+        let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
+        let tools = [spec("ok_tool"), spec("bad name")];
+        let err = register_client_tools(&mut handler, "fs", &client, &tools, &[], 60)
+            .expect_err("nonconforming tool name must be rejected");
+        assert!(err.contains("bad name"), "{err}");
+        assert!(!handler.has_tool("mcp_fs_ok_tool"), "all-or-nothing");
+    }
+
+    #[tokio::test]
+    async fn test_register_client_tools_name_collision_refuses_shadow() {
+        // o79:`mcp_{server}_{tool}` 组合碰撞(a+b_c vs a_b+c 同产 mcp_a_b_c)
+        // ——后者显式拒绝,先注册者保持原样(always_allow 升档路径封死)
+        let (client, _transport) = make_client_with_tool_response().await;
+        let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
+        register_client_tools(&mut handler, "a", &client, &[spec("b_c")], &[], 60).unwrap();
+        let err = register_client_tools(&mut handler, "a_b", &client, &[spec("c")], &[], 60)
+            .expect_err("composition collision must be refused, not silently shadowed");
+        assert!(err.contains("mcp_a_b_c"), "{err}");
+        assert!(handler.has_tool("mcp_a_b_c"), "first registrant stays");
+        let m = handler.manifest("mcp_a_b_c").unwrap();
+        assert_eq!(
+            m.approval_policy,
+            crate::agent::tool_manifest::ApprovalPolicy::ManualDefault,
+            "original policy must be intact (no always_allow escalation via overwrite)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_client_tools_refuses_cross_source_shadow() {
+        // o80:同名冒名的结构根=覆盖无来源防线——MCP 注册撞上非 MCP 来源
+        // 既有名时显式拒绝(先注册者胜),serve 面与 run/patrol 面两种装配序
+        // 下等价安全,不再依赖注册顺序巧合
+        let (client, _transport) = make_client_with_tool_response().await;
+        let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
+        // 服务代理面先注册(serve 面装配序:服务先、MCP 后)
+        let svc_manifest = crate::agent::tool_manifest::dynamic_manifest(
+            "mcp_fs_read_file",
+            crate::agent::tool_manifest::ToolSource::ServiceProxy,
+            "service proxy tool".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        handler.register(svc_manifest, std::sync::Arc::new(NoopTool));
+        let err = register_client_tools(
+            &mut handler,
+            "fs",
+            &client,
+            &[spec("read_file")],
+            &["read_file".to_string()],
+            60,
+        )
+        .expect_err("MCP tool must not shadow a non-MCP tool of the same name");
+        assert!(err.contains("mcp_fs_read_file"), "{err}");
+        assert!(err.contains("ServiceProxy"), "{err}");
+        // 被顶替面零残影:服务代理条目原样在场
+        assert!(handler.has_tool("mcp_fs_read_file"));
+        let m = handler.manifest("mcp_fs_read_file").unwrap();
+        assert!(matches!(
+            m.spec,
+            crate::agent::tool_manifest::SpecSource::Inline { .. }
+        ));
+    }
+
+    // ===== 执行超时契约(o83):超时=终止,非放弃 =====
+
+    /// 握手可通过、tools/call 永不响应的挂起 server 替身(纯 Rust,无外部依赖):
+    /// 模拟「accept 后握住不回」的缺陷/恶意 server
+    struct HungOnCallTransport {
+        closed: std::sync::atomic::AtomicBool,
+    }
+
+    impl HungOnCallTransport {
+        fn new() -> Self {
+            Self {
+                closed: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::transport::McpTransport for HungOnCallTransport {
+        async fn request(&self, method: &str, _params: Value) -> Result<Value, String> {
+            if method == "initialize" {
+                return Ok(serde_json::json!({
+                    "serverInfo": {"name": "hung", "version": "1"}
+                }));
+            }
+            // tools/call 等:永不响应(server 挂死)
+            std::future::pending().await
+        }
+
+        async fn notify(&self, _method: &str, _params: Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), String> {
+            self.closed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    async fn await_closed(transport: &HungOnCallTransport) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if transport.is_closed() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        transport.is_closed()
+    }
+
+    #[tokio::test]
+    async fn test_adapter_internal_timeout_terminates_transport() {
+        // 适配器内建超时:超时报错且传输被断开(kill 子进程语义),server
+        // 不再带着未完成副作用继续跑
+        let transport = Arc::new(HungOnCallTransport::new());
+        let client = Arc::new(McpClient::connect(transport.clone()).await.unwrap());
+        let adapter = McpToolAdapter::with_timeout(client, "slow".to_string(), 1);
+        let t0 = std::time::Instant::now();
+        let result = adapter.call(&Value::Null).await;
+        assert!(result.is_err(), "hung call must surface as timeout error");
+        assert!(
+            result.unwrap_err().contains("timed out after 1s"),
+            "timeout message must carry the budget"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "timeout must fire near the budget, took {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            await_closed(&transport).await,
+            "timeout must close the transport (terminate the server), not abandon the future"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_execution_timeout_terminates_transport() {
+        // 管道执行超时钩子契约:on_execution_timeout 触发即终止在飞 server
+        // (此前未实现 = 缺省 no-op,执行超时退化为放弃等待)
+        let transport = Arc::new(HungOnCallTransport::new());
+        let client = Arc::new(McpClient::connect(transport.clone()).await.unwrap());
+        let adapter = McpToolAdapter::new(client, "slow".to_string());
+        adapter.on_execution_timeout();
+        assert!(
+            await_closed(&transport).await,
+            "execution-timeout hook must close the transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cli_connect_deadline_bounds_hung_server() {
+        // CLI 路径握手+发现整体受 timeout_secs 约束:永不回 initialize 的
+        // stdio server 在 deadline 处报超时,不再无界拖死 agent 启动。
+        // 真子进程替身:Windows ping(-n 长轮询,stdout 输出非 JSON 行被
+        // reader 逐行丢弃)、Unix sleep(纯静默)——两者都不回协议帧。
+        let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
+        let cfg = crate::config::McpServerConfig {
+            name: "hung-stdio".to_string(),
+            #[cfg(windows)]
+            command: "ping".to_string(),
+            #[cfg(windows)]
+            args: vec!["-n".to_string(), "120".to_string(), "127.0.0.1".to_string()],
+            #[cfg(not(windows))]
+            command: "sleep".to_string(),
+            #[cfg(not(windows))]
+            args: vec!["120".to_string()],
+            env: std::collections::HashMap::new(),
+            disabled: false,
+            timeout_secs: 1,
+            always_allow: vec![],
+            transport: None,
+            url: None,
+            headers: None,
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let result = connect_and_register_one(&mut handler, &cfg).await;
+        let err = result.expect_err("hung stdio server must hit the connect deadline");
+        assert!(err.contains("timed out"), "got: {err}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "deadline must fire near timeout_secs=1, took {:?}",
+            t0.elapsed()
+        );
+        assert!(!handler.has_tool("mcp_hung-stdio_anything"));
     }
 }
