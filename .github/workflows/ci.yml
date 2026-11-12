@@ -110,6 +110,10 @@ jobs:
             name: ubuntu-latest-int-c2
             tests: true
             slice: c2
+          - os: ubuntu-22.04
+            name: ubuntu-latest-pty-c3
+            tests: true
+            slice: c3
           - os: windows-latest
             name: windows-latest
             tests: true
@@ -202,25 +206,32 @@ jobs:
       # and_kill, and the matrix experiment confirmed it (a 44.6s slice with
       # 1658 tests survived; a 293-test slice died 2.8s in, exactly when the
       # alphabetical order reached the pty:: module). The guard is per-job
-      # and not configurable, so ubuntu runs the test surface as seven
-      # matrix slices -- this also localizes any future kill to one slice --
-      # and b4 (the only slice without module filters) skips the pty module,
-      # whose unix forkpty path trips the guard; windows keeps it covered
-      # (ConPTY path, always green). Coverage gap: unix PTY handling has no
-      # CI coverage -- tracked in the observations ledger.
+      # and not configurable, so ubuntu runs the test surface as eight
+      # matrix slices -- this also localizes any future kill to one slice.
+      # b4 skips exactly ONE test by name: pty_full_chain_echo_and_kill is
+      # the only pty-family test that opens a real pty (the other six are
+      # pure logic; skipping by module used to hide them too, incl. the
+      # unix-only shell_discovery_unix_fallback). The real forkpty path is
+      # covered by slice c3, which runs the same full chain INSIDE a docker
+      # container: the guard's process-tree tracking does not reach into
+      # containers (the docker-backend shell_exec tests spawn and reap
+      # children on every ubuntu run without ever tripping it), so the
+      # container gives the unix pty path real CI coverage. Windows keeps
+      # the in-lib test (ConPTY path, always green).
       #   a:  lib runner::+agent::            (1658 tests, green)
       #   b1: lib api::                       (513)
       #   b2: lib builtin_tools::             (432, timeout-terminate family green)
       #   b3: lib mcp::+io_handlers::         (211, node-spawning tests green)
-      #   b4: lib --skip the five prefixes + pty:: (292, exact complement)
+      #   b4: lib --skip five prefixes + the one pty e2e test (exact complement)
       #   c1: integration_test binary         (30 e2e tests)
       #   c2: four small binaries + doc tests (8 e2e tests)
-      # a + b1..b4 cover the whole lib minus pty with no hole. All cargo
-      # args are passed as pwsh array literals: bare tokens after -CargoArgs
-      # get eaten by pwsh's end-of-parameters marker ("--test takes one
-      # argument").
+      #   c3: pty smoke inside docker         (1 e2e test, real forkpty)
+      # a + b1..b4 cover the whole lib minus that one test with no hole.
+      # All cargo args are passed as pwsh array literals: bare tokens after
+      # -CargoArgs get eaten by pwsh's end-of-parameters marker ("--test
+      # takes one argument").
       - name: verify 3/5a test-run lib (slices a/b1-b4)
-        if: matrix.tests && runner.os == 'Linux' && matrix.slice != 'c1' && matrix.slice != 'c2'
+        if: matrix.tests && runner.os == 'Linux' && matrix.slice != 'c1' && matrix.slice != 'c2' && matrix.slice != 'c3'
         shell: pwsh
         run: |
           $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '2'
@@ -234,7 +245,7 @@ jobs:
           } elseif ($slice -eq 'b3') {
             ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','mcp::','io_handlers::'
           } else {
-            ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','--skip','api::','--skip','builtin_tools::','--skip','mcp::','--skip','io_handlers::','--skip','runner::','--skip','agent::','--skip','pty::'
+            ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','--skip','api::','--skip','builtin_tools::','--skip','mcp::','--skip','io_handlers::','--skip','runner::','--skip','agent::','--skip','pty_full_chain_echo_and_kill'
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -277,6 +288,22 @@ jobs:
           $env:CARGO_BUILD_JOBS = '2'
           ./verify.ps1 -Phase test-run -CargoArgs '--test','serve_mcp_smoke'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # slice c3: the real forkpty path, docker-isolated. The guard's
+      # process-tree tracking does not reach into containers (docker-backend
+      # tests spawn and reap children on every ubuntu run without tripping
+      # it), so the full chain that trips it in-process runs inside a plain
+      # ubuntu:22.04 container (same glibc family as the runner build, so
+      # the host-compiled binary executes as-is; the compile itself is a
+      # cache-hit no-op after phase 2/5).
+      - name: verify 3/5g test-run pty smoke (slice c3, docker)
+        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c3'
+        shell: bash
+        run: |
+          CARGO_BUILD_JOBS=2 cargo test --test pty_smoke --no-run
+          BIN=$(find target/debug/deps -maxdepth 1 -name 'pty_smoke-*' -type f -perm -u+x ! -name '*.d' | head -1)
+          echo "pty smoke binary: $BIN"
+          docker run --rm -v "$PWD:/work" -w /work ubuntu:22.04 "$BIN" --test-threads 1 --nocapture
 
       - name: verify 4/5 secret scan
         shell: pwsh
