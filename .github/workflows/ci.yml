@@ -87,13 +87,29 @@ jobs:
             tests: true
             slice: a
           - os: ubuntu-22.04
-            name: ubuntu-latest-lib-b
+            name: ubuntu-latest-lib-b1
             tests: true
-            slice: b
+            slice: b1
           - os: ubuntu-22.04
-            name: ubuntu-latest-lib-c
+            name: ubuntu-latest-lib-b2
             tests: true
-            slice: c
+            slice: b2
+          - os: ubuntu-22.04
+            name: ubuntu-latest-lib-b3
+            tests: true
+            slice: b3
+          - os: ubuntu-22.04
+            name: ubuntu-latest-lib-b4
+            tests: true
+            slice: b4
+          - os: ubuntu-22.04
+            name: ubuntu-latest-int-c1
+            tests: true
+            slice: c1
+          - os: ubuntu-22.04
+            name: ubuntu-latest-int-c2
+            tests: true
+            slice: c2
           - os: windows-latest
             name: windows-latest
             tests: true
@@ -180,69 +196,84 @@ jobs:
 
       # lib guard bypass (2026-11-12): the runner environment's job guard
       # (provjobd, root, visible in the watchdog process table) SIGKILLs the
-      # test tree once the JOB's accumulated test-phase time crosses a
-      # threshold: five runs died at five unrelated test families, the
-      # 22-second runner-module step never died, splitting within the job
-      # still died on the fourth step at ~4 min accumulated test time, and
-      # memory was ample at every kill. The guard is per-job and not
-      # configurable, so ubuntu runs the test surface as three matrix
-      # slices, each job a fresh guard session with a ~1-2 min test phase:
-      #   lib-a: lib tests under runner::/agent:: (~1655 tests, 45s local)
-      #   lib-b: the exact complement (--skip both prefixes, ~1448 tests);
-      #          a union b covers the whole lib with no overlap
-      #   lib-c: the five integration binaries + doc tests
-      # Windows keeps the combined run (it passes in ~8 min).
-      - name: verify 3/5a test-run lib (slices a/b)
-        if: matrix.tests && runner.os == 'Linux' && matrix.slice != 'c'
+      # test tree once the test phase runs too long inside a single job:
+      # five runs died at five unrelated test families, the 22-second
+      # runner-module step never died, splitting within the job still died,
+      # and memory was ample at every kill. The first matrix experiment
+      # pinned the threshold: a 44.6s lib slice (1658 tests) SURVIVED while
+      # an 89s slice (the complement) was SIGKILLed mid-mcp-module -- so the
+      # kill window sits in (45s, 89s) of test-phase time and every slice
+      # must stay under ~35s. The guard is per-job and not configurable, so
+      # ubuntu runs the test surface as seven matrix slices, each job a
+      # fresh guard session:
+      #   a:  lib runner::+agent::            (1658 tests, 44.6s proven)
+      #   b1: lib api::                       (509)
+      #   b2: lib builtin_tools::             (432)
+      #   b3: lib mcp::+io_handlers::         (211, spawn-heaviest)
+      #   b4: lib --skip the five prefixes    (296, exact complement)
+      #   c1: integration_test binary         (30 e2e tests)
+      #   c2: four small binaries + doc tests (8 e2e tests)
+      # a + b1..b4 cover the whole lib with no hole. Windows keeps the
+      # combined run (it passes in ~8 min). All cargo args are passed as
+      # pwsh array literals: bare tokens after -CargoArgs get eaten by
+      # pwsh's end-of-parameters marker ("--test takes one argument").
+      - name: verify 3/5a test-run lib (slices a/b1-b4)
+        if: matrix.tests && runner.os == 'Linux' && matrix.slice != 'c1' && matrix.slice != 'c2'
         shell: pwsh
         run: |
           $env:CARGO_BUILD_JOBS = '2'; $env:RUST_TEST_THREADS = '2'
-          if ('${{ matrix.slice }}' -eq 'a') {
+          $slice = '${{ matrix.slice }}'
+          if ($slice -eq 'a') {
             ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','runner::','agent::'
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } elseif ($slice -eq 'b1') {
+            ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','api::'
+          } elseif ($slice -eq 'b2') {
+            ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','builtin_tools::'
+          } elseif ($slice -eq 'b3') {
+            ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','mcp::','io_handlers::'
           } else {
-            ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','--skip','runner::','--skip','agent::'
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            ./verify.ps1 -Phase test-run -CargoArgs '--lib','--','--skip','api::','--skip','builtin_tools::','--skip','mcp::','--skip','io_handlers::','--skip','runner::','--skip','agent::'
           }
-
-      - name: verify 3/5b test-run integration_test (slice c)
-        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c'
-        shell: pwsh
-        run: |
-          $env:CARGO_BUILD_JOBS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs --test integration_test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: verify 3/5c test-run io_contract_e2e (slice c)
-        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c'
+      - name: verify 3/5b test-run integration_test (slice c1)
+        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c1'
         shell: pwsh
         run: |
           $env:CARGO_BUILD_JOBS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs --test io_contract_e2e
+          ./verify.ps1 -Phase test-run -CargoArgs '--test','integration_test'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: verify 3/5d test-run mcp_gate_atomicity (slice c)
-        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c'
+      - name: verify 3/5c test-run io_contract_e2e (slice c2)
+        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c2'
         shell: pwsh
         run: |
           $env:CARGO_BUILD_JOBS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs --test mcp_gate_atomicity
+          ./verify.ps1 -Phase test-run -CargoArgs '--test','io_contract_e2e'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: verify 3/5e test-run o511_stack_repro (slice c)
-        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c'
+      - name: verify 3/5d test-run mcp_gate_atomicity (slice c2)
+        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c2'
         shell: pwsh
         run: |
           $env:CARGO_BUILD_JOBS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs --test o511_stack_repro
+          ./verify.ps1 -Phase test-run -CargoArgs '--test','mcp_gate_atomicity'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: verify 3/5f test-run serve_mcp_smoke (slice c)
-        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c'
+      - name: verify 3/5e test-run o511_stack_repro (slice c2)
+        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c2'
         shell: pwsh
         run: |
           $env:CARGO_BUILD_JOBS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs --test serve_mcp_smoke
+          ./verify.ps1 -Phase test-run -CargoArgs '--test','o511_stack_repro'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: verify 3/5f test-run serve_mcp_smoke (slice c2)
+        if: matrix.tests && runner.os == 'Linux' && matrix.slice == 'c2'
+        shell: pwsh
+        run: |
+          $env:CARGO_BUILD_JOBS = '2'
+          ./verify.ps1 -Phase test-run -CargoArgs '--test','serve_mcp_smoke'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: verify 4/5 secret scan
@@ -258,7 +289,7 @@ jobs:
           exit $LASTEXITCODE
 
       - name: doc tests
-        if: matrix.tests && (runner.os == 'Windows' || matrix.slice == 'c')
+        if: matrix.tests && (runner.os == 'Windows' || matrix.slice == 'c2')
         run: cargo test --doc
 
   # ==========================================================================
