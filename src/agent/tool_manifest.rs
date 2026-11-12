@@ -13,8 +13,8 @@
 //! 1. 无 manifest 拒绝注册：[`crate::io_handlers::tool_handler::ToolHandler::register`]
 //!    接收 `(manifest, handler)`；按名查不到静态条目且非动态源（服务代理/MCP）
 //!    的注册在启动期 panic（fail-fast）。
-//! 2. 静态层锁定：内置 36 + 规则 59 + delegate 1 + memory 6 的 manifest 为
-//!    静态表（[`static_manifests`]，合计 102）；测试断言数量、名称无重叠、spec 可解析、
+//! 2. 静态层锁定：内置 41 + 规则 60 + delegate 1 + memory 6 的 manifest 为
+//!    静态表（[`static_manifests`]，合计 108）；测试断言数量、名称无重叠、spec 可解析、
 //!    派生视图与旧表快照一致——「union 42 vs 41」类注释漂移机制上不可能再现。
 //! 3. 动态层注册期补全：服务代理与 MCP 在注册期必须产出 spec
 //!    （[`SpecSource::Inline`]）；丢字段即注册失败。
@@ -473,7 +473,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
     }
 }
 
-/// 内置工具 manifest（39 条，与 default_tool_specs 名称集合相等——测试锁）
+/// 内置工具 manifest（41 条，与 default_tool_specs 名称集合相等——测试锁）
 fn builtin_manifests() -> Vec<ToolManifest> {
     use CapDomain::*;
     let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
@@ -766,7 +766,7 @@ const GOVERNANCE_WRITE_TOOLS: &[&str] = &[
     "bundle_import",
 ];
 
-/// P2 裁决在通道的规则工具（原 GOVERNANCE_ADJUDICATION_TOOLS 规则段 19 个；
+/// P2 裁决在通道的规则工具（原 GOVERNANCE_ADJUDICATION_TOOLS 规则段 20 个；
 /// publish_list/publish_queue_get 有写权开关但不走 P2 裁决——读面语义）
 const RULE_P2_ADJUDICATED_TOOLS: &[&str] = &[
     "rule_create",
@@ -942,7 +942,7 @@ fn memory_manifests() -> Vec<ToolManifest> {
     .collect()
 }
 
-/// 全部静态 manifest（105 条；测试锁数量/唯一名/双侧集合相等）
+/// 全部静态 manifest（108 条；测试锁数量/唯一名/双侧集合相等）
 ///
 /// C1 性能收口（PR-3 顺手）：静态表在首次访问后经 OnceLock 缓存——
 /// 构造函数为纯函数（无常量/无环境依赖），行为零变化（调用面拿到的
@@ -1139,10 +1139,30 @@ mod tests {
 
     #[test]
     fn test_static_manifest_names_unique() {
+        // 唯一性必须在 BTreeMap 收拢**之前**对源向量断言:静态表构造按名收拢
+        // (重复名在收拢处被静默吞掉),收拢后查表逐名唯一是构造性同义反复,
+        // 测不出重复注册——同义反复测试的修复面
+        let mut names: Vec<String> = Vec::new();
+        names.extend(builtin_manifests().iter().map(|m| m.name.clone()));
+        names.extend(rule_manifests().iter().map(|m| m.name.clone()));
+        names.push(delegate_manifest().name);
+        names.extend(memory_manifests().iter().map(|m| m.name.clone()));
+        // 数量锁(与模块头「内置 41 + 规则 60 + delegate 1 + memory 6 = 108」
+        // 同源;计数漂移此处当场红)
+        assert_eq!(names.len(), 108, "static manifest count lock");
+        let mut sorted = names.clone();
+        sorted.sort();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(
+            before,
+            sorted.len(),
+            "duplicate static manifest names across source vectors"
+        );
+        // 收拢面照旧唯一(与源面一致;查表路径的行为锁)
         let manifests = all();
-        let names: Vec<&str> = manifests.iter().map(|m| m.name.as_str()).collect();
-        let set: HashSet<&str> = names.iter().copied().collect();
-        assert_eq!(names.len(), set.len(), "manifest names must be unique");
+        let set: HashSet<&str> = manifests.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(manifests.len(), set.len(), "manifest names must be unique");
     }
 
     #[test]
