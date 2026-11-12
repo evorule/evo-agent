@@ -675,7 +675,11 @@ async fn run_judge_command_with_budget(
         Ok(Ok(status)) => {
             let stdout = out_task.await.unwrap_or_default();
             let stderr = err_task.await.unwrap_or_default();
-            Ok(std::process::Output { status, stdout, stderr })
+            Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
         }
         Ok(Err(e)) => Err(format!("judge command spawn failed: {e}")),
         Err(_) => {
@@ -2048,13 +2052,6 @@ pub struct NodeCheckpointReplay {
     pub skipped: HashSet<String>,
 }
 
-/// 从 run 级账本回放粒级检查点,重建恢复种子(fail-closed:计划锚不匹配/
-/// blob 全文缺失/hash 校验不过,一律 Err 拒绝恢复——宁可重跑不可错续)。
-///
-/// 语义注记:计划锚按「采纳匹配、异版跳过」——账内同锚检查点全部采纳,
-/// 其它计划锚的检查点跳过(各归各版本的恢复域;同锚粒无论落在哪个计划
-/// 检查点前后都有效,二次恢复不丢粒级进度);调用方锚定了一个账内不存在的
-/// 版本(匹配数 0 而账内有检查点)=拒绝,防错版本续跑。
 /// task_template 渲染(单遍扫描替换;纯函数可测)
 ///
 /// 单遍扫描:占位符替换为上游结果时,插入内容**不参与**后续匹配——迭代
@@ -2095,6 +2092,13 @@ pub(crate) fn render_task_template(
 /// 全等/冲突判别数据源
 type SeenCheckpoints = std::collections::HashMap<String, (String, String, String)>;
 
+/// 从 run 级账本回放粒级检查点,重建恢复种子(fail-closed:计划锚不匹配/
+/// blob 全文缺失/hash 校验不过,一律 Err 拒绝恢复——宁可重跑不可错续)。
+///
+/// 语义注记:计划锚按「采纳匹配、异版跳过」——账内同锚检查点全部采纳,
+/// 其它计划锚的检查点跳过(各归各版本的恢复域;同锚粒无论落在哪个计划
+/// 检查点前后都有效,二次恢复不丢粒级进度);调用方锚定了一个账内不存在的
+/// 版本(匹配数 0 而账内有检查点)=拒绝,防错版本续跑。
 pub fn replay_node_checkpoints(
     lines: &[JournalLine],
     plan_hash: &str,
@@ -2470,7 +2474,9 @@ mod tests {
 
     #[test]
     fn replay_conflicting_duplicate_checkpoints_refuse_recovery() {
-        use crate::agent::journal::{CheckpointResultRef, JournalEvent, JournalLine, evorule_digest};
+        use crate::agent::journal::{
+            evorule_digest, CheckpointResultRef, JournalEvent, JournalLine,
+        };
         let mk = |node: &str, status: &str, content: &str| JournalLine {
             seq: 0,
             ts: 0,
@@ -2489,11 +2495,17 @@ mod tests {
         };
         // 冲突重复:同节点两检查点内容 hash 分岔 = 账面歧义,拒绝恢复
         // (此前静默取末条,歧义不可见)
-        let lines = vec![mk("n1", "completed", "content-a"), mk("n1", "completed", "content-b")];
+        let lines = vec![
+            mk("n1", "completed", "content-a"),
+            mk("n1", "completed", "content-b"),
+        ];
         let err = replay_node_checkpoints(&lines, "P").unwrap_err();
         assert!(err.contains("conflicting duplicate checkpoints"), "{err}");
         // 全等重复(幂等重检查点):容忍,取该值
-        let lines2 = vec![mk("n1", "completed", "content-a"), mk("n1", "completed", "content-a")];
+        let lines2 = vec![
+            mk("n1", "completed", "content-a"),
+            mk("n1", "completed", "content-a"),
+        ];
         let replay = replay_node_checkpoints(&lines2, "P").unwrap();
         assert_eq!(
             replay.results.get("n1").map(String::as_str),
@@ -4612,13 +4624,10 @@ mod tests {
         // 判据命令挂起原为无界 await——节点无 done 路径,整条 workflow 楔死。
         // 预算到期必须报超时(判据不过形态)且快速返回
         let t0 = std::time::Instant::now();
-        let err = run_judge_command_with_budget(
-            HUNG_JUDGE_CMD,
-            None,
-            std::time::Duration::from_secs(1),
-        )
-        .await
-        .expect_err("hung judge command must hit the budget");
+        let err =
+            run_judge_command_with_budget(HUNG_JUDGE_CMD, None, std::time::Duration::from_secs(1))
+                .await
+                .expect_err("hung judge command must hit the budget");
         assert!(err.contains("timed out"), "{err}");
         assert!(
             t0.elapsed() < std::time::Duration::from_secs(10),

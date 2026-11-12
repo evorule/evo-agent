@@ -492,10 +492,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::io_handlers::tool_handler::ToolFunction for RebindProbeTool {
-        async fn call(
-            &self,
-            _args: &serde_json::Value,
-        ) -> Result<serde_json::Value, String> {
+        async fn call(&self, _args: &serde_json::Value) -> Result<serde_json::Value, String> {
             Ok(serde_json::Value::from("probe"))
         }
     }
@@ -628,7 +625,10 @@ mod tests {
     fn test_registered_tool_names_maps_and_absent_entry_is_empty() {
         // 清除半边数据源:条目在场 = mcp_{server}_{tool} 全集;条目缺席 = 空
         let mgr = McpManager::new();
-        assert!(mgr.registered_tool_names("ghost").is_empty(), "absent entry");
+        assert!(
+            mgr.registered_tool_names("ghost").is_empty(),
+            "absent entry"
+        );
         let tools = vec![
             McpToolSpec {
                 name: "read_file".to_string(),
@@ -644,7 +644,10 @@ mod tests {
         mgr.seed_connected_entry("fs", tools.clone());
         assert_eq!(
             mgr.registered_tool_names("fs"),
-            vec!["mcp_fs_read_file".to_string(), "mcp_fs_write_file".to_string()]
+            vec![
+                "mcp_fs_read_file".to_string(),
+                "mcp_fs_write_file".to_string()
+            ]
         );
         assert_eq!(
             server_tool_registered_names("fs", &tools),

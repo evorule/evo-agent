@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// 长计算触顶——本端点按长计算形态单点放宽(每请求覆盖,不放大全局预算)
 const SERVICE_INVOKE_TIMEOUT_SECS: u64 = 300;
 
-
 /// io_response 提交载荷护栏上限:工具结果经 call_service 回写引擎时,超大
 /// 结果(典型=查询/读取命中海量数据)整体提交会被服务端载荷上限拒收(413),
 /// 引擎侧 io_request 永久悬挂。与消息落库护栏(512KB)同值同构——两条通路

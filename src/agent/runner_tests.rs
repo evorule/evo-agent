@@ -7138,7 +7138,6 @@ async fn tool_result_fetch_reaches_real_executor_via_service_pipeline() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 #[tokio::test]
 async fn tool_result_fetch_direct_intercept_respects_toolkit_membership() {
     // 保留名直拦先于管道,「关闭=下线」语义此前对其不成立——契约面无此

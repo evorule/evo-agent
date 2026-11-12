@@ -805,7 +805,11 @@ pub mod tests {
         // (不再无界缓冲)
         let (pending, rx) = pending_map_with(1);
         let oversized = format!("{{\"id\":1}}{}\n", "a".repeat(MAX_LINE_BYTES + 1));
-        reader_loop(std::io::Cursor::new(oversized.into_bytes()), pending.clone()).await;
+        reader_loop(
+            std::io::Cursor::new(oversized.into_bytes()),
+            pending.clone(),
+        )
+        .await;
         let outcome = rx.await.unwrap();
         assert!(
             outcome.unwrap_err().contains("oversized"),
@@ -819,7 +823,11 @@ pub mod tests {
         // 控制面:限额内的正常帧照常路由(上限不误伤合法流量)
         let (pending, rx) = pending_map_with(7);
         let frame = "{\"id\":7,\"result\":{\"ok\":true}}\n";
-        reader_loop(std::io::Cursor::new(frame.as_bytes().to_vec()), pending.clone()).await;
+        reader_loop(
+            std::io::Cursor::new(frame.as_bytes().to_vec()),
+            pending.clone(),
+        )
+        .await;
         let outcome = rx.await.unwrap();
         assert_eq!(outcome.unwrap()["ok"], serde_json::Value::Bool(true));
     }
