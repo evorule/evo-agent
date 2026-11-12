@@ -8893,19 +8893,7 @@ impl AgentRunner {
                                    },
                                    _ = cancel_token.cancelled() => {
                                        info!("Cancellation requested during streaming, cleaning up");
-                                       if let Err(e) = runner.flush_messages(&session_id).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                       }
-                                       // 取消路径补 sediment(流式镜像)
-                                       if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
-                                       }
-                                       runner.submit_tool_traces(&session_id).await;
                                        let duration = start_time.elapsed().as_millis() as u64;
-                                       // B21:turn_ended(cancelled)
-                                       if let Some(g) = turn_guard.take() {
-                                           g.end("cancelled", step_count as u64, duration);
-                                       }
                                        yield Ok(AgentEvent::Error(AgentError::Internal(
                                            "cancelled by user".to_string(),
                                        )));
@@ -8914,6 +8902,15 @@ impl AgentRunner {
                                            step_count,
                                            duration,
                                        )));
+                                       if let Err(e) = runner.flush_messages(&session_id).await {
+                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                       }
+                                       // 取消路径补 sediment(流式镜像)
+                                       if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                                           tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                                       }
+                                       runner.submit_tool_traces(&session_id).await;
+                                       // B21:turn_ended(cancelled)
                                        return;
                                    }
                                };
@@ -9442,15 +9439,7 @@ impl AgentRunner {
                                                                    tracing::warn!(session_id = %session_id, request_id = rid, error = %e, "submit_io_response (cancel) failed; io_request may hang on engine side");
                                                                }
                                                            }
-                                                           if let Err(e) = runner.flush_messages(&session_id).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                       }
-                                                           runner.submit_tool_traces(&session_id).await;
                                                            let duration = start_time.elapsed().as_millis() as u64;
-                                                           // B21:turn_ended(cancelled)
-                                                           if let Some(g) = turn_guard.take() {
-                                                               g.end("cancelled", step_count as u64, duration);
-                                                           }
                                                            yield Ok(AgentEvent::Error(AgentError::Internal(
                                                                "cancelled by user".to_string(),
                                                            )));
@@ -9459,6 +9448,11 @@ impl AgentRunner {
                                                                step_count,
                                                                duration,
                                                            )));
+                                                           if let Err(e) = runner.flush_messages(&session_id).await {
+                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                       }
+                                                           runner.submit_tool_traces(&session_id).await;
+                                                           // B21:turn_ended(cancelled)
                                                            return;
                                                        }
                                                    };
@@ -10359,14 +10353,7 @@ impl AgentRunner {
                                                        if cancel_token.is_cancelled() {
                                                            // 中断于工具执行/审批等待:规范取消收尾(future 借用已随块结束释放)
                                                            info!(%session_id, "Cancelled during tool execution, cleaning up");
-                                                           if let Err(e) = runner.flush_messages(&session_id).await {
-                                                               tracing::warn!(%session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                                           }
-                                                           runner.submit_tool_traces(&session_id).await;
                                                            let duration = start_time.elapsed().as_millis() as u64;
-                                                           if let Some(g) = turn_guard.take() {
-                                                               g.end("cancelled", step_count as u64, duration);
-                                                           }
                                                            yield Ok(AgentEvent::Error(AgentError::Internal(
                                                                "cancelled by user".to_string(),
                                                            )));
@@ -10375,6 +10362,10 @@ impl AgentRunner {
                                                                step_count,
                                                                duration,
                                                            )));
+                                                           if let Err(e) = runner.flush_messages(&session_id).await {
+                                                               tracing::warn!(%session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                           }
+                                                           runner.submit_tool_traces(&session_id).await;
                                                            return;
                                                        }
                                                        if let Err(e) = runner
