@@ -496,6 +496,13 @@ function handleFrame(f) {
   // 引擎活性触碰:任何帧到达即刷新(心跳停滞提示的判据源)
   lastEngineEventAt.set(Date.now());
   switch (f.type) {
+    case 'SessionResumed': {
+      // 续跑回合会话 id 回填(应用重启/快照重建后 sessionId store 为空——
+      // 不回填则审批提交报「会话未建立」)。静默回填,无 info 打扰。
+      sessionId.set(f.session_id);
+      localStorage.setItem('evo_session_id', f.session_id);
+      break;
+    }
     case 'SessionCreated': {
       sessionId.set(f.session_id);
       localStorage.setItem('evo_session_id', f.session_id);

@@ -300,6 +300,16 @@ async fn handle_ws(
                                        // S4-b:images 旁路透传(空切片零行为变化)
                                        let event_stream = if let Some(sid) = current_session.clone() {
                                            info!(session_id = %sid, "G16: continuation turn");
+                                           // 会话 id 回填帧:续跑回合(应用重启/快照重建后)
+                                           // 前端 sessionId store 为空,审批/回执必须知道
+                                           // 会话 id——加法帧,旧前端忽略(零破坏)
+                                           let _ = send_ws_json(
+                                               &mut sender,
+                                               serde_json::json!({
+                                                   "type": "SessionResumed",
+                                                   "session_id": sid,
+                                               }),
+                                           ).await;
                                            runner.run_continuation(sid, content, images)
                                        } else {
                                            info!("G16: first turn (new session)");

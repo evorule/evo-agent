@@ -2437,7 +2437,6 @@
             ? ` · ${t('{tool} 运行中', { tool: runningTool.name })}${runningToolElapsed ? ` · ${runningToolElapsed}` : ''}`
             : ''}
         </span>
-        <button type="button" class="ls-stop" onclick={interrupt}>{t('中断')}</button>
       </div>
     {/if}
     {#if engineStalled}
