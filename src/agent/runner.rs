@@ -2546,6 +2546,7 @@ impl AgentRunner {
         if let Some(hex) = ref_id
             .strip_prefix("stale-")
             .or_else(|| ref_id.strip_prefix("mech-"))
+            .or_else(|| ref_id.strip_prefix("trim-"))
         {
             if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) {
                 let actual = crate::agent::journal::evorule_digest(&raw);
@@ -3053,8 +3054,32 @@ impl AgentRunner {
                 scan.summary_empty,
             );
         }
+        // 五轮裁定批 G8/G2(B-303):trim 丢弃面 offload("被裁内容必须可查
+        // 可重建"全链闭合件)。落盘 {journal_dir}/tool_results/{trim-*.txt},
+        // 与 stale-/mech- 同族内容寻址;fetch 侧 trim- 前缀 digest 复验同批。
+        let trimmed_block = (|| {
+            let dir = self.journal_dir.as_ref()?;
+            let off = crate::agent::context_window::build_trimmed_offload(dropped)?;
+            let tool_results = dir.join(TOOL_RESULTS_DIR);
+            std::fs::create_dir_all(&tool_results).ok()?;
+            std::fs::write(tool_results.join(format!("{}.txt", off.ref_id)), &off.body).ok()?;
+            Some(crate::agent::context_window::trimmed_messages_block(&off))
+        })();
         let Some(formatted) = summary_text else {
             tracing::debug!(%session_id, "R3: summary skipped (below threshold or empty)");
+            // 五轮裁定批 G8/G2(B-303):below-threshold/空摘要时 trim 丢弃面
+            // 引用块补位——hint 从"知道丢了但拿不回"升级为"可取回"。
+            // 落盘 fail-soft:失败=维持 hint 现状,不阻塞主流程。
+            if let Some(block) = &trimmed_block {
+                for msg in trim_messages {
+                    if let Message::System { content } = msg {
+                        if content.starts_with("[earlier") {
+                            *content = block.clone();
+                            break;
+                        }
+                    }
+                }
+            }
             return Ok(None);
         };
         if let SummarizeOutcome::Generated(meta) = &outcome {
@@ -3111,7 +3136,13 @@ impl AgentRunner {
         for msg in trim_messages {
             if let Message::System { content } = msg {
                 if content.starts_with("[earlier") {
-                    *content = capped_summary;
+                    // G8/B-303:摘要之后附 offload 引用块尾巴——摘要不覆盖
+                    // dropped 原文可取回入口(摘要+原文取回双通道)。尾巴
+                    // ~250B 在 trim 预算 buffer(5%)余量内。
+                    *content = match &trimmed_block {
+                        Some(block) => format!("{capped_summary}\n\n{block}"),
+                        None => capped_summary.clone(),
+                    };
                     break;
                 }
             }

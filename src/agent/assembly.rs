@@ -137,14 +137,17 @@ pub struct BudgetSpec {
     /// 工具输出回喂字符上限（现状 TOOL_RESULT_MAX_CHARS = 48000）
     #[serde(default = "default_tool_result_max_chars")]
     pub tool_result_max_chars: usize,
-    /// 陈旧工具结果发送视图降级声明（可选段;缺省/缺键 = None = 关闭,
-    /// 发送视图与现行为逐字节一致——additive 扩展,不升配方版本）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 陈旧工具结果发送视图降级声明（可选段;五轮裁定批 G2/B-303:缺省/缺键
+    /// = Some(默认参数) = 开启——"被裁内容必须可查可重建"纪律缺省成立;
+    /// 显式 `null` = 关闭（逐字节回退旧行为）。缺省翻转属行为变更,
+    /// 项目方 2026-11-12 裁定留痕于审计 §五）
+    #[serde(default = "default_stale_demotion_enabled")]
     pub stale_result_demotion: Option<StaleDemotionSpec>,
-    /// 机制消息开关声明（可选段;缺省/缺键 = None = 关闭 = 动态区仍嵌
-    /// system prompt 内,组装与现行为逐字节一致——additive 扩展,关闭态
-    /// 不升配方版本;开启态首次生效时升版,γ-4 联调）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 机制消息开关声明（可选段;γ 批 B-268:动态区[记忆分区/Handoff Base/todo]
+    /// 外移为独立机制消息,静态区跨轮字节级稳定 = 被动前缀缓存命中前提）。
+    /// 五轮裁定批 G2/B-303:缺省/缺键 = Some(默认参数) = 开启（前缀缓存收益
+    /// 缺省可得）;显式 `null` = 关闭 = 动态区仍嵌 system prompt 内。
+    #[serde(default = "default_mechanism_messages_enabled")]
     pub mechanism_messages: Option<MechanismMessagesSpec>,
 }
 
@@ -219,6 +222,15 @@ impl Default for StaleDemotionSpec {
     }
 }
 
+/// 五轮裁定批 G2/B-303:两层安全网缺省开启(显式 null 仍可关)
+fn default_stale_demotion_enabled() -> Option<StaleDemotionSpec> {
+    Some(StaleDemotionSpec::default())
+}
+
+fn default_mechanism_messages_enabled() -> Option<MechanismMessagesSpec> {
+    Some(MechanismMessagesSpec::default())
+}
+
 fn default_stale_min_turns() -> usize {
     4
 }
@@ -277,8 +289,8 @@ impl Default for BudgetSpec {
             window_tokens_source: default_window_tokens_source(),
             reserve_for_response_pct: default_reserve_pct(),
             tool_result_max_chars: default_tool_result_max_chars(),
-            stale_result_demotion: None,
-            mechanism_messages: None,
+            stale_result_demotion: default_stale_demotion_enabled(),
+            mechanism_messages: default_mechanism_messages_enabled(),
         }
     }
 }
@@ -1320,19 +1332,38 @@ mod tests {
         assert_eq!(r, AssemblyRecipe::default());
     }
 
-    /// 预算可选段缺省缺键 = None(默认关闭,等价迁移零影响);
-    /// 默认配方序列化不出现该键(关闭面不进配方 JSON)
+    /// 五轮裁定批 G2/B-303:两层安全网缺省开启(缺省/缺键 = Some);
+    /// 序列化面恒显式(Some 输出参数对象,None 输出 null——显式关经
+    /// roundtrip 不语义泄漏回开启)
     #[test]
-    fn test_budget_stale_demotion_absent_by_default() {
+    fn test_budget_safety_nets_on_by_default() {
         let r = AssemblyRecipe::default();
-        assert!(r.budget.stale_result_demotion.is_none());
+        assert!(r.budget.stale_result_demotion.is_some());
+        assert!(r.budget.mechanism_messages.is_some());
         let empty: AssemblyRecipe = serde_json::from_str("{}").unwrap();
-        assert!(empty.budget.stale_result_demotion.is_none());
+        assert!(empty.budget.stale_result_demotion.is_some());
+        assert!(empty.budget.mechanism_messages.is_some());
         let s = serde_json::to_string(&AssemblyRecipe::default()).unwrap();
         assert!(
-            !s.contains("stale_result_demotion"),
-            "默认关闭段不应出现在序列化面"
+            s.contains("stale_result_demotion") && s.contains("mechanism_messages"),
+            "缺省开启段应显式出现在序列化面"
         );
+    }
+
+    /// 显式 null = 关闭(旧行为逐字节回退);roundtrip 不泄漏回开启
+    #[test]
+    fn test_budget_explicit_null_keeps_safety_nets_off() {
+        let off: AssemblyRecipe = serde_json::from_str(
+            r#"{"budget":{"stale_result_demotion":null,"mechanism_messages":null}}"#,
+        )
+        .unwrap();
+        assert!(off.budget.stale_result_demotion.is_none());
+        assert!(off.budget.mechanism_messages.is_none());
+        let s = serde_json::to_string(&off).unwrap();
+        assert!(s.contains("stale_result_demotion\":null"));
+        let round: AssemblyRecipe = serde_json::from_str(&s).unwrap();
+        assert!(round.budget.stale_result_demotion.is_none());
+        assert!(round.budget.mechanism_messages.is_none());
     }
 
     /// StaleDemotionSpec serde 缺省与 Default 同值(min_turns=4/min_bytes=2000)
@@ -2716,17 +2747,24 @@ mod tests {
         r
     }
 
-    /// 缺省不变式:默认配方不带 mechanism_messages(关闭),关闭态
-    /// assemble_split 与 assemble 逐字节一致且机制段 None(动态区仍嵌
-    /// system prompt 内 = 现行为)
+    /// 显式关闭配方夹具(五轮裁定批 G2/B-303:缺省已翻转,显式 null 才是关闭)
+    fn mechanism_off_recipe() -> AssemblyRecipe {
+        let mut r = AssemblyRecipe::default();
+        r.budget.mechanism_messages = None;
+        r
+    }
+
+    /// 缺省不变式(五轮裁定批 G2/B-303):默认配方 mechanism_messages = Some
+    /// (开启);显式关闭态 assemble_split 与 assemble 逐字节一致且机制段 None
+    /// (动态区仍嵌 system prompt 内 = 旧缺省行为)
     #[test]
-    fn test_mechanism_messages_default_off_and_split_disabled_byte_identical() {
+    fn test_mechanism_messages_default_on_and_explicit_off_byte_identical() {
         use crate::agent::memory::{MemoryManager, MemoryRecord};
         assert!(AssemblyRecipe::default()
             .budget
             .mechanism_messages
-            .is_none());
-        let exec = AssemblyExecutor::default_executor();
+            .is_some());
+        let exec = AssemblyExecutor::new(mechanism_off_recipe());
         let mem = MemoryManager::new(
             "b268-off",
             crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080"),
@@ -2884,16 +2922,17 @@ mod tests {
 
     // ===== 批 B-268 γ-4:开启态升版绑定 + 五件验收 =====
 
-    /// 升版绑定开启态:默认配方(关闭)沿用声明版本不升版;开启态次版本
-    /// 号 +1;用户声明版同样按 +1 升(版本面反映实际生效形态)
+    /// 升版绑定开启态(五轮裁定批 G2/B-303 语义):缺省配方(翻转后=开启)
+    /// effective 版本 = 次版本 +1;显式关闭(声明 None)沿用声明版本不升版;
+    /// 用户声明版开启同样按 +1 升(版本面反映实际生效形态)
     #[test]
     fn test_effective_recipe_version_binds_to_enabled_state() {
-        let off = AssemblyExecutor::default_executor();
-        assert_eq!(off.effective_recipe_version(), "recipe-v1.3");
-        let mut on_recipe = mechanism_on_recipe();
-        on_recipe.recipe_version = "recipe-v1.3".to_string();
-        let on = AssemblyExecutor::new(on_recipe);
+        let on = AssemblyExecutor::default_executor();
         assert_eq!(on.effective_recipe_version(), "recipe-v1.4");
+        let mut off_recipe = mechanism_off_recipe();
+        off_recipe.recipe_version = "recipe-v1.3".to_string();
+        let off = AssemblyExecutor::new(off_recipe);
+        assert_eq!(off.effective_recipe_version(), "recipe-v1.3");
         let mut declared = mechanism_on_recipe();
         declared.recipe_version = "recipe-v1.0".to_string();
         let d = AssemblyExecutor::new(declared);

@@ -145,6 +145,51 @@ pub fn demote_stale_tool_results(
     (view, offloads)
 }
 
+/// 五轮裁定批 G8/B-303:trim 丢弃面 offload 产物(`trim-` 前缀内容寻址,
+/// stale-/mech- 同族)。"被裁内容必须可查可重建"纪律的全链闭合件——
+/// trim 丢弃的消息经此落盘可取回,不再对模型永久不可见。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrimmedOffload {
+    /// 引用标识(`trim-{digest hex 段}`,hex 段已过白名单)
+    pub ref_id: String,
+    /// 落盘体(逐条 JSON 行,消息全字段保真)
+    pub body: String,
+    /// 落盘体指纹(evorule-hash 口径;fetch 复验同源)
+    pub digest: String,
+}
+
+/// trim 丢弃消息的确定性 offload 构造(纯函数;同 dropped 同体同 digest):
+/// 体 = 逐条 serde_json 单行(保真含 images/tool_calls 元数据),digest =
+/// evorule_digest(body),ref_id = `trim-{hex 段}`。空列表返回 None。
+pub fn build_trimmed_offload(dropped: &[Message]) -> Option<TrimmedOffload> {
+    if dropped.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = dropped
+        .iter()
+        .map(|m| serde_json::to_string(m).unwrap_or_default())
+        .collect();
+    let body = lines.join("\n");
+    let digest = crate::agent::journal::evorule_digest(&body);
+    let hex_segment = digest.rsplit(':').next().unwrap_or(&digest);
+    let ref_id = format!("trim-{}", sanitize_ref_segment(hex_segment));
+    Some(TrimmedOffload {
+        ref_id,
+        body,
+        digest,
+    })
+}
+
+/// trim 丢弃面引用块(占位 hint 用;fetch 入口指引与 stale-/mech- 同文案纪律)
+pub fn trimmed_messages_block(off: &TrimmedOffload) -> String {
+    format!(
+        "[TRIMMED_MESSAGES]\nref_id: {ref}\nbytes: {bytes}\ndigest: {d}\n(此前的对话轮次已裁剪,原文已落盘。需要原文时调用 tool_result_fetch 工具,按 ref_id 分页读取。)",
+        bytes = off.body.len(),
+        ref = off.ref_id,
+        d = off.digest
+    )
+}
+
 /// 陈旧机制消息发送视图降级(γ 批 B-268,β 同构三条件;确定性纯函数):
 /// 目标 = 首条 System(头部原 system)与最后一条 System(常驻最新机制
 /// 消息)之外的 System 消息。三条件全部满足才降级:①已消费——其后存在
@@ -717,6 +762,52 @@ mod tests {
     use super::*;
     use crate::agent::translator::{ImageData, ToolCall};
     use serde_json::json;
+
+    /// G8/B-303:trim offload 确定性——同输入同 ref_id 同体同指纹;
+    /// 体逐条 JSON 行保真(含 images/tool_calls 元数据)
+    #[test]
+    fn test_trimmed_offload_deterministic_and_faithful() {
+        let dropped = vec![
+            user("第一轮用户输入"),
+            Message::Assistant {
+                content: "助手回复".to_string(),
+                tool_calls: Some(vec![ToolCall {
+                    id: Some("call-1".to_string()),
+                    name: "bash".to_string(),
+                    arguments: serde_json::Value::String("{}".to_string()),
+                }]),
+            },
+        ];
+        let a = build_trimmed_offload(&dropped).expect("非空 dropped 必有 offload");
+        let b = build_trimmed_offload(&dropped).expect("重放一致");
+        assert_eq!(a, b, "同 dropped 同产物(纯函数确定性)");
+        assert!(a.ref_id.starts_with("trim-"));
+        assert!(
+            a.ref_id[5..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "ref_id 段过白名单"
+        );
+        let body_lines: Vec<&str> = a.body.lines().collect();
+        assert_eq!(body_lines.len(), 2, "逐条一行 jsonl");
+        assert!(body_lines[0].contains("第一轮用户输入"), "content 保真");
+        assert!(body_lines[1].contains("call-1"), "tool_calls 元数据保真");
+        let digest_hex = a.digest.rsplit(':').next().unwrap();
+        assert!(a.ref_id.contains(&digest_hex[..digest_hex.len().min(16)]));
+    }
+
+    /// G8/B-303:空 dropped = None;引用块含 ref_id/bytes/digest/取回指引
+    #[test]
+    fn test_trimmed_offload_empty_none_and_block_shape() {
+        assert!(build_trimmed_offload(&[]).is_none());
+        let off = build_trimmed_offload(&[user("hello")]).unwrap();
+        let block = trimmed_messages_block(&off);
+        assert!(block.starts_with("[TRIMMED_MESSAGES]"));
+        assert!(block.contains(&format!("ref_id: {}", off.ref_id)));
+        assert!(block.contains(&format!("bytes: {}", off.body.len())));
+        assert!(block.contains(&off.digest));
+        assert!(block.contains("tool_result_fetch"), "取回入口指引在场");
+    }
 
     fn user(content: &str) -> Message {
         Message::User {
