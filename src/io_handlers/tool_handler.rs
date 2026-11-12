@@ -212,7 +212,10 @@ impl ToolHandler {
     /// 全量重载语义的清除半边：MCP 重载先按来源清空动态条目再重注册，
     /// 「只加不删」的滞留工具（移除的 server/重连失败的 server/工具集
     /// 收缩后的旧名）不再滞留至进程重启。
-    pub fn unregister_source(&mut self, source: crate::agent::tool_manifest::ToolSource) -> Vec<String> {
+    pub fn unregister_source(
+        &mut self,
+        source: crate::agent::tool_manifest::ToolSource,
+    ) -> Vec<String> {
         let map = Arc::make_mut(&mut self.tools);
         let removed: Vec<String> = map
             .iter()

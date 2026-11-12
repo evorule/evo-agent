@@ -156,7 +156,11 @@ async fn run_acceptance_command_with_budget(
         Ok(Ok(status)) => {
             let stdout = out_task.await.unwrap_or_default();
             let stderr = err_task.await.unwrap_or_default();
-            Ok(std::process::Output { status, stdout, stderr })
+            Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
         }
         Ok(Err(e)) => Err(format!("acceptance command spawn failed: {e}")),
         Err(_) => {
@@ -268,10 +272,12 @@ mod tests {
         // 验收命令挂起原为无界 await——判据不返回即不存在 done 路径,task_done
         // 被永久楔死。预算到期必须报超时(fail-visible,按不过形态归因)
         let t0 = std::time::Instant::now();
-        let err =
-            run_acceptance_command_with_budget(HUNG_ACCEPTANCE_CMD, std::time::Duration::from_secs(1))
-                .await
-                .expect_err("hung acceptance command must hit the budget");
+        let err = run_acceptance_command_with_budget(
+            HUNG_ACCEPTANCE_CMD,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("hung acceptance command must hit the budget");
         assert!(err.contains("timed out"), "{err}");
         assert!(
             t0.elapsed() < std::time::Duration::from_secs(10),

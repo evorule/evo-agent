@@ -6107,8 +6107,7 @@ impl AgentRunner {
         // 「关闭=下线」语义:直拦仅在工具确实在契约面注册时生效——
         // agentTools/聚焦面把该工具过滤下线后,保留名不再豁免于开关面,
         // 调用落回管道①查表 fail-visible(tool not found)
-        if tool_name == TOOL_RESULT_FETCH_TOOL
-            && self.tool_handler.has_tool(TOOL_RESULT_FETCH_TOOL)
+        if tool_name == TOOL_RESULT_FETCH_TOOL && self.tool_handler.has_tool(TOOL_RESULT_FETCH_TOOL)
         {
             return Ok((self.execute_tool_result_fetch(args), None));
         }

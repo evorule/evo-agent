@@ -408,16 +408,14 @@ pub fn register_client_tools(
     }
     // ---- 阶段二:统一注册(来源防覆盖防线兜底;阶段一已查碰撞) ----
     for (manifest, func) in prepared {
-        tool_handler
-            .register_guarded(manifest, func)
-            .map_err(|e| {
-                tracing::warn!(
-                    server = %server_name,
-                    error = %e,
-                    "MCP tool registration refused by source guard"
-                );
-                e
-            })?;
+        tool_handler.register_guarded(manifest, func).map_err(|e| {
+            tracing::warn!(
+                server = %server_name,
+                error = %e,
+                "MCP tool registration refused by source guard"
+            );
+            e
+        })?;
     }
     tracing::info!(
         server = %server_name,

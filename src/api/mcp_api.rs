@@ -331,8 +331,7 @@ pub async fn put_servers(
     let mut registered_tools = 0usize;
     {
         let mut toolkit = state.toolkit_lock().write().expect("toolkit lock poisoned");
-        let removed = toolkit
-            .unregister_source(crate::agent::tool_manifest::ToolSource::Mcp);
+        let removed = toolkit.unregister_source(crate::agent::tool_manifest::ToolSource::Mcp);
         if !removed.is_empty() {
             info!(
                 tools_removed = removed.len(),
@@ -669,10 +668,7 @@ mod tests {
         .with_mcp(std::sync::Arc::new(manager), std::sync::Arc::new(store))
     }
 
-    fn seed_mcp_tool(
-        toolkit: &mut crate::io_handlers::tool_handler::ToolHandler,
-        name: &str,
-    ) {
+    fn seed_mcp_tool(toolkit: &mut crate::io_handlers::tool_handler::ToolHandler, name: &str) {
         let m = crate::agent::tool_manifest::dynamic_manifest(
             name,
             crate::agent::tool_manifest::ToolSource::Mcp,
@@ -683,10 +679,7 @@ mod tests {
         toolkit.register(m, std::sync::Arc::new(SeedTool));
     }
 
-    fn seed_svc_tool(
-        toolkit: &mut crate::io_handlers::tool_handler::ToolHandler,
-        name: &str,
-    ) {
+    fn seed_svc_tool(toolkit: &mut crate::io_handlers::tool_handler::ToolHandler, name: &str) {
         let m = crate::agent::tool_manifest::dynamic_manifest(
             name,
             crate::agent::tool_manifest::ToolSource::ServiceProxy,
@@ -728,9 +721,18 @@ mod tests {
             json_request(a, "PUT", "/api/mcp/servers", Some(json!({"servers": []}))).await;
         assert_eq!(status, StatusCode::OK);
         let h = toolkit.read().unwrap();
-        assert!(!h.has_tool("mcp_old_srv_tool_a"), "stale MCP tool must be removed");
-        assert!(!h.has_tool("mcp_old_srv_tool_b"), "stale MCP tool must be removed");
-        assert!(h.has_tool("svc_keep_me"), "non-MCP sources must survive reload");
+        assert!(
+            !h.has_tool("mcp_old_srv_tool_a"),
+            "stale MCP tool must be removed"
+        );
+        assert!(
+            !h.has_tool("mcp_old_srv_tool_b"),
+            "stale MCP tool must be removed"
+        );
+        assert!(
+            h.has_tool("svc_keep_me"),
+            "non-MCP sources must survive reload"
+        );
     }
 
     #[tokio::test]
@@ -765,11 +767,13 @@ mod tests {
         .unwrap();
         let a = app(state);
 
-        let (status, v) =
-            json_request(a, "POST", "/api/mcp/servers/doomed/restart", None).await;
+        let (status, v) = json_request(a, "POST", "/api/mcp/servers/doomed/restart", None).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(
-            v["error"].as_str().unwrap_or("").contains("reconnect failed"),
+            v["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("reconnect failed"),
             "{v}"
         );
         let h = toolkit.read().unwrap();
