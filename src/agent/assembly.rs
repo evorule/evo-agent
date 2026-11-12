@@ -1734,6 +1734,7 @@ mod tests {
             // 夹具代表账本来源条目(带锚);[unanchored] 标注走独立单测
             fact_id: Some(1),
             usage_count: 0,
+            effective_uses: None,
             lifecycle_state: None,
             cause_fact_id: None,
             evidence: None,
@@ -2174,6 +2175,7 @@ mod tests {
             // 夹具代表账本来源条目(带锚);[unanchored] 标注走独立单测
             fact_id: Some(1),
             usage_count: 0,
+            effective_uses: None,
             lifecycle_state: None,
             cause_fact_id: None,
             evidence: None,

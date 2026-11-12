@@ -323,6 +323,10 @@ pub struct MemoryRecord {
     /// 重要性因子=confidence+usage 加成。缺省 0=历史数据）
     #[serde(default)]
     pub usage_count: u32,
+    /// 有效强化次数（频次帽：flush_usage 每次 per-entry 至多 +1，跨 flush
+    /// 累计并随回写持久化；晋升判据读本字段，None=历史数据回退 usage_count）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_uses: Option<u32>,
 }
 
 impl MemoryRecord {
@@ -332,6 +336,7 @@ impl MemoryRecord {
             key: key.to_string(),
             value: value.to_string(),
             usage_count: 0,
+            effective_uses: None,
             lifecycle_state: None,
             timestamp,
             source: None,
@@ -3595,6 +3600,8 @@ impl MemoryManager {
                 for rec in self.cache.values_mut() {
                     if rec.fact_id == Some(*fact_id) {
                         rec.usage_count = rec.usage_count.saturating_add(*inc);
+                        rec.effective_uses =
+                            Some(rec.effective_uses.unwrap_or(0).saturating_add(1));
                         if rec.lifecycle_state.as_deref() == Some("Captured") {
                             rec.lifecycle_state = Some("Reinforced".to_string());
                         }
@@ -3621,6 +3628,33 @@ impl MemoryManager {
         };
         let fact_ids: Vec<u64> = pending.iter().map(|(f, _)| *f).collect();
         let paths = store.paths_by_fact_ids(&fact_ids);
+        // 状态防御(记忆审计 2026-11-13):回写前服务端状态复检——forget 墓碑=同 path
+        // 新版本 Tombstoned 记录,旧镜像回写会覆盖墓碑使已遗忘记忆复活。一次批量
+        // 拉家族前缀,构建 path→最新版 lifecycle 映射;复检失败(fail-open)不阻断
+        // 既有回写语义(batch 自身失败有 pending 回滚兜底)。
+        let mut server_states: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let family_prefix = format!("shared.{}.", self.namespace);
+        match self
+            .evorule_client
+            .get_shared_facts(Some(&family_prefix))
+            .await
+        {
+            Ok(facts) => {
+                for (entry, _) in latest_entries_by_path(facts) {
+                    if let Ok(r) = serde_json::from_value::<MemoryRecord>(entry.value) {
+                        if let Some(st) = &r.lifecycle_state {
+                            server_states.insert(entry.path, st.clone());
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "usage flush: 服务端状态复检不可达,fail-open 继续回写(兜底=batch 失败回滚)"
+            ),
+        }
         let mut batch: Vec<(String, serde_json::Value)> = Vec::new();
         let mut batched: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for (fact_id, inc) in &pending {
@@ -3632,11 +3666,26 @@ impl MemoryManager {
             let Some(cache_key) = cache_key else {
                 continue;
             };
+            // 状态防御:服务端 latest 已是保护态(Tombstoned/Promoted/Archived)
+            // → 跳过回写,增量弃置(墓碑后 usage 无意义;归还 pending 会无限重试)。
+            // 判据与渲染层墓碑过滤(memory.rs audit_recall_section)同源。
+            if let Some(st) = server_states.get(path) {
+                if matches!(st.as_str(), "Tombstoned" | "Promoted" | "Archived") {
+                    tracing::warn!(
+                        fact_id,
+                        path = %path,
+                        state = %st,
+                        "usage flush: 服务端保护态,跳过回写(增量弃置)——防墓碑覆盖复活"
+                    );
+                    continue;
+                }
+            }
             let Some(rec) = self.cache.get_mut(&cache_key) else {
                 tracing::warn!(fact_id, "usage flush: cache 无镜像记录,跳过回写");
                 continue;
             };
             rec.usage_count = rec.usage_count.saturating_add(*inc);
+            rec.effective_uses = Some(rec.effective_uses.unwrap_or(0).saturating_add(1));
             rec.lifecycle_state = Some("Reinforced".to_string());
             // 置信度佐证演化(账本记忆设计档 §4.2,Recipe 缺省关):recall 命中
             // =佐证证据,Δ=+0.05×w_e(来源权威权重);演化随本批版本事实落账
@@ -3836,7 +3885,11 @@ impl MemoryManager {
                 && (rec.key.starts_with("events.") || rec.key.contains(".events."))
             {
                 let conf = rec.confidence.unwrap_or(0.5);
-                if conf >= lc.promote_min_confidence && rec.usage_count >= lc.promote_min_uses {
+                // 频次帽(记忆审计 2026-11-13 定案):晋升判据读「有效强化次数」——
+                // flush_usage 每次 per-entry 至多 +1(单会话多轮累计 usage 不再
+                // 一次 flush 直达阈值);None=历史数据回退 usage_count 旧行为。
+                let eff_uses = rec.effective_uses.unwrap_or(rec.usage_count);
+                if conf >= lc.promote_min_confidence && eff_uses >= lc.promote_min_uses {
                     if gate_enabled {
                         // 治理门开:候选暂不标 Promoted,先经治理写通路提议入账
                         // (回执=资格凭据);失败保持 Captured 留待下次批
@@ -7837,6 +7890,138 @@ mod tests {
         );
         let after = mgr.cache.get("shared::events.e1").unwrap();
         assert_eq!(after.usage_count, 3, "cache 镜像本次已累加(漂移由 B3 对账)");
+    }
+
+    #[tokio::test]
+    async fn test_flush_usage_skips_tombstoned_server_state() {
+        // 状态防御(记忆审计 2026-11-13):forget 墓碑=同 path 新版本 Tombstoned(值非 null),
+        // flush_usage 以旧镜像回写同 path 会覆盖墓碑 → 已遗忘记忆复活。
+        // 修复后:回写前服务端状态复检,服务端 latest=Tombstoned 的条目跳过回写
+        // (增量弃置,不归还 pending)。修复前:无复检直接回写 → 404 失败 → 增量
+        // 归还 pending(既有回滚语义)= 红。
+        let mut server = mockito::Server::new_async().await;
+        let mut mgr = MemoryManager::new("ns", EvoruleApiClient::new(&server.url()));
+        mgr.set_session_id("s1");
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::agent::lexstore::LexStore::open(&dir.path().join("lex.db")).unwrap();
+        store
+            .replace_partition(
+                "shared.ns.events.",
+                &[(1, "shared.ns.events.e1".to_string(), serde_json::json!({}))],
+            )
+            .unwrap();
+        mgr.set_lex_store(std::sync::Arc::new(store));
+        let mut rec = MemoryRecord::new("events.e1", "v", 1);
+        rec.fact_id = Some(1);
+        mgr.cache.insert("shared::events.e1".to_string(), rec);
+        mgr.usage_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(1, 1);
+        // 服务端 latest = Tombstoned 墓碑(version 2)+更老原值(version 1)
+        let tomb = serde_json::json!({
+            "key": "events.e1", "value": "v", "timestamp": 1,
+            "lifecycle_state": "Tombstoned", "fact_id": 2
+        });
+        let older = serde_json::json!({
+            "key": "events.e1", "value": "v", "timestamp": 1, "fact_id": 1
+        });
+        let g = server
+            .mock("GET", "/api/shared/facts")
+            .match_query("prefix=shared.ns.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!([
+                    {"fact_id": 2, "path": "shared.ns.events.e1", "version": 2,
+                     "source_session_id": 0, "value": tomb},
+                    {"fact_id": 1, "path": "shared.ns.events.e1", "version": 1,
+                     "source_session_id": 0, "value": older}
+                ])
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        mgr.flush_usage("s1").await;
+        g.assert_async().await;
+        let pending_empty = mgr
+            .usage_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&1)
+            .is_none();
+        assert!(
+            pending_empty,
+            "服务端墓碑保护:该条目必须跳过回写且增量弃置(修复前:回写 404 归还 pending)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_promotion_uses_effective_uses_cap() {
+        // 频次帽(记忆审计 2026-11-13):单会话多轮累计 usage_count 一次 flush 不得
+        // 直接达晋升阈值——flush 每次 per-entry 有效次数至多 +1,晋升判据改读
+        // effective_uses(缺省回退 usage_count)。
+        // 修复前:usage_count=3 ≥ promote_min_uses=3 → 单次 flush 后即 Promoted = 红。
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        mgr.set_session_id("s1");
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::agent::lexstore::LexStore::open(&dir.path().join("lex.db")).unwrap();
+        store
+            .replace_partition(
+                "shared.ns.events.",
+                &[(1, "shared.ns.events.e1".to_string(), serde_json::json!({}))],
+            )
+            .unwrap();
+        mgr.set_lex_store(std::sync::Arc::new(store));
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut rec = MemoryRecord::new("events.e1", "poisoned", now_ts);
+        rec.fact_id = Some(1);
+        rec.confidence = Some(0.9);
+        rec.source = Some("llm".to_string());
+        mgr.cache.insert("shared::events.e1".to_string(), rec);
+        let recipe = crate::agent::recipe::MemoryRecipe::default();
+        // 单会话 3 轮注入累计(usage_pending 累计 3),会话末一次 flush
+        mgr.usage_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(1, 3);
+        mgr.flush_usage("s1").await;
+        let after = mgr.cache.get("shared::events.e1").unwrap();
+        assert_eq!(after.usage_count, 3, "观测面累计口径不变");
+        assert_eq!(
+            after.effective_uses,
+            Some(1),
+            "频次帽:一次 flush 每 entry 有效次数至多 +1"
+        );
+        mgr.apply_lifecycle_transitions("s1", &recipe).await;
+        let st = mgr
+            .cache
+            .get("shared::events.e1")
+            .unwrap()
+            .lifecycle_state
+            .clone()
+            .unwrap_or_default();
+        assert_ne!(st, "Promoted", "单会话不得直接晋升(修复前红)");
+        // 跨会话累计:3 个会话各 flush 一次 → effective_uses=3 → 晋升照常可达
+        for _ in 0..2 {
+            mgr.usage_pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(1, 3);
+            mgr.flush_usage("s1").await;
+        }
+        mgr.apply_lifecycle_transitions("s1", &recipe).await;
+        let st2 = mgr
+            .cache
+            .get("shared::events.e1")
+            .unwrap()
+            .lifecycle_state
+            .clone()
+            .unwrap_or_default();
+        assert_eq!(st2, "Promoted", "跨会话有效次数达阈后晋升照常可达");
     }
 
     #[tokio::test]
