@@ -5873,8 +5873,11 @@ impl AgentRunner {
         // candidate 工具(返回 proposal)不缓存,留给 call_service 走审批
         if self.config.max_parallel_tools > 1 {
             if let Some(tcs) = &effective_tool_calls {
+                // 缓存键无轮次语义——每轮 call_external 无条件清空（此前仅
+                // 多工具轮清理：单工具轮残留缓存会被后轮同参数调用命中，
+                // 读面返回陈旧内容、写面第二次同参数写被「命中」吞掉）
+                self.parallel_cache_clear();
                 if tcs.len() > 1 {
-                    self.parallel_cache_clear();
                     let _results = self.execute_tools_parallel(session_id, tcs).await;
                     info!(
                         %session_id,
@@ -9816,8 +9819,9 @@ impl AgentRunner {
                                                // candidate 工具(返回 proposal)不缓存,留给 call_service 走审批
                                                if runner.config.max_parallel_tools > 1 {
                                                    if let Some(tcs) = &full_tool_calls {
+                                                       // 缓存键无轮次语义——每轮无条件清空（同上）
+                                                       runner.parallel_cache_clear();
                                                        if tcs.len() > 1 {
-                                                           runner.parallel_cache_clear();
                                                            let _results = runner.execute_tools_parallel(&session_id, tcs).await;
                                                            info!(
                                                                %session_id,

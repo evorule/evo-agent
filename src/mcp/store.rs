@@ -49,16 +49,54 @@ impl McpConfigStore {
         &self.path
     }
 
-    /// 读取生效配置(mcp.toml 存在优先,损坏 warn 落空;不存在回落 fallback)
-    pub fn load(&self) -> McpConfig {
+    /// 读取生效配置(mcp.toml 存在优先;不存在回落 fallback)。
+    ///
+    /// 文件面校验（与 API PUT 面同一套 validate 语义在此处的镜像=结构级
+    /// 约束：server 名唯一+timeout>0——重复名整组覆盖与 timeout=0 不限时
+    /// 的入场路径封堵；API PUT 的完整校验仍在端点层）。解析失败不再静默
+    /// 落空配置：**错误态显式上报**（坏档与没配可区分），由调用方决定
+    /// fail-visible 呈现；文件损坏时回落 fallback 而非空配置（可用性保底）。
+    pub fn load_checked(&self) -> Result<McpConfig, String> {
         match std::fs::read_to_string(&self.path) {
-            Ok(text) => toml::from_str::<McpTomlFile>(&text)
-                .map(|f| f.mcp)
-                .unwrap_or_else(|e| {
-                    tracing::warn!(path = %self.path.display(), error = %e, "mcp.toml parse failed, using empty config");
-                    McpConfig::default()
-                }),
-            Err(_) => self.fallback.clone(),
+            Ok(text) => {
+                let cfg: McpConfig = toml::from_str::<McpTomlFile>(&text)
+                    .map(|f| f.mcp)
+                    .map_err(|e| {
+                        format!(
+                            "mcp.toml parse failed ({}): {e} — fix or remove the file;                              the MCP surface stays on the fallback config meanwhile",
+                            self.path.display()
+                        )
+                    })?;
+                // 结构级约束镜像（与 PUT 面同语义的最小子集）
+                let mut seen = std::collections::HashSet::new();
+                for srv in &cfg.servers {
+                    if !seen.insert(srv.name.clone()) {
+                        return Err(format!(
+                            "mcp.toml has duplicate server name '{}' — remove the                              duplicate entry (later duplicates silently override earlier                              ones, including their trust settings)",
+                            srv.name
+                        ));
+                    }
+                    if srv.timeout_secs == 0 {
+                        return Err(format!(
+                            "mcp.toml server '{}' has timeout_secs = 0 (unbounded);                              set a positive timeout",
+                            srv.name
+                        ));
+                    }
+                }
+                Ok(cfg)
+            }
+            Err(_) => Ok(self.fallback.clone()),
+        }
+    }
+
+    /// 读取生效配置(兼容壳：校验失败 warn+回落 fallback——既有调用方语义)
+    pub fn load(&self) -> McpConfig {
+        match self.load_checked() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(error = %e, "mcp.toml invalid; falling back");
+                self.fallback.clone()
+            }
         }
     }
 
@@ -143,7 +181,9 @@ mod tests {
     }
 
     #[test]
-    fn test_load_corrupt_file_yields_empty() {
+    fn test_load_corrupt_file_is_visible_and_falls_back() {
+        // 行为变更：损坏文件不再静默落空配置（坏档与没配可区分）——
+        // load_checked 显式报错；兼容壳 load() warn 后回落 fallback（可用性保底）
         let tmp = tempfile::tempdir().unwrap();
         let fallback = McpConfig {
             servers: vec![server("fb", "echo")],
@@ -151,8 +191,29 @@ mod tests {
         let s = store(tmp.path(), fallback);
         std::fs::create_dir_all(s.path().parent().unwrap()).unwrap();
         std::fs::write(s.path(), "not [ valid toml {{{{").unwrap();
+        let err = s
+            .load_checked()
+            .expect_err("损坏文件必须显式报错（坏档与没配可区分）");
+        assert!(err.contains("parse failed"), "{err}");
         let loaded = s.load();
-        assert!(loaded.servers.is_empty(), "损坏文件 warn 落空,不回落");
+        assert_eq!(loaded.servers.len(), 1, "兼容壳回落 fallback 保底");
+        assert_eq!(loaded.servers[0].name, "fb");
+    }
+
+    #[test]
+    fn test_load_duplicate_server_and_zero_timeout_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path(), McpConfig::default());
+        std::fs::create_dir_all(s.path().parent().unwrap()).unwrap();
+        let body = "[[mcp.servers]]\n\
+                    name = \"a\"\n\
+                    command = \"x\"\n\
+                    [[mcp.servers]]\n\
+                    name = \"a\"\n\
+                    command = \"y\"\n";
+        std::fs::write(s.path(), body).unwrap();
+        let err = s.load_checked().expect_err("重复 server 名必须拒绝");
+        assert!(err.contains("duplicate"), "{err}");
     }
 
     #[test]
