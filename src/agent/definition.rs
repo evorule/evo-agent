@@ -350,9 +350,10 @@ impl CapabilityBoundary {
         let (root_desc, boundary_rule) = match &self.read_root {
             Some(r) if r != &self.sandbox_root => (
                 format!(
-                    "- 可读根:{}(读面工具 file_read/file_list/search_files/grep_files \
-                     相对该根解析)\n- 可写域:{}(写面工具 file_write/edit_file/file_create/\
-                     file_move/file_delete 相对该根解析)",
+                    "- 可读根:{}(读面工具 file_read/file_list/search_files/grep_files/\
+                     image_load/code_search/read_back 共 7 件,相对该根解析)\n- 可写域:{}\
+                     (写面工具 file_write/edit_file/file_create/file_move/file_delete \
+                     相对该根解析)",
                     r.display(),
                     self.sandbox_root.display()
                 ),
@@ -2757,6 +2758,38 @@ mod tests {
         assert!(seg.contains("session_spawn"));
         assert!(seg.contains("踩坑清单"));
         assert!(seg.contains("续接判据"));
+    }
+
+    #[test]
+    fn awareness_segment_lists_all_read_face_tools() {
+        // 边界文案完整性:读域工具清单须含全部 7 件读面工具(此前只列 4 件,
+        // image_load/code_search/read_back 缺席——LLM 自知边界欠完整)
+        let b = CapabilityBoundary {
+            mode: "read_only".to_string(),
+            sandbox_root: PathBuf::from("D:/evo-agent"),
+            read_root: Some(PathBuf::from("D:/")),
+            tools: vec![
+                "file_read".to_string(),
+                "file_write".to_string(),
+                "image_load".to_string(),
+            ],
+        };
+        let seg = b.awareness_segment();
+        for t in [
+            "file_read",
+            "file_list",
+            "search_files",
+            "grep_files",
+            "image_load",
+            "code_search",
+            "read_back",
+        ] {
+            assert!(
+                seg.contains(t),
+                "awareness segment must mention read tool '{t}'"
+            );
+        }
+        assert!(seg.contains("7 件"), "segment should carry the tool count");
     }
 
     // ===== B 批「读宽写窄」:CapabilityBoundary.read_root 双域语义 =====

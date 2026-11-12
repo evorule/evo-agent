@@ -45,6 +45,17 @@ fn classify(gate: u8) -> LineDisposition {
     }
 }
 
+/// 窄窗重判:首判为丢弃/预记形态时复读一次门状态——输入落定与分类之间
+/// 门恰好翻转回 OPEN(提示窗刚解除)时,该行按 Steering 注入而非丢弃。
+/// 单次复读(无自旋):窗口只在「输入落定→分类」的微秒级窄窗内有效。
+fn classify_with_recheck(first: u8, recheck: u8) -> LineDisposition {
+    let first_class = classify(first);
+    if !matches!(first_class, LineDisposition::Queue) && recheck == GATE_OPEN {
+        return LineDisposition::Queue;
+    }
+    first_class
+}
+
 /// Step-gap steering source: background line reader + queue (step-gap contract
 /// surface: `spawn` + `try_recv`; turn lifecycle methods are REPL-side only).
 pub struct SteeringSource {
@@ -137,7 +148,7 @@ fn reader_loop(tx: Sender<String>, gate: Arc<AtomicU8>, alive: Arc<AtomicBool>) 
         if line.is_empty() {
             continue;
         }
-        match classify(gate.load(Ordering::Acquire)) {
+        match classify_with_recheck(gate.load(Ordering::Acquire), gate.load(Ordering::Acquire)) {
             LineDisposition::Queue => {
                 if tx.send(line.to_string()).is_err() {
                     break; // source dropped
@@ -224,6 +235,33 @@ mod tests {
         assert_eq!(classify(GATE_OPEN), LineDisposition::Queue);
         assert_eq!(classify(GATE_PAUSED), LineDisposition::DropForPrompt);
         assert_eq!(classify(GATE_CLOSED), LineDisposition::QueueAsPrenote);
+    }
+
+    #[test]
+    fn classify_with_recheck_closes_the_narrow_window_loss() {
+        // 门翻转窄窗:首判 PAUSED/CLOSED 而复读时门已回 OPEN(提示窗刚解除)
+        // = 按 Steering 注入,不丢行;门仍 PAUSED/CLOSED = 维持原判;
+        // 首判 OPEN 不受复读影响
+        assert_eq!(
+            classify_with_recheck(GATE_PAUSED, GATE_OPEN),
+            LineDisposition::Queue
+        );
+        assert_eq!(
+            classify_with_recheck(GATE_CLOSED, GATE_OPEN),
+            LineDisposition::Queue
+        );
+        assert_eq!(
+            classify_with_recheck(GATE_PAUSED, GATE_PAUSED),
+            LineDisposition::DropForPrompt
+        );
+        assert_eq!(
+            classify_with_recheck(GATE_CLOSED, GATE_CLOSED),
+            LineDisposition::QueueAsPrenote
+        );
+        assert_eq!(
+            classify_with_recheck(GATE_OPEN, GATE_PAUSED),
+            LineDisposition::Queue
+        );
     }
 
     #[test]
