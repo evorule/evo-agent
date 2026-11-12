@@ -166,8 +166,9 @@ fn build_tool_result_reference(
          digest: {digest}\n\
          path: {rel_path}\n\
          head:\n{head}\n...[head/tail elided {} chars]...\ntail:\n{tail}\n\
-         (完整结果已落盘。需要更多内容时调用 tool_result_fetch 工具,按 ref_id 分页读取。)",
+         (G4/B-307:完整结果已落盘,本消息只含首尾片段——省略的 {} 字符不在上下文中,不取回即永久不可见。需要更多内容时调用 tool_result_fetch 工具,按 ref_id 与 chars 分页读取全部原文。)",
         raw.len(),
+        total_chars.saturating_sub(TOOL_RESULT_REF_HEAD_CHARS + TOOL_RESULT_REF_TAIL_CHARS),
         total_chars.saturating_sub(TOOL_RESULT_REF_HEAD_CHARS + TOOL_RESULT_REF_TAIL_CHARS)
     )
 }
@@ -1258,10 +1259,31 @@ fn context_signal_line(used: usize, budget: usize, window: usize, step: usize) -
         return None;
     }
     Some(format!(
-        "\n\n[context] 窗口使用 {pct}%（输入预算 {}k/{}k），回合 {step}",
+        "[context] 窗口使用 {pct}%（输入预算 {}k/{}k），回合 {step}",
         budget / 1000,
         window / 1000,
     ))
+}
+
+/// G10/五轮裁定批(B-307):窗口信号行注入——发送视图末尾独立 User 提示行
+/// (裁定 A 案;消息形态先例=steering `[steering note]` 同族)。信号是每轮
+/// 变化的瞬态内容,只动发送视图不进权威历史(与 H1 现注入面同纪律);
+/// 首条 System 从此字节级不受信号行影响——长会话最依赖前缀缓存时的
+/// KV 失效根因(审计 G10)自此消除。≤70% 静默零变化。返回是否注入。
+fn push_context_signal(
+    messages_to_send: &mut Vec<Message>,
+    ctx: &ContextWindowManager,
+    step: usize,
+) -> bool {
+    let used = ctx.count(messages_to_send);
+    let Some(line) = context_signal_line(used, ctx.budget(), ctx.window_tokens(), step) else {
+        return false;
+    };
+    messages_to_send.push(Message::User {
+        content: line,
+        images: Vec::new(),
+    });
+    true
 }
 
 /// TODO: doc
@@ -5524,19 +5546,11 @@ impl AgentRunner {
             self.apply_mechanism_demotion(&self.apply_stale_demotion(messages))
         };
 
-        // H1(自主交接设计):窗口余量信号行——每轮请求前按当前发送集计数,
-        // 使用率>70% 才注入(以下静默,纯聚焦信号不强制动作);口径与 G2 裁剪
-        // /agent_api 暴露同源(零第二套计数),回合数=ReAct step。
+        // H1(自主交接设计)+G10(B-307):窗口余量信号行——每轮请求前按当前发送
+        // 集计数,使用率>70% 才注入(以下静默);注入形态=发送视图末尾独立
+        // User 提示行(裁定 A 案,见 push_context_signal 注记)。
         if let Some(ctx) = &self.context_window {
-            let used = ctx.count(&messages_to_send);
-            if let Some(line) = context_signal_line(used, ctx.budget(), ctx.window_tokens(), step) {
-                for msg in &mut messages_to_send {
-                    if let Message::System { content } = msg {
-                        content.push_str(&line);
-                        break;
-                    }
-                }
-            }
+            push_context_signal(&mut messages_to_send, ctx, step);
         }
 
         // G11:注入格式指令到 system prompt(只影响本次请求的 messages_to_send,不改原 messages)
@@ -9298,23 +9312,14 @@ impl AgentRunner {
                                                        }
                                                    }
                                                }
-                                               // H1:窗口余量信号行(与引擎路径同款;此前仅
-                                               // 引擎路径注入,流式主循环缺位=批六清尾补齐)
+                                               // H1:窗口余量信号行(与引擎路径同款;G10/B-307
+                                               // 注入形态=末尾独立 User 行,见 push_context_signal)
                                                if let Some(ctx) = &runner.context_window {
-                                                   let used = ctx.count(&messages_to_send);
-                                                   if let Some(line) = context_signal_line(
-                                                       used,
-                                                       ctx.budget(),
-                                                       ctx.window_tokens(),
+                                                   push_context_signal(
+                                                       &mut messages_to_send,
+                                                       ctx,
                                                        react_round as usize,
-                                                   ) {
-                                                       for msg in &mut messages_to_send {
-                                                           if let Message::System { content } = msg {
-                                                               content.push_str(&line);
-                                                               break;
-                                                           }
-                                                       }
-                                                   }
+                                                   );
                                                }
 
         // policy 档剩余条件复述块注入(每轮

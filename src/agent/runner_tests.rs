@@ -126,8 +126,9 @@ fn test_context_signal_line_threshold_and_format() {
     assert_eq!(context_signal_line(19_600, 28_000, 38_000, 2), None); // 恰 70%
                                                                       // 设计示例口径:73%（输入预算 28k/38k），回合 N
     let line = context_signal_line(20_440, 28_000, 38_000, 7).unwrap(); // 73%
-    assert!(line.starts_with("\n\n"), "信号行以空行前缀追加: {line}");
-    assert!(line.contains("[context] 窗口使用 73%"), "{line}");
+                                                                        // G10/B-307:信号行改为独立 User 消息形态,无拼接空行前缀
+    assert!(!line.starts_with('\n'), "独立消息形态无空行前缀: {line}");
+    assert!(line.starts_with("[context] 窗口使用 73%"), "{line}");
     assert!(line.contains("输入预算 28k/38k"), "{line}");
     assert!(line.contains("回合 7"), "{line}");
     // 边界:71% 出信号
@@ -135,6 +136,55 @@ fn test_context_signal_line_threshold_and_format() {
     // 零预算/零窗口守卫(未配置窗口口径不出信号)
     assert_eq!(context_signal_line(999, 0, 38_000, 1), None);
     assert_eq!(context_signal_line(999, 28_000, 0, 1), None);
+}
+
+/// G10/B-307:信号行注入形态——末尾独立 User 消息,首条 System 字节不动
+/// (前缀缓存前提);≤70% 静默零变化
+#[test]
+fn test_push_context_signal_appends_trailing_user_message() {
+    use crate::agent::context_window::{ContextWindowManager, TrimStrategy};
+    let ctx = ContextWindowManager::with_approx_counter(38_000, 4_000, TrimStrategy::default());
+    let mut view = vec![
+        Message::System {
+            content: "SYSTEM-BYTES-ANCHOR".to_string(),
+        },
+        Message::User {
+            content: "goal".to_string(),
+            images: vec![],
+        },
+    ];
+    // >70%(budget=34000):追加 120KB ASCII 填充(≈30k token>23800)后末尾应有 [context] 行
+    view.push(Message::User {
+        content: "x".repeat(120_000),
+        images: vec![],
+    });
+    assert!(push_context_signal(&mut view, &ctx, 7), ">70% 应出信号");
+    match &view[0] {
+        Message::System { content } => {
+            assert_eq!(
+                content, "SYSTEM-BYTES-ANCHOR",
+                "首条 System 字节不动(前缀缓存前提)"
+            )
+        }
+        other => panic!("首条应为 System,实得 {other:?}"),
+    }
+    match view.last().unwrap() {
+        Message::User { content, images } => {
+            assert!(
+                content.starts_with("[context]"),
+                "末尾独立 User [context] 行: {content}"
+            );
+            assert!(images.is_empty());
+        }
+        other => panic!("末条应为 User,实得 {other:?}"),
+    }
+    // ≤70%:静默零变化
+    let mut quiet = vec![Message::System {
+        content: "S".to_string(),
+    }];
+    let ctx2 = ContextWindowManager::with_approx_counter(38_000, 4_000, TrimStrategy::default());
+    assert!(!push_context_signal(&mut quiet, &ctx2, 1), "低用量静默");
+    assert_eq!(quiet.len(), 1, "静默零变化");
 }
 
 #[test]
@@ -8371,4 +8421,31 @@ async fn g8_without_journal_dir_keeps_hint_unchanged() {
         }
         other => panic!("期望 System hint,实得 {other:?}"),
     }
+}
+
+// ---- 五轮裁定批 G4/B-307: 引用块截断后果说明在场(防文案回退) ----
+
+#[test]
+fn g4_reference_block_carries_truncation_consequence() {
+    // G4:占位块必须让 LLM 知道"省略内容不取回即不可见"——否则引用化后
+    // 不调 fetch 即静默丢信息(审计 G4 的引导闭环面)
+    let raw = format!(
+        "HEAD-{}\n{}\nTAIL-{}",
+        "a".repeat(2500),
+        "y".repeat(60_000),
+        "z".repeat(1500)
+    );
+    let block = build_tool_result_reference(
+        &raw,
+        "call-g4",
+        "audit_get",
+        "tool_results/x.txt",
+        "blake3:abc",
+    );
+    assert!(
+        block.contains("不取回即永久不可见"),
+        "截断后果说明在场: {block}"
+    );
+    assert!(block.contains("tool_result_fetch"), "取回入口在场");
+    assert!(block.contains("chars:"), "分页单位(chars)元数据在场");
 }
