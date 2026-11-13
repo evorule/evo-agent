@@ -686,7 +686,8 @@ pub(crate) fn layerize_stable(
     notices: &mut Vec<String>,
 ) -> (usize, usize, usize) {
     let total = stable.len();
-    let mut resident: Vec<MemoryRecord> = Vec::new();
+    let mut resident_system: Vec<MemoryRecord> = Vec::new();
+    let mut resident_user: Vec<MemoryRecord> = Vec::new();
     let mut recallable: Vec<MemoryRecord> = Vec::new();
     for r in stable.drain(..) {
         let domain = MemoryManager::stable_domain_of(&r.key);
@@ -714,10 +715,12 @@ pub(crate) fn layerize_stable(
                 "stable resident promotion: usage gate met, entry now injected unconditionally"
             );
         }
-        if resident_hit {
-            resident.push(r);
-        } else {
-            recallable.push(r);
+        match domain {
+            // System 段恒居最前：下游 fit_recall 的预算扫描遇 System 域豁免
+            // 不计数——若 User resident 混排在前被切,其后 System 约束同被切
+            StableDomain::System => resident_system.push(r),
+            _ if resident_hit => resident_user.push(r),
+            _ => recallable.push(r),
         }
     }
 
@@ -736,18 +739,20 @@ pub(crate) fn layerize_stable(
         notices.push(format!(
             "memory budget: stable 召回层裁剪 {} 条(常驻 {} 条全保留,绝对帽 {} token)",
             recall_total - cut,
-            resident.len(),
+            resident_system.len() + resident_user.len(),
             policy.stable_cap_tokens
         ));
     }
 
-    let injected_tokens = resident
+    let injected_tokens = resident_system
         .iter()
+        .chain(resident_user.iter())
         .chain(recallable.iter())
         .map(|r| ContextBudget::estimate_tokens(&r.value))
         .sum();
-    let injected = resident.len() + recallable.len();
-    stable.extend(resident);
+    let injected = resident_system.len() + resident_user.len() + recallable.len();
+    stable.extend(resident_system);
+    stable.extend(resident_user);
     stable.extend(recallable);
     (injected, total - injected, injected_tokens)
 }
@@ -1014,12 +1019,20 @@ impl ContextBudget {
         let budget = self.memory_cap();
         let mut used = 0;
 
-        // L2 稳定事实优先（硬注入）
+        // L2 稳定事实优先（硬注入）。System 域条目（安全约束/系统边界）为
+        // 常驻豁免：不占预算计数、永不截断——比例预算小于常驻面本身就是
+        // 配置异常，宁可挤压召回层也不牺牲安全约束（层分注释承诺的兑现：
+        // 「前缀截断只切召回层尾部」）。前提：stable 已过 layerize_stable
+        // （System 段前置；未过该路径时退化为旧行为）。
         let stable_total = recall.stable.len();
+        let mut used = 0;
         let cut_stable = recall
             .stable
             .iter()
             .position(|r| {
+                if MemoryManager::stable_domain_of(&r.key) == StableDomain::System {
+                    return false; // 常驻豁免:不计数、不触发截断
+                }
                 used += Self::estimate_tokens(&r.value);
                 used > budget
             })
@@ -1033,7 +1046,6 @@ impl ContextBudget {
                 budget
             ));
         }
-
         if used > budget {
             if !recall.summaries.is_empty() || !recall.events.is_empty() {
                 recall.degradation_notices.push(format!(
@@ -4986,6 +4998,61 @@ mod tests {
         );
         // llm 高置信高使用也不常驻（常驻晋升只适用 system/user）
         assert_eq!(stable[4].key, "stable.llm.extracted", "llm 层落召回尾部");
+    }
+
+    #[test]
+    fn test_layerize_resident_system_prefix_enforced() {
+        // System 段恒居最前（输入乱序时重排）：下游 fit_recall 的预算扫描
+        // 对 System 域豁免计数——若 User resident 混排在前,预算耗尽时其后
+        // System 安全约束同被切（修复前红=保持输入序,User 在 System 前）。
+        let policy = layerize_policy();
+        let mk = |key: &str, conf: Option<f32>| {
+            let mut r = MemoryRecord::new(key, "内容", 1);
+            r.confidence = conf;
+            r
+        };
+        let mut stable = vec![
+            mk("stable.user.prefs", Some(0.9)), // User resident 在前
+            mk("stable.system.boundary", Some(0.3)),
+        ];
+        let usage = std::collections::HashMap::new();
+        let mut notices = Vec::new();
+        layerize_stable(&mut stable, &usage, &policy, &mut notices);
+        assert_eq!(
+            stable[0].key, "stable.system.boundary",
+            "System 段必须前置（修复前红=stable.user.prefs）"
+        );
+        assert_eq!(stable[1].key, "stable.user.prefs");
+    }
+
+    #[test]
+    fn test_fit_recall_system_domain_exempt_from_budget() {
+        // 小预算下 System 域条目（安全约束）豁免截断；修复前红=position-scan
+        // 全列计数,System 条目 token 计入预算触发截断（安全约束丢失）。
+        let mut recall = RecallContext::default();
+        let mut sys = MemoryRecord::new("stable.system.boundary", &"rule ".repeat(50), 1);
+        sys.confidence = Some(0.3);
+        let mut user_low = MemoryRecord::new("stable.user.pref", &"pref ".repeat(50), 2);
+        user_low.confidence = Some(0.1);
+        recall.stable.push(sys);
+        recall.stable.push(user_low);
+        // total_window=20, ratio=0.25 → memory_cap=5 token
+        let budget = ContextBudget::new(20, 0.25);
+        budget.fit_recall(&mut recall);
+        assert!(
+            recall
+                .stable
+                .iter()
+                .any(|r| r.key == "stable.system.boundary"),
+            "System 域安全约束必须豁免截断（修复前红=被切光）"
+        );
+        assert!(
+            recall
+                .stable
+                .iter()
+                .all(|r| MemoryManager::stable_domain_of(&r.key) == StableDomain::System),
+            "预算内仅保留 System 豁免条目,召回层条目被切"
+        );
     }
 
     #[test]
