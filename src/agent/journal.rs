@@ -733,8 +733,8 @@ pub enum JournalEvent {
         tool: String,
         /// 原文全文字节数
         size_bytes: usize,
-        /// 生效的回喂上限(chars)
-        max_chars: usize,
+        /// 生效的回喂上限(tokens;K-1 案 A 计量口径由 chars 换 token)
+        max_tokens: usize,
         /// 降级原因(journal_disabled | offload_failed)
         reason: String,
     },
@@ -3133,7 +3133,7 @@ mod tests {
             w.write_event(JournalEvent::ToolResultTruncated {
                 tool: "audit_get".into(),
                 size_bytes: 1234567,
-                max_chars: 48000,
+                max_tokens: 12000,
                 reason: "offload_failed".into(),
             })
             .unwrap();
@@ -3145,12 +3145,12 @@ mod tests {
             JournalEvent::ToolResultTruncated {
                 tool,
                 size_bytes,
-                max_chars,
+                max_tokens,
                 reason,
             } => {
                 assert_eq!(tool, "audit_get");
                 assert_eq!(*size_bytes, 1234567);
-                assert_eq!(*max_chars, 48000);
+                assert_eq!(*max_tokens, 12000);
                 assert_eq!(reason, "offload_failed");
             }
             other => panic!("expected tool_result_truncated, got {other:?}"),

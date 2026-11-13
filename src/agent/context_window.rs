@@ -10,9 +10,10 @@
 //!
 //! ## 计数策略
 //!
-//! 默认 `ApproxTokenCounter`,无外部依赖:
-//! - ASCII 字符:4 chars ≈ 1 token
-//! - CJK 字符:1 char ≈ 1 token(中文 1 字 ≈ 1 token 是经验值)
+//! 默认 `ApproxTokenCounter`,无外部依赖(文本计量公共函数
+//! `approx_token_len`,R-3 单源化):
+//! - ASCII 字符:4 chars ≈ 1 token(向下取整)
+//! - 非 ASCII 字符(CJK 为主):1 char ≈ 1 token
 //! - 每条消息固定开销 4 token(role 标签 + 结构分隔符)
 //! - 旁路图片 base64 按 ASCII 同率折算(4 chars ≈ 1 token;媒体载荷
 //!   不计入会让压缩触发对图文消息失明)
@@ -306,23 +307,21 @@ pub trait TokenCounter: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// 近似计数器(无外部依赖,CJK-aware)
+/// 近似计数器(无外部依赖)
 ///
 /// 适用场景:开发/测试/不允许引入 tiktoken 依赖时。
-/// 精度:±15%,对裁剪决策足够。
+/// 精度:±15%,对裁剪决策足够。文本计量统一走公共函数
+/// [`approx_token_len`](R-3 单源化)。
 #[derive(Debug, Clone)]
 pub struct ApproxTokenCounter {
     /// 每条消息的固定开销(role 标签 + 结构分隔符)
     per_message_overhead: usize,
-    /// ASCII 字符→token 比例的倒数(4 = 4 chars/token)
-    ascii_chars_per_token: usize,
 }
 
 impl Default for ApproxTokenCounter {
     fn default() -> Self {
         Self {
             per_message_overhead: 4, // <|im_start|>role\n ... <|im_end|>\n
-            ascii_chars_per_token: 4,
         }
     }
 }
@@ -333,52 +332,37 @@ impl ApproxTokenCounter {
         Self::default()
     }
 
-    /// 估算一段文本的 token 数(CJK-aware)
-    ///
-    /// - CJK 字符(含全角标点、日韩文):1 char ≈ 1 token
-    /// - 其他字符(ASCII / 拉丁):4 chars ≈ 1 token
+    /// 估算一段文本的 token 数(R-3 单源化:转发公共函数
+    /// [`approx_token_len`],与记忆区预算计量同式同码)
     fn count_text(&self, s: &str) -> usize {
-        let mut cjk = 0usize;
-        let mut other = 0usize;
-        for ch in s.chars() {
-            if is_cjk(ch) {
-                cjk += 1;
-            } else {
-                other += 1;
-            }
-        }
-        let ascii_tokens = other / self.ascii_chars_per_token.max(1);
-        // 余数向上取整(零碎字符也算 1 token)
-        let ascii_remainder = if !other.is_multiple_of(self.ascii_chars_per_token.max(1)) {
-            1
-        } else {
-            0
-        };
-        cjk + ascii_tokens + ascii_remainder
+        approx_token_len(s)
     }
 }
 
-/// 判断字符是否属于 CJK(中文/日文/韩文)或全角标点
+/// 近似 token 计量公共函数(R-3 单源化,机制优化修复技术设计 §1.2)
 ///
-/// 这些字符在 BPE 分词后通常 1 char ≈ 1 token。
-fn is_cjk(ch: char) -> bool {
-    let c = ch as u32;
-    // CJK 统一表意文字(常用汉字)
-    (0x4E00..=0x9FFF).contains(&c)
-    // CJK 扩展 A
-    || (0x3400..=0x4DBF).contains(&c)
-    // CJK 兼容表意文字
-    || (0xF900..=0xFAFF).contains(&c)
-    // 平假名
-    || (0x3040..=0x309F).contains(&c)
-    // 片假名
-    || (0x30A0..=0x30FF).contains(&c)
-    // 韩文音节
-    || (0xAC00..=0xD7AF).contains(&c)
-    // 全角标点(CJK Symbols and Punctuation)
-    || (0x3000..=0x303F).contains(&c)
-    // 半角/全角形式
-    || (0xFF00..=0xFFEF).contains(&c)
+/// 唯一实现:序列入口 [`ApproxTokenCounter::count_text`] 与记忆区入口
+/// `ContextBudget::estimate_tokens`(memory.rs)均转发至此,消灭同式异码。
+/// 以 memory.rs 版本为基准统一(记忆区口径是 ME 系列修复的锚定面):
+/// - ASCII:4 chars ≈ 1 token(向下取整,余数不进位);
+/// - 非 ASCII(CJK 为主):1 char ≈ 1 token——消除中文按字节计数导致的
+///   记忆预算系统性超发(实证报告 §3.6a 校准);非 CJK 非 ASCII(emoji/
+///   西文重音等)一并按 1 token/字计,偏保守方向(宁多估不超发)。
+///
+/// 确定性、零依赖、可复现。对外语义文档详见 memory.rs `estimate_tokens`。
+pub(crate) fn approx_token_len(text: &str) -> usize {
+    let mut tokens = 0usize;
+    let mut ascii_run = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii_run += 1;
+        } else {
+            tokens += ascii_run / 4;
+            ascii_run = 0;
+            tokens += 1;
+        }
+    }
+    tokens + ascii_run / 4
 }
 
 impl TokenCounter for ApproxTokenCounter {
@@ -980,13 +964,13 @@ mod tests {
 
     #[test]
     fn test_count_ascii() {
-        // 4 chars ≈ 1 token,per_message_overhead=4,结尾 +3
-        // "hello" = 5 chars → 2 tokens (5/4=1 余 1,向上取整)
+        // 4 chars ≈ 1 token(向下取整),per_message_overhead=4,结尾 +3
+        // "hello" = 5 chars → 1 token (5/4=1,余数不进位)
         let c = ApproxTokenCounter::new();
         let msgs = vec![user("hello")];
         let total = c.count_messages(&msgs);
-        // 4 (overhead) + 2 (text) + 3 (tail) = 9
-        assert_eq!(total, 9);
+        // 4 (overhead) + 1 (text) + 3 (tail) = 8
+        assert_eq!(total, 8);
     }
 
     #[test]
@@ -1004,12 +988,12 @@ mod tests {
         let c = ApproxTokenCounter::new();
         // "你好 hello" = 2 CJK + 6 ASCII (含空格)
         // CJK: 2 tokens
-        // ASCII: 6/4 = 1 余 2 → 2 tokens
-        // 总 text: 4 tokens
+        // ASCII: 6/4 = 1 (向下取整)
+        // 总 text: 3 tokens
         let msgs = vec![user("你好 hello")];
         let total = c.count_messages(&msgs);
-        // 4 (overhead) + 4 (text) + 3 (tail) = 11
-        assert_eq!(total, 11);
+        // 4 (overhead) + 3 (text) + 3 (tail) = 10
+        assert_eq!(total, 10);
     }
 
     #[test]
@@ -1017,12 +1001,12 @@ mod tests {
         let c = ApproxTokenCounter::new();
         let msgs = vec![assistant_with_tool_call("calling", "search")];
         let total = c.count_messages(&msgs);
-        // overhead 4 + content "calling" (7 chars → 2 tokens)
-        // + tool_name "search" (6 chars → 2 tokens)
+        // overhead 4 + content "calling" (7 chars → 1 token)
+        // + tool_name "search" (6 chars → 1 token)
         // + args {"q":"test"} (12 chars → 3 tokens)
         // + tail 3
-        // = 4 + 2 + 2 + 3 + 3 = 14
-        assert_eq!(total, 14);
+        // = 4 + 1 + 1 + 3 + 3 = 12
+        assert_eq!(total, 12);
     }
 
     // ========== 图片旁路 base64 计入测试 ==========
@@ -1041,8 +1025,8 @@ mod tests {
                 data_base64: b64,
             }],
         }];
-        // 4 (overhead) + 2 (text) + 100 (image) + 3 (tail) = 109
-        assert_eq!(c.count_messages(&msgs), 109);
+        // 4 (overhead) + 1 (text) + 100 (image) + 3 (tail) = 108
+        assert_eq!(c.count_messages(&msgs), 108);
     }
 
     /// Tool 变体旁路图同样计入
@@ -1051,15 +1035,15 @@ mod tests {
         let c = ApproxTokenCounter::new();
         let b64 = "QUJD".repeat(100); // 400 chars → 100 tokens
         let msgs = vec![Message::Tool {
-            content: "hi".to_string(),     // 2 chars → 1 token
+            content: "hi".to_string(),     // 2 chars → 0 tokens(向下取整)
             tool_name: "echo".to_string(), // 4 chars → 1 token
             images: vec![ImageData {
                 mime_type: "image/png".to_string(),
                 data_base64: b64,
             }],
         }];
-        // 4 (overhead) + 1 (content) + 1 (tool_name) + 100 (image) + 3 (tail) = 109
-        assert_eq!(c.count_messages(&msgs), 109);
+        // 4 (overhead) + 0 (content) + 1 (tool_name) + 100 (image) + 3 (tail) = 108
+        assert_eq!(c.count_messages(&msgs), 108);
     }
 
     /// 无图消息计数与既有口径逐 token 一致(基线保护)
@@ -1067,7 +1051,7 @@ mod tests {
     fn test_count_without_images_unchanged() {
         let c = ApproxTokenCounter::new();
         let msgs = vec![user("hello")];
-        assert_eq!(c.count_messages(&msgs), 9);
+        assert_eq!(c.count_messages(&msgs), 8);
     }
 
     // ========== ContextWindowManager.trim 测试 ==========
@@ -1320,26 +1304,42 @@ mod tests {
     }
 
     #[test]
-    fn test_is_cjk_basic() {
-        // 汉字
-        assert!(is_cjk('你'));
-        assert!(is_cjk('好'));
-        assert!(is_cjk('世'));
-        assert!(is_cjk('界'));
-        // 平假名
-        assert!(is_cjk('あ'));
-        // 片假名
-        assert!(is_cjk('ア'));
-        // 韩文
-        assert!(is_cjk('한'));
-        // 全角标点
-        assert!(is_cjk('，'));
-        assert!(is_cjk('。'));
-        // ASCII
-        assert!(!is_cjk('a'));
-        assert!(!is_cjk('Z'));
-        assert!(!is_cjk(' '));
-        assert!(!is_cjk('1'));
+    /// R-3:公共计量函数单元测试(ASCII 向下取整 / 非 ASCII 1 token/字)
+    #[test]
+    fn test_approx_token_len_semantics() {
+        // 空串
+        assert_eq!(approx_token_len(""), 0);
+        // ASCII 向下取整(5 chars → 1;余数不进位——与旧 counter 口径差异)
+        assert_eq!(approx_token_len("hello"), 1);
+        assert_eq!(approx_token_len("abcdefghijkl"), 3);
+        // CJK 1 char ≈ 1 token
+        assert_eq!(approx_token_len("你好世界"), 4);
+        // 混排:ascii run 先折算再逐字计非 ASCII
+        assert_eq!(approx_token_len("abc一二"), 2);
+        assert_eq!(approx_token_len("abcd一二efgh"), 1 + 2 + 1);
+        // 非 CJK 非 ASCII(emoji/重音)统一按 1 token/字计(与旧口径差异)
+        assert_eq!(approx_token_len("éé"), 2);
+        assert_eq!(approx_token_len("😀😀"), 2);
+    }
+
+    /// R-3:双入口一致性断言——序列入口(count_text)与记忆区入口
+    /// (ContextBudget::estimate_tokens)对同文本必须等值(同式异码消灭锁)
+    #[test]
+    fn test_approx_token_len_dual_entry_consistency() {
+        let samples = [
+            "",
+            "hello world, plain ascii text for estimation.",
+            "你好世界，上下文预算。",
+            "mixed 你好 ascii and 中文内容 12345.",
+            "émoji 😀 and accented éè.",
+        ];
+        for s in samples {
+            assert_eq!(
+                ApproxTokenCounter::new().count_text(s),
+                crate::agent::memory::ContextBudget::estimate_tokens(s),
+                "dual entry mismatch for {s:?}"
+            );
+        }
     }
 
     /// 集成测试:100 条消息,context_window=8192,验证 trim 后不超 budget

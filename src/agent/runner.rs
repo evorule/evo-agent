@@ -24,7 +24,9 @@ use crate::agent::approval::{
     ApprovalRequest,
 };
 use crate::agent::callback::CallbackChain;
-use crate::agent::context_window::{sanitize_ref_segment, ContextWindowManager, TrimStrategy};
+use crate::agent::context_window::{
+    approx_token_len, sanitize_ref_segment, ContextWindowManager, TrimStrategy,
+};
 use crate::agent::journal::REWIND_BUDGET_LIMIT;
 use crate::builtin_tools::ask_user::{
     parse_ask_user_query, AskUserCallback, AskUserQuery, ASK_USER_TOOL,
@@ -100,35 +102,107 @@ const IO_GUARD_MAX_RETRIES: u32 = 2;
 /// LLM 下轮要么先调用相应工具获取真实结果,要么如实说明未执行该动作
 const IO_GUARD_CORRECTION_PROMPT: &str = "系统输出门禁反馈：上一条收尾输出中包含未实际执行的动作描述（如声称已执行命令、已写入文件或已提交代码，但本会话未调用对应工具）。请修正后重新收尾：要么先调用相应工具获取真实结果，要么如实说明当前未执行该动作、仅作说明性描述。";
 
-/// tool_result 回喂 LLM 前的默认字符上限已配方化
-/// (AssemblyRecipe::default() budget.tool_result_max_chars = 48000,约 12k
-/// tokens,ASCII 口径)
+/// 工具输出回喂 LLM 前的 token 上限已配方化(K-1 案 A token 化迁移)
+/// (AssemblyRecipe budget.tool_result_max_tokens 生效值缺省 12000 ≈ 48K
+/// ASCII 字符/4;旧键 tool_result_max_chars /4 折算,新键优先,生效值
+/// clamp 1000..=100000,取值见 `AssemblyExecutor::tool_result_max_tokens`)
 ///
 /// 单个超大工具输出(整页网页、长日志等)会挤占上下文预算,连带把任务锚点
 /// 从尾部保留区挤出。截断仅作用于回喂 LLM 的 messages 入列值;审计链
 /// persist_message / ToolResult 事件保留原始全文(事实记录不动,与 trim
-/// 不改写原 messages 的哲学一致)。生效值见 `AgentRunner::tool_result_max_chars`。
-/// 截断过长的 tool_result:保留头尾各半,中间插入截断标注;未超限原样归还
-///
-/// 元层先行批:上限由配方 budget.tool_result_max_chars 声明(默认 48000 =
-/// 原 TOOL_RESULT_MAX_CHARS 常量,等价迁移)
-fn truncate_tool_result(raw: String, max_chars: usize) -> String {
-    // 字节长度快路径(字符数 ≤ 字节数,未超字节限必然未超字符限)
-    if raw.len() <= max_chars {
+/// 不改写原 messages 的哲学一致)。
+/// 计量口径:`approx_token_len`(R-3 公共函数;ASCII 4 chars ≈ 1 token 向下
+/// 取整,非 ASCII 1 char ≈ 1 token)——CJK 重内容不再按字符计量超发
+/// (48K 中文字符 ≈ 48K token,在 12K token 上限下必须截断)。
+/// 截断过长的 tool_result:头尾各半按 token 计,中间插入截断标注;标注文案
+/// `[truncated N chars]` 沿用(Q9 冻结邻域不动,N 指被丢弃的字符数);
+/// 未超限原样归还
+fn truncate_tool_result(raw: String, max_tokens: usize) -> String {
+    // 整段估算不超限原样
+    if approx_token_len(&raw) <= max_tokens {
         return raw;
     }
     let total_chars = raw.chars().count();
-    if total_chars <= max_chars {
-        return raw;
+    // 标注预留位按 dropped=total_chars(最大位数)计,保证最终标注文本
+    // 不超预留、输出恒 ≤ 上限;标注 N 填实际丢弃字符数(旧实现按
+    // total-cap 预估,系低估近似——此处精确化,文案形态不变)
+    let marker_reserve = format!("\n...[truncated {} chars]...\n", total_chars);
+    let keep_tokens = max_tokens.saturating_sub(approx_token_len(&marker_reserve));
+    let head_tokens = keep_tokens / 2;
+    let tail_tokens = keep_tokens - head_tokens;
+    let head_end = token_prefix_boundary(&raw, head_tokens);
+    let tail_start = token_suffix_boundary(&raw, tail_tokens);
+    let head_chars = raw[..head_end].chars().count();
+    let tail_chars = raw[tail_start..].chars().count();
+    let dropped = total_chars - head_chars - tail_chars;
+    let marker = format!("\n...[truncated {} chars]...\n", dropped);
+    format!("{}{}{}", &raw[..head_end], marker, &raw[tail_start..])
+}
+
+/// 头部保留边界:使前缀 token 计量 ≤ budget 的最大字符边界
+/// (增量累计与 approx_token_len 的 ASCII run 口径严格一致:ascii 每
+/// 4 字符 +1 token,非 ASCII 字符冲账前置 run 后 +1。零碎 ascii 字符
+/// 不前推边界——头尾与标注拼接时会合并计费,组对齐防超限)
+fn token_prefix_boundary(s: &str, budget_tokens: usize) -> usize {
+    if budget_tokens == 0 {
+        return 0;
     }
-    let truncated = total_chars - max_chars;
-    let marker = format!("\n...[truncated {} chars]...\n", truncated);
-    let keep = max_chars.saturating_sub(marker.chars().count());
-    let head = keep / 2;
-    let tail = keep - head;
-    let head_str: String = raw.chars().take(head).collect();
-    let tail_str: String = raw.chars().skip(total_chars - tail).collect();
-    format!("{}{}{}", head_str, marker, tail_str)
+    let mut tokens = 0usize;
+    let mut ascii_run = 0usize;
+    let mut boundary = 0usize;
+    for (i, ch) in s.char_indices() {
+        if ch.is_ascii() {
+            ascii_run += 1;
+            if ascii_run.is_multiple_of(4) {
+                tokens += 1;
+                if tokens > budget_tokens {
+                    break;
+                }
+                boundary = i + 1;
+            }
+        } else {
+            tokens += ascii_run / 4;
+            ascii_run = 0;
+            tokens += 1;
+            if tokens > budget_tokens {
+                break;
+            }
+            boundary = i + ch.len_utf8();
+        }
+    }
+    boundary
+}
+
+/// 尾部保留边界:使后缀 token 计量 ≤ budget 的最小起始字符边界
+/// (从尾部反向增量累计,口径同 [`token_prefix_boundary`];保证字符边界)
+fn token_suffix_boundary(s: &str, budget_tokens: usize) -> usize {
+    if budget_tokens == 0 {
+        return s.len();
+    }
+    let mut tokens = 0usize;
+    let mut ascii_run = 0usize;
+    let mut boundary = s.len();
+    for (i, ch) in s.char_indices().rev() {
+        if ch.is_ascii() {
+            ascii_run += 1;
+            if ascii_run.is_multiple_of(4) {
+                tokens += 1;
+                if tokens > budget_tokens {
+                    break;
+                }
+                boundary = i;
+            }
+        } else {
+            tokens += ascii_run / 4;
+            ascii_run = 0;
+            tokens += 1;
+            if tokens > budget_tokens {
+                break;
+            }
+            boundary = i;
+        }
+    }
+    boundary
 }
 
 // ---- 超大工具结果引用化出站门 ----
@@ -142,7 +216,9 @@ const TOOL_RESULTS_DIR: &str = "tool_results";
 /// manifest 静态表不加条目(102 数量锁快照不破);发现/契约面由引用块
 /// 尾部指引(「调用 tool_result_fetch 工具,按 ref_id 分页读取」)承载。
 const TOOL_RESULT_FETCH_TOOL: &str = "tool_result_fetch";
-/// 取回单窗缺省 chars(上限=引用化阈值 tool_result_max_chars,窗口不二次引用化)
+/// 取回单窗缺省 chars(上限=引用化阈值的 ASCII 基准折算
+/// tool_result_max_tokens×4,与旧字符口径等价;Cjk 最坏 1 token/char 时
+/// 窗口本身可能触发一次再引用化,引用块头尾恒小于阈值不再嵌套)
 const TOOL_RESULT_FETCH_DEFAULT_CHARS: usize = 20000;
 
 /// 构造超大工具结果的引用块(纯函数;LLM 可见面)。原文完整保留在引用文件,
@@ -1423,8 +1499,10 @@ pub struct AgentRunner {
     max_context_tokens: usize,
     /// 元层先行批:组装执行器(配方驱动的单一组装出口;run/流式两组装点共用)
     assembly: crate::agent::assembly::AssemblyExecutor,
-    /// 工具输出回喂字符上限(配方 budget.tool_result_max_chars;默认 48000)
-    tool_result_max_chars: usize,
+    /// 工具输出回喂 token 上限(配方 budget.tool_result_max_tokens 生效值;
+    /// 缺省 12000 ≈ 48K ASCII 字符/4,旧键折算见
+    /// `AssemblyExecutor::tool_result_max_tokens`)
+    tool_result_max_tokens: usize,
     /// 陈旧工具结果发送视图降级声明(None = 默认关闭——发送视图与现行为
     /// 逐字节一致;Some = 历史中已消费的陈旧工具结果在发送视图降级为占位块,
     /// 原文落盘 tool_results 供 tool_result_fetch 取回,账本原文不动)
@@ -1648,7 +1726,7 @@ impl AgentRunner {
             propose_anchor: None,
             max_context_tokens: 8192,
             assembly: crate::agent::assembly::AssemblyExecutor::default_executor(),
-            tool_result_max_chars: 48_000,
+            tool_result_max_tokens: 12_000,
             stale_demotion: None,
             mechanism_demotion: None,
             token_counter: None,
@@ -2049,7 +2127,7 @@ impl AgentRunner {
         // 事实源)——PR-H4 验收批抽取为 wire_definition_context_window 单一
         // 实现,WS 流式构造路径(construct_runner)复用同源逻辑
         runner.wire_definition_context_window(def.context_window_tokens);
-        runner.tool_result_max_chars = runner.assembly.tool_result_max_chars();
+        runner.tool_result_max_tokens = runner.assembly.tool_result_max_tokens();
         // 陈旧工具结果降级声明(配方可选段;缺省 None = 关闭,行为零变化)
         runner.stale_demotion = runner.assembly.stale_result_demotion().cloned();
         // 机制消息开关声明(配方可选段;缺省 None = 关闭,行为零变化)
@@ -2451,15 +2529,14 @@ impl AgentRunner {
     /// fail-soft:journal 目录未启用或落盘失败时降级为截断回喂(既有行为)。
     /// 未超限原样归还(字节级现行为不变)。
     fn gate_tool_result(&self, raw: String, tool_name: &str, call_id: Option<&str>) -> String {
-        // 快路径:未超限原样(truncate 同口径)
-        if raw.len() <= self.tool_result_max_chars
-            && raw.chars().count() <= self.tool_result_max_chars
-        {
+        // 快路径:整段 token 估算未超限原样(truncate 同口径;K-1 案 A 计量
+        // 由字符换 token——CJK 重内容按 1 token/字计,不再按字符口径超发)
+        if approx_token_len(&raw) <= self.tool_result_max_tokens {
             return raw;
         }
         let Some(dir) = &self.journal_dir else {
             self.record_tool_result_truncated(tool_name, raw.len(), "journal_disabled");
-            return truncate_tool_result(raw, self.tool_result_max_chars);
+            return truncate_tool_result(raw, self.tool_result_max_tokens);
         };
         match self.offload_tool_result(&raw, tool_name, call_id, dir) {
             Ok(reference) => reference,
@@ -2471,7 +2548,7 @@ impl AgentRunner {
                     "tool result offload failed; falling back to truncation"
                 );
                 self.record_tool_result_truncated(tool_name, raw.len(), "offload_failed");
-                truncate_tool_result(raw, self.tool_result_max_chars)
+                truncate_tool_result(raw, self.tool_result_max_tokens)
             }
         }
     }
@@ -2484,7 +2561,7 @@ impl AgentRunner {
             let _ = j.write_event(crate::agent::journal::JournalEvent::ToolResultTruncated {
                 tool: tool_name.to_string(),
                 size_bytes,
-                max_chars: self.tool_result_max_chars,
+                max_tokens: self.tool_result_max_tokens,
                 reason: reason.to_string(),
             });
         }
@@ -2583,10 +2660,12 @@ impl AgentRunner {
             }
         }
         let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        // 上限=引用化阈值的 ASCII 基准折算(tokens×4,与旧字符口径等价;
+        // 保证 ASCII 内容窗口回喂不再触发引用化)
         let max_chars = args
             .get("max_chars")
             .and_then(|v| v.as_u64())
-            .map(|v| (v as usize).min(self.tool_result_max_chars))
+            .map(|v| (v as usize).min(self.tool_result_max_tokens * 4))
             .unwrap_or(TOOL_RESULT_FETCH_DEFAULT_CHARS)
             .max(1);
         let total_chars = raw.chars().count();
@@ -5097,7 +5176,7 @@ impl AgentRunner {
         let propose_anchor = self.propose_anchor.clone();
         let max_context_tokens = self.max_context_tokens;
         let assembly = self.assembly.clone();
-        let tool_result_max_chars = self.tool_result_max_chars;
+        let tool_result_max_tokens = self.tool_result_max_tokens;
         let journal_dir = self.journal_dir.clone();
         let acceptance_command = self.acceptance_command.clone();
         let pipeline_entry = self.pipeline_entry;
@@ -5182,7 +5261,7 @@ impl AgentRunner {
                 propose_anchor: propose_anchor.clone(),
                 max_context_tokens,
                 assembly: assembly.clone(),
-                tool_result_max_chars,
+                tool_result_max_tokens,
                 // 陈旧工具结果降级声明沿链继承(与父 runner 同配方口径;
                 // None = 关闭,子代理行为零变化)
                 stale_demotion: assembly.stale_result_demotion().cloned(),
@@ -7676,7 +7755,7 @@ impl AgentRunner {
                                 std::path::Path::new(B1_IMAGES_DIR),
                             );
                             repair_images = imgs;
-                            truncate_tool_result(cleaned, self.tool_result_max_chars)
+                            truncate_tool_result(cleaned, self.tool_result_max_tokens)
                         }
                         Err(e) => {
                             report.observed += 1;
@@ -7807,7 +7886,7 @@ impl AgentRunner {
 
         let mut messages: Vec<Message> = records
             .into_iter()
-            .filter_map(|rec| rec_to_message(&rec, runner.tool_result_max_chars))
+            .filter_map(|rec| rec_to_message(&rec, runner.tool_result_max_tokens))
             .collect();
 
         // 压缩视图回读(fail-soft):账面带压缩视图时应用折叠复原发送视图,
@@ -10498,7 +10577,7 @@ impl AgentRunner {
                                                            "tool_name": tc.name,
                                                            "result": truncate_tool_result(
                                                                outcome.final_result.to_string(),
-                                                               runner.tool_result_max_chars,
+                                                               runner.tool_result_max_tokens,
                                                            ),
                                                        });
                                                        if let Some(record) = outcome.approval_record {
@@ -11267,7 +11346,7 @@ impl AgentRunner {
                                                    "tool_name": tool_name,
                                                    "result": truncate_tool_result(
                                                        final_result.to_string(),
-                                                       runner.tool_result_max_chars,
+                                                       runner.tool_result_max_tokens,
                                                    ),
                                                });
                                                if let Some(record) = outcome.approval_record {
@@ -11819,8 +11898,9 @@ fn reasoning_opt(s: &str) -> Option<String> {
 /// - assistant 的 tool_calls 反序列化失败(降级为无 tool_calls)
 /// - tool 消息缺少 tool_name
 ///
-/// 元层先行批:max_chars 由调用方从配方生效值传入(runner.tool_result_max_chars)
-fn rec_to_message(rec: &MessageRecord, max_chars: usize) -> Option<Message> {
+/// 元层先行批:上限由调用方从配方生效值传入(runner.tool_result_max_tokens;
+/// K-1 案 A 后计量为 token)
+fn rec_to_message(rec: &MessageRecord, max_tokens: usize) -> Option<Message> {
     match rec.role.as_str() {
         "system" => Some(Message::System {
             content: rec.content.clone(),
@@ -11849,7 +11929,7 @@ fn rec_to_message(rec: &MessageRecord, max_chars: usize) -> Option<Message> {
         "tool" => rec.tool_name.clone().map(|tool_name| {
             // 重建值同样按上限截断:continuation 恢复路径与运行中回喂的 wire
             // 形态保持一致(审计链存瘦身后指纹文本,截断仅作用于回喂 LLM 的值)
-            let content = truncate_tool_result(rec.content.clone(), max_chars);
+            let content = truncate_tool_result(rec.content.clone(), max_tokens);
             Message::Tool {
                 // B1:按 content 中指纹从落盘还原旁路图片(缺失/不匹配降级为空)
                 images: restore_images_from_content(&content, std::path::Path::new(B1_IMAGES_DIR)),

@@ -1804,7 +1804,7 @@ mod tests {
             JournalEvent::ToolResultTruncated {
                 tool: "t".into(),
                 size_bytes: 1,
-                max_chars: 1,
+                max_tokens: 1,
                 reason: "r".into(),
             },
             JournalEvent::ToolEventsElided {
