@@ -27,6 +27,11 @@
 //!    缺席时受信内部通道(sediment→stable.llm)回落 user 身份,server 开
 //!    鉴权则受保护域写入被 403 拒、降级 cache-only。姿态检查零网络动作,
 //!    实际成败计数看运行面 `GET /admin/memory-health`)
+//! ⑨ 摘要两源一致性(Full;B-359,L-2 案 a):最近 session 的压缩视图摘要块
+//!    现算 evorule_digest vs rolling_summary.content_digest 比对——不一致
+//!    Fail(fail-visible,不自动修复);占位块/缺源 Warn/Pass(非 mismatch)。
+//!    三源中的 region_summary_cache 源构造性同源豁免(种子自 view 恢复,
+//!    serve 内存态 CLI 进程不可达;设计档机制优化修复技术设计 §3.2 案 a)。
 //!
 //! 边界纪律:探活为本模块独立实现,不借用 `io_handlers::LlmHandler`(该文件
 //! 零改动);凭据面只出「存在性」,零密钥内容(与 `LlmStatusSnapshot` 脱敏
@@ -38,6 +43,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::config::Config;
+use crate::Message;
 
 // ---------------------------------------------------------------------------
 // 修复指引文案常量(模板唯一来源,入口间不得各写各的)
@@ -196,6 +202,7 @@ pub async fn run_preflight(cfg: &Config, workdir: &Path, scope: PreflightScope) 
         checks.push(check_auth_identity(
             std::env::var("EVORULE_SERVICE_TOKEN").ok(),
         ));
+        checks.push(check_summary_consistency(cfg, workdir).await);
     }
 
     PreflightReport { checks }
@@ -450,6 +457,165 @@ fn stream_endpoint_url(executor_url: &str) -> Option<String> {
         .map(|base| format!("{base}/llm/execute-stream"))
 }
 
+/// ⑨ 两源判定结论(纯函数面;IO 组装层映射到 PreflightCheck)
+enum SummaryCheckVerdict {
+    /// 两源指纹一致
+    Consistent,
+    /// view 侧摘要块仍是占位(LLM 摘要从未落账)——非 mismatch
+    Placeholder,
+    /// view 有摘要而 rolling payload 缺失——非 mismatch(单侧缺账)
+    MissingRolling,
+    /// 两源都在但指纹不等——真不一致
+    Mismatch,
+}
+
+/// ⑨ 判定核心(纯函数,零 I/O,单测面):view 摘要块与 rolling content_digest
+/// 比对。可比性前提:缓存命中/摘要产出后 body[0] 被替换为摘要文本原样
+/// (与 rolling summary_text 字面同文,runner.rs 落账路径亲验),故摘要块
+/// 文本现算 evorule_digest 可与 rolling content_digest 直接比对。
+fn verdict_summary_consistency(
+    view: &crate::agent::runner::CompactionViewRecord,
+    rolling_digest: Option<&str>,
+) -> SummaryCheckVerdict {
+    // 摘要块=replacement 中首个非占位 System 消息(占位形态
+    // "[earlier N messages compacted...]";主动压缩落账顺序=摘要块在区前)
+    let Some(text) = view.replacement.iter().find_map(|m| match m {
+        Message::System { content } if !content.starts_with("[earlier ") => Some(content.as_str()),
+        _ => None,
+    }) else {
+        return SummaryCheckVerdict::Placeholder;
+    };
+    match rolling_digest {
+        None => SummaryCheckVerdict::MissingRolling,
+        Some(d) => {
+            if crate::agent::journal::evorule_digest(text) == d {
+                SummaryCheckVerdict::Consistent
+            } else {
+                SummaryCheckVerdict::Mismatch
+            }
+        }
+    }
+}
+
+/// journal 档目录最新 session 文件名(去 .jsonl 后缀;目录缺失/空档 None;
+/// 与 serve 侧 with_journal_dir 同一定位口径)
+fn latest_session_id(dir: &Path) -> Option<String> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .max_by_key(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        })
+        .and_then(|e| {
+            e.path()
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+}
+
+/// ⑨ 摘要两源一致性(Full;L-2 案 a)
+///
+/// 最近 session 的压缩视图摘要块现算 evorule_digest vs rolling_summary
+/// payload 的 content_digest 比对:不一致 Fail(fail-visible,不自动修复——
+/// 三源 fail-soft 语义保持,报告人裁);占位块 Warn(摘要未落账≠不一致);
+/// 任一源缺失 Pass-with-detail(无账不报)。cache 源构造性同源豁免(种子自
+/// view 恢复,serve 内存态 CLI 进程不可达)。state 读回与 serve 重建读账
+/// 同源(compaction_view/rolling_summary 均 payload 落链),namespace 口径
+/// 与 serve resolve_memory_namespace 同款(default agent 定义,空回落 general)。
+async fn check_summary_consistency(cfg: &Config, workdir: &Path) -> PreflightCheck {
+    const NAME: &str = "summary-consistency";
+    let sessions_dir = workdir.join("data").join("sessions");
+    let Some(session_id) = latest_session_id(&sessions_dir) else {
+        return pass(
+            NAME,
+            format!(
+                "no session journals under {} (nothing to compare)",
+                sessions_dir.display()
+            ),
+        );
+    };
+    let client = crate::api::evorule_client::EvoruleApiClient::with_auth_token(
+        cfg.evorule.base_url.trim_end_matches('/'),
+        if cfg.evorule.api_key.is_empty() {
+            None
+        } else {
+            Some(cfg.evorule.api_key.as_str())
+        },
+    );
+    let state = match client.get_state(&session_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            return warn(
+                NAME,
+                format!("session {session_id}: state unavailable ({e}); consistency not checked"),
+            )
+        }
+    };
+    let agents_dir = if cfg.agents.dir.is_absolute() {
+        cfg.agents.dir.clone()
+    } else {
+        workdir.join(&cfg.agents.dir)
+    };
+    let namespace = crate::agent::definition::AgentDefinitionManager::new(agents_dir)
+        .load(&cfg.agents.default)
+        .ok()
+        .and_then(|d| {
+            if d.memory.namespace.is_empty() {
+                None
+            } else {
+                Some(d.memory.namespace)
+            }
+        })
+        .unwrap_or_else(|| "general".to_string());
+    let view = crate::agent::memory::MemoryManager::compaction_view_from_state(
+        &state,
+        &namespace,
+        &session_id,
+    );
+    let Some(view) = view else {
+        return pass(
+            NAME,
+            format!("session {session_id}: no compaction view (nothing to compare)"),
+        );
+    };
+    let rolling = crate::agent::memory::MemoryManager::rolling_summary_from_state(
+        &state,
+        &namespace,
+        &session_id,
+    );
+    match verdict_summary_consistency(&view, rolling.as_ref().map(|(_, _, _, d)| d.as_str())) {
+        SummaryCheckVerdict::Consistent => pass(
+            NAME,
+            format!("session {session_id}: view summary digest == rolling content_digest"),
+        ),
+        SummaryCheckVerdict::Placeholder => warn(
+            NAME,
+            format!(
+                "session {session_id}: compaction view holds placeholder summary \
+                 (LLM summary never landed); not a mismatch"
+            ),
+        ),
+        SummaryCheckVerdict::MissingRolling => warn(
+            NAME,
+            format!(
+                "session {session_id}: rolling summary payload missing while view holds summary text"
+            ),
+        ),
+        SummaryCheckVerdict::Mismatch => fail(
+            NAME,
+            format!(
+                "session {session_id}: summary digest mismatch between compaction view \
+                 and rolling payload"
+            ),
+            "inspect payload landing paths (__memory__.{ns}.session_{sid}.compaction_view \
+             / .rolling_summary); do not auto-repair (fail-soft semantics)",
+        ),
+    }
+}
+
 fn pass(name: &str, detail: String) -> PreflightCheck {
     PreflightCheck {
         name: name.to_string(),
@@ -484,10 +650,89 @@ fn warn(name: &str, detail: String) -> PreflightCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::journal::evorule_digest;
+    use crate::agent::runner::CompactionViewRecord;
     use crate::config::Config;
 
     fn base_cfg() -> Config {
         Config::default()
+    }
+
+    fn view_with_summary(text: &str) -> CompactionViewRecord {
+        CompactionViewRecord {
+            view_version: "compaction_view/v1".to_string(),
+            kind: "active_compaction".to_string(),
+            region_start_idx: 0,
+            region_end_idx: 2,
+            region_hash: "h".to_string(),
+            replacement: vec![
+                Message::System {
+                    content: text.to_string(),
+                },
+                Message::Tool {
+                    content: "[cleared body]".to_string(),
+                    tool_name: "grep_files".to_string(),
+                    images: Vec::new(),
+                },
+            ],
+            overrides: Vec::new(),
+            generation: 1,
+            at_epoch_ms: 0,
+        }
+    }
+
+    // ⑨ L-2 案 a 判定核心:四分支
+    #[test]
+    fn test_summary_verdict_consistent() {
+        let text = "滚动摘要:用户完成了 X。";
+        let view = view_with_summary(text);
+        assert!(matches!(
+            verdict_summary_consistency(&view, Some(&evorule_digest(text))),
+            SummaryCheckVerdict::Consistent
+        ));
+    }
+
+    #[test]
+    fn test_summary_verdict_mismatch() {
+        let view = view_with_summary("滚动摘要:用户完成了 X。");
+        assert!(matches!(
+            verdict_summary_consistency(&view, Some("blake3:deadbeef")),
+            SummaryCheckVerdict::Mismatch
+        ));
+    }
+
+    #[test]
+    fn test_summary_verdict_placeholder_is_not_mismatch() {
+        // 摘要从未落账:占位块 → Placeholder(Warn 级,不 fail)
+        let view =
+            view_with_summary("[earlier 3 messages compacted due to context window pressure]");
+        assert!(matches!(
+            verdict_summary_consistency(&view, Some("blake3:whatever")),
+            SummaryCheckVerdict::Placeholder
+        ));
+    }
+
+    #[test]
+    fn test_summary_verdict_missing_rolling_is_not_mismatch() {
+        // 单侧缺账:rolling payload 缺失 → MissingRolling(Warn 级,不 fail)
+        let view = view_with_summary("滚动摘要文本。");
+        assert!(matches!(
+            verdict_summary_consistency(&view, None),
+            SummaryCheckVerdict::MissingRolling
+        ));
+    }
+
+    #[test]
+    fn test_latest_session_id_picks_jsonl_and_skips_empty_dir() {
+        // 空/缺失目录 → None
+        let empty = std::env::temp_dir().join(format!("evo-pf-{}", std::process::id()));
+        assert_eq!(latest_session_id(&empty), None);
+        // 单档 → 该档 stem;非 jsonl 不入选
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join("s1.jsonl"), "{}").unwrap();
+        std::fs::write(empty.join("notes.txt"), "x").unwrap();
+        assert_eq!(latest_session_id(&empty).as_deref(), Some("s1"));
+        std::fs::remove_dir_all(&empty).ok();
     }
 
     fn dead_url(port: u16, path: &str) -> String {
@@ -584,7 +829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_full_eight_checks_order() {
+    async fn test_full_checks_order() {
         let mut cfg = base_cfg();
         cfg.evorule.base_url = dead_url(1, "");
         cfg.llm.executor_url = dead_url(1, "/llm/execute");
@@ -602,6 +847,7 @@ mod tests {
                 "workdir-writable",
                 "llm-stream-endpoint",
                 "trusted-channel-identity",
+                "summary-consistency",
             ]
         );
         assert!(report.has_fail());

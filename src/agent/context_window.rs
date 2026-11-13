@@ -134,6 +134,7 @@ fn is_authentic_offload_block(content: &str, marker: &str) -> bool {
 ///   tool_result_fetch 按 ref_id 分页取回;
 /// - `compaction`:主动压缩清引用,原文完整留存会话 journal 的 tool_result
 ///   事件(审计链),ref_id 槽位为 `-`,不走 fetch。
+///
 /// 旧形态 `[STALE_TOOL_RESULT]`/`[cleared: 工具名]` 只读兼容:占位符是纯
 /// 文本回放(重建面无解析),fetch 按 ref_id 驱动与占位符形态无关——旧条目
 /// 继续可取回,新形态仅未来条目产生,永不回写旧数据。
