@@ -4515,10 +4515,11 @@ async fn agent_memory_evidence(
         .load(&agent_type)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    // 2. 构造 MemoryManager（带 session_id,供 audit verify）
-    let memory =
-        crate::agent::memory::MemoryManager::new(&agent_type, state.evorule_client.clone())
-            .with_session_id(&params.session_id);
+    // 2. 构造 MemoryManager（namespace 与主链同口径——def.memory.namespace,
+    //    非 agent_type 直作 namespace;两者不等时旧写法结构性空召回）
+    let namespace = resolve_memory_namespace(&state, &agent_type);
+    let memory = crate::agent::memory::MemoryManager::new(&namespace, state.evorule_client.clone())
+        .with_session_id(&params.session_id);
 
     // 3. scope 解析
     let scope = match params.scope.as_str() {
@@ -4547,15 +4548,21 @@ async fn agent_memory_recall(
         .load(&agent_type)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    // 2. 构造 MemoryManager
-    let memory =
-        crate::agent::memory::MemoryManager::new(&agent_type, state.evorule_client.clone());
+    // 2. 构造 MemoryManager（namespace 与主链同口径——def.memory.namespace）
+    let namespace = resolve_memory_namespace(&state, &agent_type);
+    let memory = crate::agent::memory::MemoryManager::new(&namespace, state.evorule_client.clone());
 
-    // 3. 参数缺省（走 AgentDefinition.memory 配置）
+    // 3. 参数缺省（走 AgentDefinition.memory 配置;显式传入 clamp 到工具面
+    //    同款上限,防端点侧无上限拉爆召回）
+    const RECALL_LIMIT_MAX: usize = 100;
     let max_summaries = params
         .max_summaries
-        .unwrap_or(def.memory.max_session_summaries);
-    let max_events = params.max_events.unwrap_or(def.memory.max_injected_events);
+        .unwrap_or(def.memory.max_session_summaries)
+        .min(RECALL_LIMIT_MAX);
+    let max_events = params
+        .max_events
+        .unwrap_or(def.memory.max_injected_events)
+        .min(RECALL_LIMIT_MAX);
 
     // 4. recall（with_evidence=true 时走 C2 带证据路径）
     let ctx = if params.with_evidence.unwrap_or(false) {
