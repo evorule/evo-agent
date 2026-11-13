@@ -8217,10 +8217,32 @@ async fn rebuild_applies_compaction_view_and_records_delta() {
     );
     // 摘要缓存种子:主动压缩视图携带的摘要文本按区哈希回填(重建零重算)
     let cache = runner.region_summary_cache.lock().unwrap();
-    assert_eq!(
-        cache.get("region-hash-seed").map(String::as_str),
-        Some("[earlier conversation summary] cached digest")
-    );
+    assert!(cache.iter().any(|(k, v)| {
+        k == "region-hash-seed" && v == "[earlier conversation summary] cached digest"
+    }));
+}
+
+#[tokio::test]
+async fn region_summary_cache_is_bounded_fifo() {
+    // 容量语义:256 上限 FIFO 淘汰;同 hash 重复写=原位替换不增容。
+    // (修复前 HashMap 无界增长,长驻进程内存泄漏)
+    let server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let runner = AgentRunner::new(AgentConfig::default(), client.clone());
+    for i in 0..300 {
+        runner.cache_region_summary(&format!("h{i}"), &format!("s{i}"));
+    }
+    {
+        let cache = runner.region_summary_cache.lock().unwrap();
+        assert_eq!(cache.len(), 256, "超出容量必须淘汰");
+        assert!(!cache.iter().any(|(k, _)| k == "h0"), "最老条目 FIFO 淘汰");
+        assert!(cache.iter().any(|(k, _)| k == "h299"), "最新条目在位");
+    }
+    runner.cache_region_summary("h299", "s299-v2");
+    runner.cache_region_summary("h299", "s299-v3");
+    let cache = runner.region_summary_cache.lock().unwrap();
+    assert_eq!(cache.len(), 256, "同 hash 重复写不增容");
+    assert!(cache.iter().any(|(k, v)| k == "h299" && v == "s299-v3"));
 }
 
 #[tokio::test]
