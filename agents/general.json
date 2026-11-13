@@ -104,7 +104,8 @@
     "lex_store": "data/lex/general.db",
     "recipe": {
       "retrieval": {
-        "variant_dedupe": true
+        "variant_dedupe": true,
+        "normalize_attributes": true
       },
       "tools": {
         "expose": ["memory_search", "memory_get"]

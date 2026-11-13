@@ -44,6 +44,12 @@ pub struct RetrievalConfig {
     /// 变化）。缺省 false=既有行为零影响（缺省不变式）。
     #[serde(default)]
     pub variant_dedupe: bool,
+    /// 提取端写前归并（D2-二期，B-370）：sediment 稳定事实落库前按
+    /// (语义首段, 归一属性) 对齐既有活跃事实，命中即复用既有 path 新版本
+    /// 覆写（同 path 裁定链自动生效）；同极性值差异打 conflict 标记不自动
+    /// supersede。缺省 false=既有行为零影响（缺省不变式）。
+    #[serde(default)]
+    pub normalize_attributes: bool,
     /// 半衰期（天）：情景/语义分型
     #[serde(default = "default_half_life")]
     pub half_life_days: HalfLifeDays,
@@ -408,6 +414,7 @@ impl Default for MemoryRecipe {
                 w_confidence: default_w_confidence(),
                 w_usage: default_w_usage(),
                 variant_dedupe: false,
+                normalize_attributes: false,
                 w_authority: 0.0,
                 w_entity: 0.0,
                 usage_cap: default_usage_cap(),

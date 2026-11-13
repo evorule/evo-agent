@@ -25,7 +25,9 @@
 use crate::agent::audited_llm::AuditedLlm;
 use crate::agent::journal::{JournalEvent, JournalLine};
 use crate::agent::json_repair::from_str_with_repair;
-use crate::agent::memory::{MemoryManager, MemoryRecord, MemoryScope, PersistOutcome};
+use crate::agent::memory::{
+    latest_entries_by_path, MemoryManager, MemoryRecord, MemoryScope, PersistOutcome,
+};
 use crate::agent::memory_event::event::{EventSource, EventType, MemoryEvent};
 use crate::agent::memory_event::extraction::{extract_json_from_text, EventExtractor};
 use crate::agent::summarizer::ContextSummarizer;
@@ -145,6 +147,10 @@ pub struct SedimentResult {
     /// 仅本地 cache 的稳定事实 key 列表（持久化失败 CacheOnly，
     /// 不计入 stable_facts 防虚报成功；由 B3 对账补偿）
     pub stable_facts_cache_only: Vec<String>,
+    /// 写前归并冲突标记（D2-二期，B-370）：复用既有 path 但值不同的
+    /// (语义首段, 归一属性) 列表——同极性值不自动 supersede（多位置部署
+    /// 两值可同真），落账进治理观察面
+    pub merge_conflicts: Vec<String>,
     /// 提取并写入共享账本的事件 ID 列表（R07/E17 接线后实际填充）
     pub events: Vec<String>,
     /// 写入共享账本的知识候选 event_id 列表
@@ -213,6 +219,116 @@ fn tool_claim_rejected(key: &str, value: &str, registry: &[String]) -> bool {
     !registry_lower.iter().any(|t| value_lower.contains(t))
 }
 
+/// 属性词规范化（D2-二期，B-370）：从 fact.key 尾段提取归一属性词。
+///
+/// - 剥修饰前缀（true_/real_/current_/effective_/actual_，单遍）；
+/// - 单复数归一（仅复数→单数方向，len>3 防误伤）；
+/// - 等价表（数据驱动，首版仅收观测实证的 location/place——扩表须走
+///   MEMORY-FEEDBACK 实证，禁拍脑袋扩）；
+/// - **fail-safe：不在表内的词返回 None=永不归并**（未知形态宁可不合并）。
+pub(crate) fn normalize_attribute(tail: &str) -> Option<String> {
+    let mut w = tail.trim().to_ascii_lowercase();
+    for p in ["true_", "real_", "current_", "effective_", "actual_"] {
+        if let Some(rest) = w.strip_prefix(p) {
+            w = rest.to_string();
+            break;
+        }
+    }
+    if w.len() > 3 && w.ends_with('s') {
+        w.pop();
+    }
+    ATTRIBUTE_EQUIV
+        .iter()
+        .find(|(k, _)| *k == w)
+        .map(|(_, v)| v.to_string())
+}
+
+const ATTRIBUTE_EQUIV: &[(&str, &str)] = &[("location", "location"), ("place", "location")];
+
+/// 语义首段（与 memory 侧召回聚簇同构）：剥 B5 域包装
+/// （stable.llm.{model}.——model 恒单路径段）后取首个 `.` 前段。
+fn semantic_head(key: &str) -> &str {
+    let mut s = key;
+    if let Some(rest) = s.strip_prefix("stable.") {
+        s = rest;
+    }
+    if let Some(rest) = s.strip_prefix("llm.") {
+        if let Some(dot) = rest.find('.') {
+            s = &rest[dot + 1..]; // 剥 model 段
+        }
+    }
+    s.split('.').next().unwrap_or(s)
+}
+
+fn semantic_tail(key: &str) -> &str {
+    key.rsplit('.').next().unwrap_or(key)
+}
+
+/// 值形态粗判（防误合并护栏之一）：0=布尔 1=路径形态 2=数值 3=其它
+fn value_shape(v: &str) -> u8 {
+    let t = v.trim();
+    if t == "true" || t == "false" {
+        0
+    } else if t.contains(':') || t.contains('\\') || t.starts_with('/') {
+        1
+    } else if t.parse::<f64>().is_ok() {
+        2
+    } else {
+        3
+    }
+}
+
+/// 写前归并裁决（D2-二期，B-370）：新事实 (fact_key, value) 对齐既有活跃
+/// 事实——同语义首段 + 同归一属性 + 值形态相似 → 复用既有 path 新版本
+/// 覆写（同 path 裁定链自动生效）；值不同 → conflict 标记（不自动
+/// supersede）；任一条件不齐 → 新键原样写。
+pub(crate) enum VariantMerge {
+    /// 复用既有事实的写入 key（新版本覆写走同 path 版本谱系）
+    Reuse { path: String, conflict: bool },
+    /// 新键原样写
+    New,
+}
+
+pub(crate) fn merge_target(existing: &[MemoryRecord], fact_key: &str, value: &str) -> VariantMerge {
+    let head = semantic_head(fact_key);
+    let Some(want_attr) = normalize_attribute(semantic_tail(fact_key)) else {
+        return VariantMerge::New;
+    };
+    let want_shape = value_shape(value);
+    let rank = |r: &MemoryRecord| (r.confidence.unwrap_or(0.0), r.timestamp);
+    let mut best: Option<&MemoryRecord> = None;
+    for r in existing {
+        let k = &r.key;
+        if k.contains(".promoted.") {
+            continue; // 治理标记域不参与归并
+        }
+        if semantic_head(k) != head {
+            continue; // 护栏一:同语义首段
+        }
+        let Some(attr) = normalize_attribute(semantic_tail(k)) else {
+            continue; // 护栏二:既有侧属性词可归一(未知词永不归并)
+        };
+        if attr != want_attr {
+            continue; // 护栏三:同归一属性
+        }
+        if value_shape(&r.value) != want_shape {
+            continue; // 护栏四:值形态相似
+        }
+        match best {
+            Some(b) if rank(b) >= rank(r) => {}
+            _ => best = Some(r),
+        }
+    }
+    let Some(target) = best else {
+        return VariantMerge::New;
+    };
+    let conflict = target.value.trim() != value.trim();
+    VariantMerge::Reuse {
+        path: target.key.clone(),
+        conflict,
+    }
+}
+
 /// C1 主入口：会话结束时调用（best-effort，错误记日志不阻断）
 ///
 /// # 执行顺序
@@ -261,6 +377,40 @@ pub async fn sediment(
 
                 // 3. 稳定事实 → 共享空间（B5：写入 llm 域 `stable.llm.{model}.*`，
                 //    与用户/系统域隔离；source 由系统填充为 llm:{raw_model}）
+                // D2-二期（B-370）：写前归并查询——每批一次全前缀拉活跃事实
+                // （LexStore 缓存≈零网络；失败降级为不归并，行为=既有路径）。
+                // 门控=Recipe.retrieval.normalize_attributes（缺省关=既有行为
+                // 零影响）。
+                let merge_enabled = deps
+                    .memory
+                    .recipe
+                    .as_ref()
+                    .map(|r| r.retrieval.normalize_attributes)
+                    .unwrap_or(false);
+                let existing_records: Vec<MemoryRecord> = if merge_enabled {
+                    let prefix = format!("shared.{}.stable.", deps.memory.namespace());
+                    match deps
+                        .memory
+                        .evorule_client
+                        .get_shared_facts(Some(&prefix))
+                        .await
+                    {
+                        Ok(facts) => latest_entries_by_path(facts)
+                            .into_iter()
+                            .filter_map(|(_, r)| r)
+                            .collect(),
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                error = %e,
+                                "sediment: merge query failed; proceeding without merge"
+                            );
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
                 for fact in &out.stable_facts {
                     let key = format!(
                         "stable.llm.{}.{}",
@@ -278,9 +428,45 @@ pub async fn sediment(
                         );
                         continue;
                     }
+                    // D2-二期（B-370）：写前归并裁决——命中即复用既有 path
+                    // （新版本覆写走同 path 版本谱系，supersession 链跨模型
+                    // 自然贯通）；同极性值差异 → conflict 标记落账（不自动
+                    // supersede）；未命中/门控关 → 新键原样写（既有行为）。
+                    let write_key = if merge_enabled {
+                        match merge_target(&existing_records, &fact.key, &fact.value) {
+                            VariantMerge::Reuse { path, conflict } => {
+                                if conflict {
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        reused = %path,
+                                        extracted = %fact.key,
+                                        "sediment: same-polarity value conflict; reusing existing path with conflict flag"
+                                    );
+                                    result
+                                        .merge_conflicts
+                                        .push(format!("{}:{}", fact.key, path));
+                                } else {
+                                    tracing::info!(
+                                        reused = %path,
+                                        extracted = %fact.key,
+                                        "sediment: variant merged into existing path"
+                                    );
+                                }
+                                path
+                            }
+                            VariantMerge::New => key.clone(),
+                        }
+                    } else {
+                        key.clone()
+                    };
                     match deps
                         .memory
-                        .set_scoped_with_source(MemoryScope::Shared, &key, &fact.value, &source)
+                        .set_scoped_with_source(
+                            MemoryScope::Shared,
+                            &write_key,
+                            &fact.value,
+                            &source,
+                        )
                         .await
                     {
                         // 区分 Persisted/CacheOnly——CacheOnly 不计入 stable_facts 防虚报
@@ -1898,6 +2084,100 @@ async fn rollup_old_summaries(
 
 #[cfg(test)]
 mod tests {
+
+    /// D2-二期（B-370）：属性词规范化黄金样本——等价对 + 负例。
+    #[test]
+    fn test_normalize_attribute_golden_samples() {
+        // 修饰前缀剥离
+        assert_eq!(
+            normalize_attribute("true_location").as_deref(),
+            Some("location")
+        );
+        assert_eq!(
+            normalize_attribute("real_location").as_deref(),
+            Some("location")
+        );
+        assert_eq!(
+            normalize_attribute("current_place").as_deref(),
+            Some("location")
+        );
+        // 单复数归一（复数→单数）
+        assert_eq!(
+            normalize_attribute("locations").as_deref(),
+            Some("location")
+        );
+        // 基词直过
+        assert_eq!(normalize_attribute("location").as_deref(), Some("location"));
+        // 负例：未知词/实体词/异域词——永不归并（fail-safe）
+        assert_eq!(normalize_attribute("engine"), None);
+        assert_eq!(normalize_attribute("current_engine_state"), None);
+        assert_eq!(normalize_attribute("location_version"), None);
+        assert_eq!(normalize_attribute("capability_summary"), None);
+    }
+
+    /// D2-二期（B-370）：写前归并裁决——同 head+同归一属性+同值形态 →
+    /// 复用既有 path；值不同 → conflict；不齐 → New。
+    #[test]
+    fn test_merge_target_reuse_conflict_new() {
+        let rec = |key: &str, value: &str, conf: f32, ts: u64| -> MemoryRecord {
+            serde_json::from_value(serde_json::json!({
+                "key": key, "value": value, "timestamp": ts, "confidence": conf
+            }))
+            .unwrap()
+        };
+        let existing = vec![
+            rec(
+                "stable.llm.m3.engine.true_location",
+                "C:/rt/workspace/video_engine",
+                0.8,
+                100,
+            ),
+            rec("stable.llm.m3.engine.name", "video_engine", 0.9, 120),
+        ];
+        // 同 head(engine)+同归一属性(location)+同路径形态值 → 复用既有 path
+        match merge_target(
+            &existing,
+            "engine.location",
+            "D:/AI AGENT/workspace/video_engine",
+        ) {
+            VariantMerge::Reuse { path, conflict } => {
+                assert_eq!(path, "stable.llm.m3.engine.true_location");
+                assert!(conflict, "值不同=同极性冲突标记");
+            }
+            VariantMerge::New => panic!("应命中归并复用"),
+        }
+        // 同值 → 复用且无冲突
+        match merge_target(&existing, "engine.location", "C:/rt/workspace/video_engine") {
+            VariantMerge::Reuse { conflict, .. } => assert!(!conflict),
+            VariantMerge::New => panic!("应命中归并复用"),
+        }
+        // 异 head → New
+        assert!(matches!(
+            merge_target(&existing, "environment.location", "C:/rt/x"),
+            VariantMerge::New
+        ));
+        // 异值形态（路径 vs 词）→ New（护栏：值形态相似才归并）
+        assert!(matches!(
+            merge_target(&existing, "engine.location", "video_engine"),
+            VariantMerge::New
+        ));
+        // 同 head 未知属性词（tail 不可归一）→ New
+        assert!(matches!(
+            merge_target(&existing, "engine.capability_summary", "x"),
+            VariantMerge::New
+        ));
+        // promoted 标记域不参与归并
+        let with_promoted = vec![rec(
+            "stable.llm.m3.promoted.engine.true_location",
+            "C:/x",
+            0.9,
+            150,
+        )];
+        assert!(matches!(
+            merge_target(&with_promoted, "engine.location", "C:/y"),
+            VariantMerge::New
+        ));
+    }
 
     #[test]
     fn probe_sim_detail() {
