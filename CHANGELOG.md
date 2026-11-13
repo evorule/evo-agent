@@ -36,6 +36,16 @@
 
 ## [Unreleased]
 
+### Recall-time variant clustering (opt-in)
+
+- 🆕 新增:召回期变体聚簇（D2-一期）——recall 注入前按语义首段聚簇（剥
+  `shared.{ns}.stable.llm.{model}.` 域包装，跨模型变体同簇），簇内仅保留
+  ranking 最高一条（confidence → timestamp → key 全序），其余退出本轮注入
+  （usage 不计，零写面变化）。缓解同主题事实变体挤占召回配额与截断误伤。
+- 门控:`Recipe.retrieval.variant_dedupe`（缺省 false=既有行为零变化），
+  `agents/general.json` 显式开启。一期按首段聚簇，跨首段同语义变体留待
+  二期提取端归并。
+
 ### Snapshot chain follows the effective capability boundary
 
 - 🐛 修复:checkpoint 仓库根与写面根分叉(`--agent-root` ≠ serve workdir 且
