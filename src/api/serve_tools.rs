@@ -925,6 +925,22 @@ pub fn apply_capability_boundary(
                 ),
             );
         }
+        // B-368（adjacent 缺口）：declared read_write 会话写面已全域
+        // 重绑 sandbox_root，undo 快照栈必须随重绑同根——否则快照落盘根与
+        // 写面根分叉，workspace_undo 对会话写入静默扑空。合成态不进此分支
+        // （apply_capability_boundary 仅 declared 生效），undo 缺省绑定
+        // workdir/DEFAULT_WRITABLE_DIR（=write_domain），无需重绑。
+        if let Some((undo_root, undo_sub)) = undo_rebind_root(Some(b)) {
+            let store = std::sync::Arc::new(
+                crate::agent::workspace_checkpoint::CheckpointStore::new(&undo_root, undo_sub),
+            );
+            handler.register_static(
+                "workspace_undo",
+                std::sync::Arc::new(
+                    crate::builtin_tools::workspace_undo::WorkspaceUndoTool::new(store),
+                ),
+            );
+        }
     }
 }
 
@@ -986,6 +1002,51 @@ pub fn checkpoint_writable_dir(
 // =============================================================================
 // B2 skills 装配:声明解析 + read_skill 注册(serve/CLI/delegate 共用)
 // =============================================================================
+
+/// checkpoint 仓库根派生（B-368 案 A）：快照链绑**生效边界**——
+/// 合成态（write_domain 在场）取写面基根（write_domain 的父目录，= toolkit
+/// workdir），declared read_write（write_domain 缺席）取 sandbox_root（与
+/// "." 全域重绑同域）。`req_workspace`/`agent_root` 仅作声明缺席且合成
+/// write_domain 亦缺席时的回落口径（与修复前 `session_workspace_root`
+/// 内联语义同源）。
+///
+/// 修复前分叉：三处 runner 接线用 `session_workspace_root(
+/// req.workspace, agent_workspace_root)`，写面却绑 workdir/workspace——
+/// `--agent-root` ≠ workdir 且未带 req.workspace 时 checkpoint 仓库 ≠ 写面根。
+pub fn checkpoint_repo_root(
+    req_workspace: Option<&Path>,
+    agent_root: &Path,
+    effective: &crate::agent::definition::CapabilityBoundary,
+) -> std::path::PathBuf {
+    // 快照链跟生效边界(B-368):合成态=写面基根,declared=sandbox_root。
+    // req_workspace/agent_root 保留兼容签名(req.workspace declared 注入时
+    // sandbox_root 即其值,口径自然一致);声明与合成域均不携带时维持回落。
+    let _ = (req_workspace, agent_root);
+    match &effective.write_domain {
+        Some(w) => w
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(w)
+            .to_path_buf(),
+        None => effective.sandbox_root.clone(),
+    }
+}
+
+/// undo 快照栈重绑根派生（B-368 adjacent 缺口）：declared read_write
+/// 会话写面被重绑到 sandbox_root 全域（"."），undo store 必须随重绑同根；
+/// 合成态 undo 缺省绑定 workdir/DEFAULT_WRITABLE_DIR（= write_domain），无需
+/// 重绑 → None。返回 (store_root, writable_subdir)。
+pub fn undo_rebind_root(
+    declared: Option<&crate::agent::definition::CapabilityBoundary>,
+) -> Option<(std::path::PathBuf, &'static str)> {
+    // declared read_write:写面已重绑 sandbox_root 全域,undo store 随重绑同根;
+    // read_only 无写面;合成态 undo 缺省已绑 workdir/workspace(=write_domain)
+    let d = declared?;
+    if d.is_read_only() {
+        return None;
+    }
+    Some((d.sandbox_root.clone(), "."))
+}
 
 /// B2:skills 声明面解析 —— def.skills 显式声明 → 生效清单(C 形态后供
 /// CLI from_definition / delegate 子代理路径使用;serve 会话创建路径改为
@@ -2285,6 +2346,79 @@ service_tools = ["config_persist", "rule_sandbox"]
                 crate::builtin_tools::file_write::DEFAULT_WRITABLE_DIR
             )))
         );
+    }
+
+    #[test]
+    fn test_checkpoint_repo_root_follows_effective_boundary() {
+        use super::checkpoint_repo_root;
+        use crate::agent::definition::CapabilityBoundary;
+        use std::path::PathBuf;
+        // 分叉部署:agent_root=R,合成边界 write_domain=W/workspace(W≠R)
+        // → checkpoint 仓库根必须=写面基根 W,修复前旧口径返回 agent_root R(红)
+        let synth = CapabilityBoundary {
+            mode: "read_write".to_string(),
+            sandbox_root: PathBuf::from("R:/agent-root"),
+            read_root: None,
+            write_domain: Some(PathBuf::from("W:/workdir/workspace")),
+            tools: vec!["file_write".to_string()],
+        };
+        let root = checkpoint_repo_root(None, Path::new("R:/agent-root"), &synth);
+        assert_eq!(
+            root,
+            PathBuf::from("W:/workdir"),
+            "checkpoint 仓库根=写面基根(write_domain 父目录),非 agent_root"
+        );
+        // declared read_write(write_domain 缺席) → sandbox_root(与 "." 重绑同域)
+        let declared = CapabilityBoundary {
+            mode: "read_write".to_string(),
+            sandbox_root: PathBuf::from("S:/sandbox"),
+            read_root: None,
+            write_domain: None,
+            tools: vec!["file_write".to_string()],
+        };
+        let root2 = checkpoint_repo_root(None, Path::new("R:/agent-root"), &declared);
+        assert_eq!(root2, PathBuf::from("S:/sandbox"));
+        // 回落口径:声明态 req.workspace 注入时 sandbox_root 即 req.ws(旧语义一致)
+        assert_eq!(
+            checkpoint_repo_root(
+                Some(Path::new("S:/sandbox")),
+                Path::new("R:/agent-root"),
+                &declared
+            ),
+            PathBuf::from("S:/sandbox")
+        );
+    }
+
+    #[test]
+    fn test_undo_rebind_root_declared_read_write() {
+        use super::undo_rebind_root;
+        use crate::agent::definition::CapabilityBoundary;
+        use std::path::PathBuf;
+        // declared read_write:写面重绑 sandbox_root 全域 → undo 必须随重绑同根
+        let declared = CapabilityBoundary {
+            mode: "read_write".to_string(),
+            sandbox_root: PathBuf::from("S:/sandbox"),
+            read_root: None,
+            write_domain: None,
+            tools: vec!["file_write".to_string(), "workspace_undo".to_string()],
+        };
+        let rebind = undo_rebind_root(Some(&declared));
+        assert_eq!(
+            rebind,
+            Some((PathBuf::from("S:/sandbox"), ".")),
+            "declared read_write 会话 undo store 随写面重绑(sandbox_root, \".\")"
+        );
+        // declared read_only:无写面,无重绑
+        let ro = CapabilityBoundary {
+            mode: "read_only".to_string(),
+            sandbox_root: PathBuf::from("S:/sandbox"),
+            read_root: None,
+            write_domain: None,
+            tools: vec![],
+        };
+        assert_eq!(undo_rebind_root(Some(&ro)), None);
+        // 合成态:undo 缺省已绑 workdir/workspace(=write_domain),无需重绑
+        assert_eq!(undo_rebind_root(None), None);
     }
 
     #[test]
