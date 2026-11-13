@@ -1548,10 +1548,10 @@ pub struct AgentRunner {
     /// 后续 persist 以 messages.len() + 本值对齐账面,避免覆盖既有记录)。
     /// 仅在重建读账应用视图时被写入;delta=0 时行为字节级不变。
     persist_idx_delta: std::sync::atomic::AtomicUsize,
-    /// 近摘要区摘要缓存(键=区内容哈希):压缩命中缓存时零 LLM 重算;
-    /// 重建读账时从压缩视图种子恢复,运行期与重建面同源。
-    region_summary_cache:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// 近摘要区摘要缓存(键=区内容哈希,插入序 FIFO,容量上限 256):
+    /// 压缩命中缓存时零 LLM 重算;重建读账时从压缩视图种子恢复,运行期与
+    /// 重建面同源。上限防长驻进程无界增长(同 hash 重复写=原位替换不增容)。
+    region_summary_cache: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 /// 管道阶段⑦执行器：runner 的 call_service 通路
@@ -1684,9 +1684,7 @@ impl AgentRunner {
             verify: None,
             verify_config: None,
             persist_idx_delta: std::sync::atomic::AtomicUsize::new(0),
-            region_summary_cache: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            region_summary_cache: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -3189,6 +3187,22 @@ impl AgentRunner {
     /// 直写),消息层仅留结构化引用;口径注记:设计档「[cleared: call_id]」
     /// 的 call_id 在消息层不存在(Message::Tool 无 call_id 标识),以工具名
     /// 引用替代——call_id 级对账在 journal 侧(t{seq} 合成键)成立。
+    /// 摘要缓存回填（运行期与重建种子共用）：同 hash 原位替换、容量上限
+    /// 256 FIFO 淘汰——防长驻进程无界增长。
+    fn cache_region_summary(&self, region_hash: &str, text: &str) {
+        const REGION_SUMMARY_CACHE_CAP: usize = 256;
+        if let Ok(mut cache) = self.region_summary_cache.lock() {
+            if let Some(pos) = cache.iter().position(|(k, _)| k == region_hash) {
+                cache[pos] = (region_hash.to_string(), text.to_string());
+            } else {
+                cache.push((region_hash.to_string(), text.to_string()));
+                while cache.len() > REGION_SUMMARY_CACHE_CAP {
+                    cache.remove(0);
+                }
+            }
+        }
+    }
+
     async fn active_compaction(
         &self,
         session_id: &str,
@@ -3234,10 +3248,11 @@ impl AgentRunner {
         let cached_summary = if region_hash.is_empty() {
             None
         } else {
-            self.region_summary_cache
-                .lock()
-                .ok()
-                .and_then(|c| c.get(&region_hash).cloned())
+            self.region_summary_cache.lock().ok().and_then(|c| {
+                c.iter()
+                    .find(|(k, _)| k.as_str() == region_hash)
+                    .map(|(_, v)| v.clone())
+            })
         };
         if let Some(text) = cached_summary {
             body[0] = Message::System { content: text };
@@ -3264,9 +3279,7 @@ impl AgentRunner {
             if !region_hash.is_empty() {
                 if let Message::System { content } = &body[0] {
                     if content.starts_with("[earlier conversation summary]") {
-                        if let Ok(mut cache) = self.region_summary_cache.lock() {
-                            cache.insert(region_hash.clone(), content.clone());
-                        }
+                        self.cache_region_summary(&region_hash, content);
                     }
                 }
             }
@@ -5209,9 +5222,7 @@ impl AgentRunner {
                 verify: None,
                 verify_config: None,
                 persist_idx_delta: std::sync::atomic::AtomicUsize::new(0),
-                region_summary_cache: std::sync::Arc::new(std::sync::Mutex::new(
-                    std::collections::HashMap::new(),
-                )),
+                region_summary_cache: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         })
     }
@@ -7816,9 +7827,7 @@ impl AgentRunner {
                     if view.kind == "active_compaction" && !view.region_hash.is_empty() {
                         if let Some(Message::System { content }) = view.replacement.first() {
                             if content.starts_with("[earlier conversation summary]") {
-                                if let Ok(mut cache) = runner.region_summary_cache.lock() {
-                                    cache.insert(view.region_hash.clone(), content.clone());
-                                }
+                                runner.cache_region_summary(&view.region_hash, content);
                             }
                         }
                     }

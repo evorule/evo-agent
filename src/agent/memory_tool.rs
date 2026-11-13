@@ -1211,16 +1211,24 @@ impl ToolFunction for MemoryLinkTool {
 /// 遗忘归属复核（纯函数,F-614 闸面）：agent 仅可遗忘**自身产出**的条目
 /// ——llm 来源域可遗忘;user/system 来源=治理受保护域,拒绝（受治边界:
 /// 遗忘权不越权到人类与系统的记忆）。
-pub(crate) fn forget_allowed(record: &MemoryRecord) -> Result<(), String> {
+pub(crate) fn forget_allowed(record: &MemoryRecord, ledger_path: &str) -> Result<(), String> {
     let key = record.key.as_str();
     let src = record.source.as_deref().unwrap_or_default();
-    if key.starts_with("stable.user.") || src.contains("user") {
+    // 域判定三通道：key 显式前缀（新写入）/ 账本 path（老数据主防线——
+    // key 为回填尾段时前缀判据失真）/ source 标记。任一命中即拒。
+    if key.starts_with("stable.user.")
+        || ledger_path.contains("stable.user.")
+        || src.contains("user")
+    {
         return Err(
             "forget rejected: target is user-authored (protected domain; agent may only              forget its own outputs)"
                 .to_string(),
         );
     }
-    if key.starts_with("stable.system.") || src.starts_with("system") {
+    if key.starts_with("stable.system.")
+        || ledger_path.contains("stable.system.")
+        || src.starts_with("system")
+    {
         return Err(
             "forget rejected: target is system-authored (protected domain; agent may only              forget its own outputs)"
                 .to_string(),
@@ -1263,14 +1271,39 @@ pub(crate) async fn memory_forget_exec(
         .await
         .map_err(|e| format!("memory_forget: ledger unreachable ({e})"))?;
     let norm_target = target.trim_start_matches("shared::").to_string();
-    let matched = facts
+    let full_path = format!("{prefix}{norm_target}");
+    // 目标匹配两轮收紧：①精确 path（全前缀形态或裸 path）——无歧义；
+    // ②尾段匹配仅 llm 域条目参与且命中必须唯一（user/system 域永不尾段
+    // 命中=防误伤越权；多候选=歧义拒判防静默忘错对象）。
+    let matched = match facts
         .iter()
-        .find(|f| {
-            f.path == format!("{prefix}{norm_target}")
-                || f.path == norm_target
-                || f.path.rsplit('.').next() == Some(norm_target.as_str())
-        })
-        .ok_or_else(|| format!("memory_forget: target '{target}' not found in ledger"))?;
+        .find(|f| f.path == full_path || f.path == norm_target)
+    {
+        Some(f) => Some(f),
+        None => {
+            let tail_hits: Vec<_> = facts
+                .iter()
+                .filter(|f| {
+                    f.path.contains(".llm.")
+                        && f.path.rsplit('.').next() == Some(norm_target.as_str())
+                })
+                .collect();
+            match tail_hits.len() {
+                1 => Some(tail_hits[0]),
+                0 => None,
+                _ => {
+                    let cands: Vec<&str> =
+                        tail_hits.iter().map(|f| f.path.as_str()).collect();
+                    return Err(format!(
+                        "memory_forget: target '{target}' is ambiguous — {} candidates: {} (use full ledger path)",
+                        cands.len(),
+                        cands.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+    .ok_or_else(|| format!("memory_forget: target '{target}' not found in ledger"))?;
     if matched.path.contains(".tombstoned.") {
         return Err(format!(
             "memory_forget: target '{}' is already tombstoned",
@@ -1301,7 +1334,7 @@ pub(crate) async fn memory_forget_exec(
             0,
         ),
     };
-    forget_allowed(&record)?;
+    forget_allowed(&record, &matched.path)?;
 
     // 墓碑版本(同路径 latest-wins):保留原值于账(append-only),状态=Tombstoned
     let mut tombstone = record.clone();
@@ -1650,12 +1683,131 @@ mod tests {
             r
         };
         // llm 产出可遗忘
-        assert!(forget_allowed(&mk("stable.llm.promoted.x", Some("llm-note"))).is_ok());
-        assert!(forget_allowed(&mk("notes.failure.f", None)).is_ok());
+        assert!(forget_allowed(&mk("stable.llm.promoted.x", Some("llm-note")), "").is_ok());
+        assert!(forget_allowed(&mk("notes.failure.f", None), "").is_ok());
         // user/system 域拒绝
-        assert!(forget_allowed(&mk("stable.user.prefs", None)).is_err());
-        assert!(forget_allowed(&mk("stable.system.rule", None)).is_err());
-        assert!(forget_allowed(&mk("misc", Some("user-upload"))).is_err());
+        assert!(forget_allowed(&mk("stable.user.prefs", None), "").is_err());
+        assert!(forget_allowed(&mk("stable.system.rule", None), "").is_err());
+        assert!(forget_allowed(&mk("misc", Some("user-upload")), "").is_err());
+    }
+
+    #[tokio::test]
+    async fn forget_tail_match_restricted_to_llm_domain() {
+        // 尾段匹配收紧：user/system 域条目永不经尾段命中（防误伤越权）。
+        // 修复前红：target="EV" 尾段命中 stable.user 域条目并落墓碑（PUT 200）。
+        let mut server = mockito::Server::new_async().await;
+        let client = EvoruleApiClient::new(&server.url());
+        let body = r#"[
+            {"fact_id":301,"path":"shared.ns.stable.user.EV","value":{"key":"EV","value":"user data","timestamp":100,"source":"stable"},"source_session_id":1,"version":1}
+        ]"#;
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.ns.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        let m_put = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/api/sessions/s1/payload$".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"fact_id":999}"#)
+            .create_async()
+            .await;
+        let args = serde_json::json!({"target": "EV", "reason": "test"});
+        let r = memory_forget_exec("ns", &client, "s1", &args).await;
+        assert!(
+            r.is_err(),
+            "user 域条目不得经尾段匹配被 forget（修复前红=命中并落墓碑）"
+        );
+        assert!(
+            r.as_ref().unwrap_err().contains("not found in ledger"),
+            "user 域尾段应零命中返回 not found（而非歧义/其他错）：{:?}",
+            r
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_tail_match_ambiguous_rejected() {
+        // 同尾段多候选（llm 域）→ 歧义拒判；修复前红=静默忘掉第一个命中。
+        let mut server = mockito::Server::new_async().await;
+        let client = EvoruleApiClient::new(&server.url());
+        let body = r#"[
+            {"fact_id":311,"path":"shared.ns.llm.x.EV","value":{"key":"EV","value":"a","timestamp":100,"source":"llm"},"source_session_id":1,"version":1},
+            {"fact_id":312,"path":"shared.ns.llm.y.EV","value":{"key":"EV","value":"b","timestamp":200,"source":"llm"},"source_session_id":1,"version":1}
+        ]"#;
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.ns.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        let m_put = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/api/sessions/s1/payload$".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"fact_id":999}"#)
+            .create_async()
+            .await;
+        let args = serde_json::json!({"target": "EV", "reason": "test"});
+        let err = memory_forget_exec("ns", &client, "s1", &args)
+            .await
+            .unwrap_err();
+        assert!(err.contains("ambiguous"), "歧义必须拒判（修复前红={err}）");
+    }
+
+    #[tokio::test]
+    async fn forget_tail_match_llm_single_hit_still_works() {
+        // 正向保持：llm 域单尾段命中→forget 照常（行为面不回退）。
+        let mut server = mockito::Server::new_async().await;
+        let client = EvoruleApiClient::new(&server.url());
+        let body = r#"[
+            {"fact_id":321,"path":"shared.ns.llm.promoted.EV","value":{"key":"EV","value":"llm output","timestamp":100,"source":"llm"},"source_session_id":1,"version":1}
+        ]"#;
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.ns.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        let m_put = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/api/sessions/s1/payload$".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"fact_id":999}"#)
+            .create_async()
+            .await;
+        let args = serde_json::json!({"target": "EV", "reason": "cleanup"});
+        let r = memory_forget_exec("ns", &client, "s1", &args).await;
+        assert!(r.is_ok(), "llm 域单尾段命中应照常 forget：{:?}", r.err());
+        m_put.assert_async().await;
+    }
+
+    #[test]
+    fn forget_ownership_gate_checks_ledger_path_not_backfilled_key() {
+        // 域判定防线补 path 维度：老数据（key 回填尾段+source 缺省）的
+        // stable.user/system 域条目——修复前红=回填 key 无域前缀且 source 空
+        // →判据双失→越权放行。
+        let mk = |k: &str, src: Option<&str>| {
+            let mut r = MemoryRecord::new(k, "v", 1);
+            r.source = src.map(str::to_string);
+            r
+        };
+        assert!(forget_allowed(&mk("EV", None), "shared.ns.stable.user.EV").is_err());
+        assert!(forget_allowed(&mk("EV", None), "shared.ns.stable.system.EV").is_err());
+        assert!(forget_allowed(&mk("EV", None), "shared.ns.llm.promoted.EV").is_ok());
+        assert!(forget_allowed(&mk("EV", None), "shared.ns.notes.failure.EV").is_ok());
     }
     use super::*;
 
