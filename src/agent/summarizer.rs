@@ -593,6 +593,11 @@ impl ContextSummarizer {
     /// 不触发 LLM 重算——重建读账，不重算）。
     /// G9：回读链透传内容指纹；旧账无指纹（空串）时种子只可作增量基底，
     /// 整段命中需一次再生成补齐指纹。
+    ///
+    /// R-1 边界注记：`seed_cache` 是**单槽**缓存（`Option<RollingCache>`，
+    /// gen 单调守卫防旧账回灌），存滚动摘要冻结面续算状态；与
+    /// runner `region_summary_cache`（多槽、键=区哈希、服务同区复用）
+    /// **语义分化而非冗余——不要合并**（设计档 机制优化修复技术设计 §2）。
     pub fn seed_cache(
         &self,
         frozen_len: usize,

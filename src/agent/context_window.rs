@@ -124,6 +124,42 @@ fn is_authentic_offload_block(content: &str, marker: &str) -> bool {
     content_addressed || has_path
 }
 
+/// R-4(B-358):降级/清除占位符统一构造(单源,机制优化修复技术设计 §3.1)。
+///
+/// 共享骨架+来源标记:首行 `[context-offloaded: source=... tool=... ref_id=...
+/// digest=...]`,随后 `ref_id:`/`digest:`/`bytes:` 结构行与取回指引——结构行
+/// 复用 [`is_authentic_offload_block`] 的 G12 真实性校验(同形伪装防御不降级)。
+/// source 取值:
+/// - `trim-stale`:trim 陈旧降级,ref_id=`stale-{hex}`(内容寻址族),可经
+///   tool_result_fetch 按 ref_id 分页取回;
+/// - `compaction`:主动压缩清引用,原文完整留存会话 journal 的 tool_result
+///   事件(审计链),ref_id 槽位为 `-`,不走 fetch。
+/// 旧形态 `[STALE_TOOL_RESULT]`/`[cleared: 工具名]` 只读兼容:占位符是纯
+/// 文本回放(重建面无解析),fetch 按 ref_id 驱动与占位符形态无关——旧条目
+/// 继续可取回,新形态仅未来条目产生,永不回写旧数据。
+pub(crate) fn build_offload_marker(
+    source: &str,
+    tool: &str,
+    ref_id: &str,
+    digest: &str,
+    bytes: usize,
+) -> String {
+    let digest_hex = digest.rsplit(':').next().unwrap_or(digest);
+    let digest16 = &digest_hex[..digest_hex.len().min(16)];
+    let hint = if ref_id == "-" {
+        "该工具结果已上下文外置。原文完整留存于会话 journal 的 tool_result 事件,可经审计链查询。"
+    } else {
+        "该工具结果已上下文外置。需要原文时调用 tool_result_fetch 工具,按 ref_id 分页读取。"
+    };
+    format!(
+        "[context-offloaded: source={source} tool={tool} ref_id={ref_id} digest=blake3:{digest16}]\n\
+         ref_id: {ref_id}\n\
+         digest: {digest}\n\
+         bytes: {bytes}\n\
+         ({hint})"
+    )
+}
+
 /// 陈旧工具结果发送视图降级(确定性纯函数;无时钟/无随机/无外部读取,
 /// 账后视图装配纪律同款:同输入同输出,可由账上原文+本函数重建发送视图)
 ///
@@ -163,18 +199,19 @@ pub fn demote_stale_tool_results(
             continue;
         }
         // 已引用化内容跳过(不二次降级);G12(B-316):真实性校验——
-        // 仅凭前缀会被同形内容骗过
-        if is_authentic_offload_block(content, "[TOOL_RESULT_REF]") {
+        // 仅凭前缀会被同形内容骗过。R-4:统一形态 marker 同样跳过
+        // (authentic 校验同构复用,防已外置内容二次降级丢 ref_id)
+        if is_authentic_offload_block(content, "[TOOL_RESULT_REF]")
+            || is_authentic_offload_block(content, "[context-offloaded:")
+        {
             continue;
         }
         let digest = crate::agent::journal::evorule_digest(content);
         // 内容寻址:digest hex 段过引用段白名单(与出站引用化同口径)
         let hex_segment = digest.rsplit(':').next().unwrap_or(&digest);
         let ref_id = format!("stale-{}", sanitize_ref_segment(hex_segment));
-        let placeholder = format!(
-            "[STALE_TOOL_RESULT]\nref_id: {ref_id}\ntool: {tool_name}\nbytes: {}\ndigest: {digest}\n(陈旧工具结果已降级。需要原文时调用 tool_result_fetch 工具,按 ref_id 分页读取。)",
-            content.len()
-        );
+        let placeholder =
+            build_offload_marker("trim-stale", tool_name, &ref_id, &digest, content.len());
         offloads.push(StaleOffload {
             ref_id,
             tool_name: tool_name.clone(),
@@ -412,6 +449,11 @@ fn default_hint_budget_tokens() -> usize {
     15
 }
 
+/// 计数误差预留百分比缺省值(R-2 同款:与装配配方 default_buffer_pct 同值 5)
+fn default_buffer_pct() -> usize {
+    5
+}
+
 /// 裁剪策略
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrimStrategy {
@@ -434,6 +476,9 @@ pub struct ContextWindowManager {
     /// 唯一事实源=装配配方 TrimSpec.hint_budget_tokens,经 runner 构造点
     /// [`Self::with_hint_budget_tokens`] 注入,缺省构造保持 15 兼容)
     hint_budget_tokens: usize,
+    /// 计数误差预留百分比(R-2 同款单源化:缺省 5 = 原 budget/20 硬编码;
+    /// 事实源=配方 TrimSpec.buffer_pct,经 [`Self::with_buffer_pct`] 注入)
+    buffer_pct: usize,
 }
 
 impl ContextWindowManager {
@@ -454,6 +499,7 @@ impl ContextWindowManager {
             reserve_for_response,
             strategy,
             hint_budget_tokens: default_hint_budget_tokens(),
+            buffer_pct: default_buffer_pct(),
         }
     }
 
@@ -461,6 +507,13 @@ impl ContextWindowManager {
     /// 单一事实源;不调即保持缺省 15,行为零变化)
     pub fn with_hint_budget_tokens(mut self, tokens: usize) -> Self {
         self.hint_budget_tokens = tokens;
+        self
+    }
+
+    /// 注入计数误差预留百分比(R-2 同款:配方 TrimSpec.buffer_pct 单一事实
+    /// 源;不调即保持缺省 5,行为零变化)
+    pub fn with_buffer_pct(mut self, pct: usize) -> Self {
+        self.buffer_pct = pct;
         self
     }
 
@@ -577,7 +630,9 @@ impl ContextWindowManager {
         // R-2 单源化:预留量=配方 TrimSpec.hint_budget_tokens 注入值(缺省 15,
         // 与原硬编码等价)
         let hint_overhead = self.hint_budget_tokens;
-        let buffer = (budget / 20).max(5);
+        // buffer 预留=配方 TrimSpec.buffer_pct 注入百分比(缺省 5,与原
+        // budget/20 硬编码等价);R-2 同款收注入,消灭声明面零消费缺口
+        let buffer = (budget * self.buffer_pct / 100).max(5);
         let available_for_recent = budget
             .saturating_sub(always_tokens)
             .saturating_sub(hint_overhead)
@@ -804,6 +859,7 @@ impl Clone for ContextWindowManager {
             reserve_for_response: self.reserve_for_response,
             strategy: self.strategy,
             hint_budget_tokens: self.hint_budget_tokens,
+            buffer_pct: self.buffer_pct,
         }
     }
 }
@@ -897,7 +953,9 @@ mod tests {
         let (view, offloads) = demote_stale_tool_results(&messages, 4, 100);
         assert_eq!(offloads.len(), 1, "同形伪装内容必须被降级");
         assert!(
-            view[1].content().starts_with("[STALE_TOOL_RESULT]"),
+            view[1]
+                .content()
+                .starts_with("[context-offloaded: source=trim-stale"),
             "降级后为 stale 引用块: {}",
             view[1].content()
         );
@@ -1482,12 +1540,15 @@ mod tests {
             "视图两次输出逐字节相等"
         );
         assert_eq!(o1, o2, "offload 清单两次输出相等");
-        // 黄金形态锚:占位块全文确定性(字段序固定)
+        // 黄金形态锚:占位块全文确定性(单源构造,字段序固定)
         let digest = evorule_digest(&long);
         let hex = digest.rsplit(':').next().unwrap();
-        let expected = format!(
-            "[STALE_TOOL_RESULT]\nref_id: stale-{hex}\ntool: grep_files\nbytes: {}\ndigest: {digest}\n(陈旧工具结果已降级。需要原文时调用 tool_result_fetch 工具,按 ref_id 分页读取。)",
-            long.len()
+        let expected = build_offload_marker(
+            "trim-stale",
+            "grep_files",
+            &format!("stale-{hex}"),
+            &digest,
+            long.len(),
         );
         assert_eq!(v1[1].content(), expected);
         assert_eq!(o1.len(), 1);
@@ -1495,6 +1556,38 @@ mod tests {
         assert_eq!(o1[0].digest, digest);
         assert_eq!(o1[0].tool_name, "grep_files");
         assert_eq!(o1[0].content, long);
+    }
+
+    /// R-4:统一形态构造单测(两 source 各一;G12 真实性校验对统一形态成立)
+    #[test]
+    fn test_build_offload_marker_two_sources() {
+        let digest = evorule_digest("payload");
+        let hex = digest.rsplit(':').next().unwrap();
+        let ref_id = format!("stale-{hex}");
+        // trim-stale:内容寻址 ref_id + fetch 取回指引;G12 校验通过
+        let stale = build_offload_marker("trim-stale", "grep_files", &ref_id, &digest, 42);
+        assert!(
+            stale.starts_with(&format!(
+                "[context-offloaded: source=trim-stale tool=grep_files ref_id={ref_id} digest=blake3:"
+            )),
+            "首行共享骨架: {stale}"
+        );
+        assert!(stale.contains(&format!("ref_id: {ref_id}\ndigest: {digest}\nbytes: 42")));
+        assert!(stale.contains("tool_result_fetch"));
+        assert!(
+            is_authentic_offload_block(&stale, "[context-offloaded:"),
+            "G12 真实性校验复用:统一形态须过 content-addressed 校验"
+        );
+        // compaction:ref_id 槽位 "-"(不走 fetch),journal 审计指引
+        let comp = build_offload_marker("compaction", "shell_exec", "-", &digest, 7);
+        assert!(
+            comp.starts_with(
+                "[context-offloaded: source=compaction tool=shell_exec ref_id=- digest=blake3:"
+            ),
+            "首行共享骨架: {comp}"
+        );
+        assert!(comp.contains("会话 journal"));
+        assert!(!comp.contains("tool_result_fetch"));
     }
 
     /// 条件②轮距边界:K-1 轮不降级,K 轮降级(显式小值 K=3)
@@ -1510,7 +1603,9 @@ mod tests {
         let msgs = history_with_tool_after_n_assistants(&content, 3);
         let (view, offs) = demote_stale_tool_results(&msgs, 3, 100);
         assert_eq!(offs.len(), 1);
-        assert!(view[1].content().starts_with("[STALE_TOOL_RESULT]"));
+        assert!(view[1]
+            .content()
+            .starts_with("[context-offloaded: source=trim-stale"));
     }
 
     /// 条件③字节阈值边界:T 字节不降级(条件为严格大于),T+1 降级(显式小值 T=100)
@@ -1525,7 +1620,9 @@ mod tests {
         let msgs = history_with_tool_after_n_assistants(&"Y".repeat(101), 2);
         let (view, offs) = demote_stale_tool_results(&msgs, 2, 100);
         assert_eq!(offs.len(), 1);
-        assert!(view[1].content().starts_with("[STALE_TOOL_RESULT]"));
+        assert!(view[1]
+            .content()
+            .starts_with("[context-offloaded: source=trim-stale"));
     }
 
     /// 条件①已消费边界:其后无 Assistant 消息 = 尚未消费,永不降级
@@ -1618,11 +1715,11 @@ mod tests {
         let digest = evorule_digest(&content);
         let hex = digest.rsplit(':').next().unwrap();
         let ph = view[2].content();
-        assert!(ph.starts_with("[STALE_TOOL_RESULT]"));
+        assert!(ph.starts_with("[context-offloaded: source=trim-stale"));
         assert!(ph.contains(&format!("ref_id: stale-{hex}")));
         assert!(ph.contains(&format!("digest: {digest}")));
         assert!(ph.contains(&format!("bytes: {}", content.len())));
-        assert!(ph.contains("tool: grep_files"));
+        assert!(ph.contains("tool=grep_files"), "首行来源标记含工具名");
         assert!(ph.contains("tool_result_fetch"), "取回指引在场");
         // 原子组兼容:Assistant 侧消息零改动(逐字段比对)
         match &view[1] {

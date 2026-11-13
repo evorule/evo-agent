@@ -1630,6 +1630,9 @@ pub struct AgentRunner {
     /// 压缩命中缓存时零 LLM 重算;重建读账时从压缩视图种子恢复,运行期与
     /// 重建面同源。上限防长驻进程无界增长(同 hash 重复写=原位替换不增容)。
     /// O-2:VecDeque——队尾入/队首出 O(1),原位替换按下标赋值。
+    /// R-1 边界注记:本缓存管**同区复用多槽**;summarizer `seed_cache` 管
+    /// **滚动摘要续算单槽**(gen 单调守卫)——语义分化,不要合并(设计档
+    /// 机制优化修复技术设计 §2)。
     region_summary_cache:
         std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(String, String)>>>,
 }
@@ -2453,6 +2456,12 @@ impl AgentRunner {
                 .trim_params()
                 .map(|(_, _, hint)| hint)
                 .unwrap_or(15),
+        )
+        .with_buffer_pct(
+            self.assembly
+                .trim_params()
+                .map(|(_, pct, _)| pct as usize)
+                .unwrap_or(5),
         );
         self.context_window = Some(ctx_mgr);
         // C3:记录总窗口 token,供组装执行器作记忆区预算基准
@@ -3268,7 +3277,7 @@ impl AgentRunner {
     /// 动作(设计 D3):①近摘要区 = system 前缀 + 最近
     /// `policy.keep_rounds`(设置键 longSession.compaction.keepRounds,默认 = COMPACTION_KEEP_ROUNDS)轮之外的全部消息;②近摘要区滚动摘要
     /// (purpose=compaction,经 audited_llm 留痕,复用保真对照+记忆落链);
-    /// ③区内大块工具结果原文以 `[cleared: 工具名]` 引用替代(按原文长度
+    /// ③区内大块工具结果原文以统一形态 `[context-offloaded: source=compaction ...]` 引用替代(R-4 单源构造 build_offload_marker,按原文长度
     /// 从大到小,条数受 maxClearToolResults 约束);④摘要块回注区前 +
     /// compaction_performed 落 journal。
     ///
@@ -5235,6 +5244,12 @@ impl AgentRunner {
                         .trim_params()
                         .map(|(_, _, hint)| hint)
                         .unwrap_or(15),
+                )
+                .with_buffer_pct(
+                    assembly
+                        .trim_params()
+                        .map(|(_, pct, _)| pct as usize)
+                        .unwrap_or(5),
                 ),
             );
             AgentRunner {
@@ -12363,8 +12378,11 @@ fn compaction_region_bounds(messages: &[Message], keep_rounds: usize) -> Option<
 }
 
 /// B21 D3 工具结果引用替代(纯函数):按原文长度从大到小清除至多 `max_clear`
-/// 条 tool 消息,原文以 `[cleared: 工具名]` 引用替代(完整原文留存 journal,
+/// 条 tool 消息,原文以统一形态 `[context-offloaded: source=compaction ...]`
+/// 引用替代(R-4 单源构造 build_offload_marker;完整原文留存 journal,
 /// 可恢复原则)。返回 `(清除后的消息副本, 实际清除条数)`。
+/// 已外置/已引用化/已清除(重建重放)的内容跳过——弱前缀判断即可
+/// (无安全面,仅防二次清除覆盖原 ref_id 结构)。
 fn clear_tool_results(region: &[Message], max_clear: usize) -> (Vec<Message>, usize) {
     if max_clear == 0 {
         return (region.to_vec(), 0);
@@ -12372,7 +12390,12 @@ fn clear_tool_results(region: &[Message], max_clear: usize) -> (Vec<Message>, us
     let mut tool_idxs: Vec<usize> = region
         .iter()
         .enumerate()
-        .filter(|(_, m)| matches!(m, Message::Tool { .. }))
+        .filter(|(_, m)| {
+            matches!(m, Message::Tool { .. })
+                && !m.content().starts_with("[context-offloaded:")
+                && !m.content().starts_with("[TOOL_RESULT_REF]")
+                && !m.content().starts_with("[cleared: ")
+        })
         .map(|(i, _)| i)
         .collect();
     if tool_idxs.is_empty() {
@@ -12391,7 +12414,15 @@ fn clear_tool_results(region: &[Message], max_clear: usize) -> (Vec<Message>, us
                 images,
             } = msg
             {
-                *content = format!("[cleared: {tool_name}]");
+                // digest 对清除前原文计算(与 journal 留存原文同源可对账)
+                let digest = crate::agent::journal::evorule_digest(content);
+                *content = crate::agent::context_window::build_offload_marker(
+                    "compaction",
+                    tool_name,
+                    "-",
+                    &digest,
+                    content.len(),
+                );
                 // B1:图片属窗口大头,清 content 必须连带清旁路图,防预算门被架空
                 *images = Vec::new();
                 cleared += 1;
