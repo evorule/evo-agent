@@ -237,12 +237,38 @@ struct LedgerInner {
     turn_dropped: usize,
     /// 开具/注入待办（写入失败传感器置位；下一次 persist 前置重开具重注入）
     needs_ensure: bool,
+    /// shared 面双写失败事件暂存（key, value JSON）：补写闭环——下次
+    /// append_event 开头逐条重试，Persisted 即移除、失败保留（对齐
+    /// MemoryEventStore 的 pending_persist 模式；此前失败事件本轮缺账
+    /// 且永不补写，召回视图与证据链单边漂移仅 warn 可见）
+    pending_shared: Vec<(String, String)>,
 }
 
 impl LedgerInner {
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.seq
+    }
+
+    /// shared 面缺账补写：逐条重试 pending（Persisted 即移除；失败保留
+    /// 队列下次再试）——对齐 MemoryEventStore pending_persist 模式。
+    async fn flush_pending_shared(&mut self) {
+        if self.pending_shared.is_empty() {
+            return;
+        }
+        let taken = std::mem::take(&mut self.pending_shared);
+        let mut still = Vec::new();
+        for (key, value) in taken {
+            match self
+                .memory
+                .set_scoped(MemoryScope::Shared, &key, &value)
+                .await
+            {
+                Ok(PersistOutcome::Persisted { .. }) => {}
+                _ => still.push((key, value)),
+            }
+        }
+        self.pending_shared = still;
     }
 
     /// 回读账面末端事件（复用活会话且进程内链为空时）——
@@ -332,6 +358,9 @@ impl LedgerInner {
         if self.needs_ensure {
             self.ensure_gov_session(gov_path).await;
         }
+        // shared 面缺账补写：上一轮失败事件先于新事件重试（Persisted 即
+        // 移除；仍失败保留队列下次再试——不阻断本轮）
+        self.flush_pending_shared().await;
         let fact_id = match self.prev_fact {
             Some(prev) => match self.store.write_event_with_cause(event.clone(), prev).await {
                 Ok(fid) => fid,
@@ -366,14 +395,16 @@ impl LedgerInner {
                     // 自愈传感器：session 在手但 HTTP 失败（404 类/瞬时）
                     Ok(PersistOutcome::CacheOnly) => {
                         self.needs_ensure = true;
-                        tracing::warn!(event_id = %event.event_id, "event ledger: shared-face dual write CacheOnly; gov session re-ensure armed");
+                        self.pending_shared.push((key, value));
+                        tracing::warn!(event_id = %event.event_id, "event ledger: shared-face dual write CacheOnly; gov session re-ensure armed, queued for replay");
                     }
                     // 自愈传感器：session 未设（注入前/失效后）
                     Err(e) => {
                         if matches!(e, MemoryError::SessionNotSet) {
                             self.needs_ensure = true;
                         }
-                        tracing::warn!(event_id = %event.event_id, error = %e, "event ledger: shared-face dual write failed");
+                        self.pending_shared.push((key, value));
+                        tracing::warn!(event_id = %event.event_id, error = %e, "event ledger: shared-face dual write failed; queued for replay");
                     }
                 }
             }
@@ -417,6 +448,7 @@ impl EventLedger {
                 turn_warned: false,
                 turn_dropped: 0,
                 needs_ensure: false,
+                pending_shared: Vec::new(),
             }),
             gov_session_path: OnceLock::new(),
         }
@@ -577,6 +609,7 @@ mod tests {
             turn_warned: false,
             turn_dropped: 0,
             needs_ensure: false,
+            pending_shared: Vec::new(),
         };
         let admitted: Vec<bool> = (0..7).map(|_| inner.try_admit_tool_event()).collect();
         assert_eq!(
@@ -589,6 +622,30 @@ mod tests {
         inner.turn_written = 0;
         inner.turn_warned = false;
         assert!(inner.try_admit_tool_event());
+    }
+
+    #[tokio::test]
+    async fn pending_shared_survives_failed_replay() {
+        // 补写闭环：shared 面失败事件暂存队列，重试仍失败（dead client）→
+        // 保留队列下次再试（修复前：缺账事件永不补写，无 pending 结构）。
+        let mut inner = LedgerInner {
+            store: MemoryEventStore::new("agent_test", dead_client()),
+            memory: MemoryManager::new("agent_test", dead_client()),
+            client: dead_client(),
+            seq: 0,
+            prev_fact: None,
+            turn_written: 0,
+            turn_warned: false,
+            turn_dropped: 0,
+            needs_ensure: false,
+            pending_shared: vec![("events.EL-000001".to_string(), "{}".to_string())],
+        };
+        inner.flush_pending_shared().await;
+        assert_eq!(
+            inner.pending_shared.len(),
+            1,
+            "失败重试后事件必须保留在队列（修复前红=无补写机制）"
+        );
     }
 
     #[tokio::test]
@@ -717,6 +774,7 @@ mod tests {
             turn_warned: false,
             turn_dropped: 0,
             needs_ensure: false,
+            pending_shared: Vec::new(),
         };
         // 传感器：写入失败（fact_id=0）武装自愈待办
         let e1 = build_tool_event(1, "echo", true, 1, None, now_secs());
