@@ -4882,8 +4882,20 @@ fn test_clear_tool_results_largest_first_within_cap() {
     let (out, cleared) = clear_tool_results(&region, 2);
     assert_eq!(cleared, 2);
     assert_eq!(out[0].content(), region[0].content(), "短条保留");
-    assert_eq!(out[2].content(), "[cleared: b]");
-    assert_eq!(out[3].content(), "[cleared: c]");
+    assert!(
+        out[2]
+            .content()
+            .starts_with("[context-offloaded: source=compaction tool=b"),
+        "统一形态: {}",
+        out[2].content()
+    );
+    assert!(
+        out[3]
+            .content()
+            .starts_with("[context-offloaded: source=compaction tool=c"),
+        "统一形态: {}",
+        out[3].content()
+    );
     // 非 tool 消息不受影响
     assert_eq!(out[1].content(), "u");
 }
@@ -7315,7 +7327,10 @@ fn stale_demotion_enabled_replaces_stale_and_persists_fetchable_file() {
         other => panic!("expected Tool, got {other:?}"),
     };
     let ph = view[stale_idx].content();
-    assert!(ph.starts_with("[STALE_TOOL_RESULT]"), "占位块形态: {ph}");
+    assert!(
+        ph.starts_with("[context-offloaded: source=trim-stale"),
+        "占位块形态: {ph}"
+    );
     let digest = crate::agent::journal::evorule_digest(&original);
     let hex = digest.rsplit(':').next().unwrap();
     let ref_id = format!("stale-{hex}");
