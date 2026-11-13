@@ -49,6 +49,10 @@ pub const SLOT_SOURCES: &[&str] = &[
 /// 记忆区降级层白名单（降级顺序声明的合法值）
 pub const DEGRADATION_LAYERS: &[&str] = &["stable", "summaries", "events"];
 
+/// 记忆区预算缺省比例（L-1 残余单源化：S3_memory 声明与槽位未声明
+/// budget 时两个 None 分支的默认口径共引此常数，消灭三处字面量重复）
+const DEFAULT_MEMORY_RATIO: f32 = 0.25;
+
 /// 裁剪策略白名单（现状唯一实现;新增策略 = 执行器升级 = major）
 pub const TRIM_STRATEGIES: &[&str] = &["KeepSystemKeepLast"];
 
@@ -134,9 +138,17 @@ pub struct BudgetSpec {
     /// 响应预留百分比（现状 max_tokens/4 = 25%）
     #[serde(default = "default_reserve_pct")]
     pub reserve_for_response_pct: u32,
-    /// 工具输出回喂字符上限（现状 TOOL_RESULT_MAX_CHARS = 48000）
+    /// 工具输出回喂字符上限（现状 TOOL_RESULT_MAX_CHARS = 48000;
+    /// K-1 案 A 后为旧键——生效值按 ASCII 基准 /4 折算 token,仅在
+    /// 新键未显式声明时参与折算,见 [`BudgetSpec::tool_result_max_tokens`])
     #[serde(default = "default_tool_result_max_chars")]
     pub tool_result_max_chars: usize,
+    /// 工具输出回喂 token 上限（K-1 案 A token 化迁移;缺省 12000 ≈ 48K
+    /// ASCII 字符/4,与旧字符口径等价）。None = 未显式声明,按旧键
+    /// `tool_result_max_chars` /4 折算(兼容既有配方);显式声明优先于旧键。
+    /// 生效值 clamp 1000..=100000,见 `AssemblyExecutor::tool_result_max_tokens`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_max_tokens: Option<usize>,
     /// 陈旧工具结果发送视图降级声明（可选段;五轮裁定批 G2/B-303:缺省/缺键
     /// = Some(默认参数) = 开启——"被裁内容必须可查可重建"纪律缺省成立;
     /// 显式 `null` = 关闭（逐字节回退旧行为）。缺省翻转属行为变更,
@@ -289,6 +301,7 @@ impl Default for BudgetSpec {
             window_tokens_source: default_window_tokens_source(),
             reserve_for_response_pct: default_reserve_pct(),
             tool_result_max_chars: default_tool_result_max_chars(),
+            tool_result_max_tokens: None,
             stale_result_demotion: default_stale_demotion_enabled(),
             mechanism_messages: default_mechanism_messages_enabled(),
         }
@@ -393,7 +406,7 @@ fn default_slots() -> Vec<SlotSpec> {
             optional: false,
             enabled: true,
             budget: Some(SlotBudget {
-                ratio: 0.25,
+                ratio: DEFAULT_MEMORY_RATIO,
                 base: "input".to_string(),
                 clamp: [0.1, 0.5],
             }),
@@ -859,9 +872,25 @@ impl AssemblyExecutor {
         self.recipe.budget.reserve_for_response_pct
     }
 
-    /// 工具输出回喂字符上限(默认配方 48000 = 现状 TOOL_RESULT_MAX_CHARS)
+    /// 工具输出回喂字符上限(默认配方 48000 = 现状 TOOL_RESULT_MAX_CHARS;
+    /// K-1 案 A 后为旧键,仅作兼容读取与折算基准,见
+    /// [`Self::tool_result_max_tokens`])
     pub fn tool_result_max_chars(&self) -> usize {
         self.recipe.budget.tool_result_max_chars
+    }
+
+    /// 工具输出回喂 token 上限生效值(K-1 案 A token 化迁移)
+    ///
+    /// 折算与钳制口径:新键显式声明优先;None 时按旧键 ASCII 基准 /4 折算
+    /// (48K chars → 12K tokens,语义近似保留);生效值 clamp 1000..=100000
+    /// (构造期钳制,防声明过小把回喂全截没/过大失去预算意义)。
+    pub fn tool_result_max_tokens(&self) -> usize {
+        let raw = self
+            .recipe
+            .budget
+            .tool_result_max_tokens
+            .unwrap_or(self.recipe.budget.tool_result_max_chars / 4);
+        raw.clamp(1_000, 100_000)
     }
 
     /// 陈旧工具结果发送视图降级声明(None = 默认关闭——发送视图零变化)
@@ -1133,10 +1162,11 @@ impl AssemblyExecutor {
                                         self.budget_base_tokens(&b.base, total_window)?;
                                     crate::agent::memory::ContextBudget::new(base_tokens, b.ratio)
                                 }
-                                // 槽位未声明 budget:默认口径(input 基×0.25,与默认配方一致)
+                                // 槽位未声明 budget:默认口径(input 基×DEFAULT_MEMORY_RATIO,
+                                // 与默认配方 S3 声明一致)
                                 None => crate::agent::memory::ContextBudget::new(
                                     self.budget_base_tokens("input", total_window)?,
-                                    0.25,
+                                    DEFAULT_MEMORY_RATIO,
                                 ),
                             };
                             let region = mem.build_system_prompt_with_recall("", recall, &budget);
@@ -1164,10 +1194,11 @@ impl AssemblyExecutor {
                                         self.budget_base_tokens(&b.base, total_window)?;
                                     crate::agent::memory::ContextBudget::new(base_tokens, b.ratio)
                                 }
-                                // 槽位未声明 budget:默认口径(input 基×0.25,与默认配方一致)
+                                // 槽位未声明 budget:默认口径(input 基×DEFAULT_MEMORY_RATIO,
+                                // 与默认配方 S3 声明一致)
                                 None => crate::agent::memory::ContextBudget::new(
                                     self.budget_base_tokens("input", total_window)?,
-                                    0.25,
+                                    DEFAULT_MEMORY_RATIO,
                                 ),
                             };
                             prompt = mem.build_system_prompt_with_recall(&prompt, recall, &budget);
@@ -1367,6 +1398,52 @@ mod tests {
     fn test_empty_object_deserializes_to_default() {
         let r: AssemblyRecipe = serde_json::from_str("{}").unwrap();
         assert_eq!(r, AssemblyRecipe::default());
+    }
+
+    // ===== K-1 案 A:tool_result_max_tokens 配置面(测试矩阵 ①②③⑥)=====
+
+    /// ①缺省 12000(= 旧键 48000 ASCII 基准 /4,等价迁移)
+    #[test]
+    fn test_tool_result_max_tokens_default_12000() {
+        let exec = AssemblyExecutor::default_executor();
+        assert_eq!(exec.tool_result_max_tokens(), 12_000);
+        // 缺省序列化面不携带新键(skip_serializing_if None)
+        let s = serde_json::to_string(&AssemblyRecipe::default()).unwrap();
+        assert!(!s.contains("tool_result_max_tokens"));
+    }
+
+    /// ②旧键折算:仅声明旧键 tool_result_max_chars 时按 ASCII 基准 /4 折算
+    #[test]
+    fn test_tool_result_max_tokens_old_key_divides_by_four() {
+        let r: AssemblyRecipe =
+            serde_json::from_str(r#"{"budget":{"tool_result_max_chars":20000}}"#).unwrap();
+        let exec = AssemblyExecutor::new(r);
+        assert_eq!(exec.tool_result_max_tokens(), 5_000);
+    }
+
+    /// ③新键优先:两键并存时显式声明的 token 值生效,旧键不参与折算
+    #[test]
+    fn test_tool_result_max_tokens_new_key_wins() {
+        let r: AssemblyRecipe = serde_json::from_str(
+            r#"{"budget":{"tool_result_max_chars":48000,"tool_result_max_tokens":5000}}"#,
+        )
+        .unwrap();
+        let exec = AssemblyExecutor::new(r);
+        assert_eq!(exec.tool_result_max_tokens(), 5_000);
+    }
+
+    /// ⑥clamp 边界:生效值钳制 1000..=100000(999→1000,100001→100000)
+    #[test]
+    fn test_tool_result_max_tokens_clamped() {
+        let low: AssemblyRecipe =
+            serde_json::from_str(r#"{"budget":{"tool_result_max_tokens":999}}"#).unwrap();
+        assert_eq!(AssemblyExecutor::new(low).tool_result_max_tokens(), 1_000);
+        let high: AssemblyRecipe =
+            serde_json::from_str(r#"{"budget":{"tool_result_max_tokens":100001}}"#).unwrap();
+        assert_eq!(
+            AssemblyExecutor::new(high).tool_result_max_tokens(),
+            100_000
+        );
     }
 
     /// 五轮裁定批 G2/B-303:两层安全网缺省开启(缺省/缺键 = Some);

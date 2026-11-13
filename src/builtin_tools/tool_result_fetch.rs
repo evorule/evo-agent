@@ -5,7 +5,7 @@
 //!
 //! **执行真源在 runner**:[`AgentRunner::execute_tool_result_fetch`]
 //! (runner.rs 保留名直拦,先于治理管道)——持有 journal_dir 与
-//! tool_result_max_chars 会话态,是本工具的唯一真执行点。
+//! tool_result_max_tokens 会话态,是本工具的唯一真执行点。
 //!
 //! 本 stub 的存在意义仅为「注册必须 manifest+执行器成对在场」的工具面
 //! 统一架构硬规则 1:把工具挂进 LLM 契约面。此前该工具不在任何

@@ -985,19 +985,13 @@ impl ContextBudget {
     ///   经验值只对 ASCII 成立。
     /// - 本实现：ASCII 按 chars/4（英文行为不变），非 ASCII（CJK 为主）
     ///   按 1 token/字计，消除中文预算超发。确定性、零依赖、可复现。
+    ///
+    /// R-3 单源化：实现体收敛至公共函数
+    /// `crate::agent::context_window::approx_token_len`（本函数为其
+    /// 记忆区入口转发，序列入口 ApproxTokenCounter::count_text 同源），
+    /// 消灭同式异码；语义文档与唯一实现在该函数处。
     pub(crate) fn estimate_tokens(text: &str) -> usize {
-        let mut tokens = 0usize;
-        let mut ascii_run = 0usize;
-        for ch in text.chars() {
-            if ch.is_ascii() {
-                ascii_run += 1;
-            } else {
-                tokens += ascii_run / 4;
-                ascii_run = 0;
-                tokens += 1;
-            }
-        }
-        tokens + ascii_run / 4
+        crate::agent::context_window::approx_token_len(text)
     }
 
     /// C3: 在 memory_cap 内组装记忆块；超限按降级顺序截断。
@@ -1017,7 +1011,6 @@ impl ContextBudget {
             return; // 不限制
         }
         let budget = self.memory_cap();
-        let mut used = 0;
 
         // L2 稳定事实优先（硬注入）。System 域条目（安全约束/系统边界）为
         // 常驻豁免：不占预算计数、永不截断——比例预算小于常驻面本身就是

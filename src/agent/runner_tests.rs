@@ -2762,7 +2762,7 @@ fn test_g15_rec_to_message_system() {
         fact_id: None,
     };
     let msg =
-        rec_to_message(&rec, recipe_tool_result_max_chars()).expect("system rec should convert");
+        rec_to_message(&rec, recipe_tool_result_max_tokens()).expect("system rec should convert");
     assert!(matches!(msg, Message::System { ref content } if content == "You are helpful"));
 }
 
@@ -2779,7 +2779,7 @@ fn test_g15_rec_to_message_user() {
         fact_id: None,
     };
     let msg =
-        rec_to_message(&rec, recipe_tool_result_max_chars()).expect("user rec should convert");
+        rec_to_message(&rec, recipe_tool_result_max_tokens()).expect("user rec should convert");
     assert!(matches!(msg, Message::User { ref content, .. } if content == "Hello"));
 }
 
@@ -2798,8 +2798,8 @@ fn test_g15_rec_to_message_assistant_with_tool_calls() {
         reasoning: None,
         fact_id: None,
     };
-    let msg =
-        rec_to_message(&rec, recipe_tool_result_max_chars()).expect("assistant rec should convert");
+    let msg = rec_to_message(&rec, recipe_tool_result_max_tokens())
+        .expect("assistant rec should convert");
     match msg {
         Message::Assistant {
             content,
@@ -2826,8 +2826,8 @@ fn test_g15_rec_to_message_assistant_without_tool_calls() {
         reasoning: None,
         fact_id: None,
     };
-    let msg =
-        rec_to_message(&rec, recipe_tool_result_max_chars()).expect("assistant rec should convert");
+    let msg = rec_to_message(&rec, recipe_tool_result_max_tokens())
+        .expect("assistant rec should convert");
     match msg {
         Message::Assistant {
             content,
@@ -2855,8 +2855,8 @@ fn test_g15_rec_with_reasoning_strips_for_replay_and_wire() {
         timestamp: 0,
         fact_id: None,
     };
-    let msg =
-        rec_to_message(&rec, recipe_tool_result_max_chars()).expect("assistant rec should convert");
+    let msg = rec_to_message(&rec, recipe_tool_result_max_tokens())
+        .expect("assistant rec should convert");
     let wire = serde_json::to_value(&msg).unwrap();
     assert!(wire.get("reasoning").is_none(), "回放形状不得含 reasoning");
 }
@@ -2874,7 +2874,7 @@ fn test_g15_rec_to_message_tool() {
         fact_id: None,
     };
     let msg =
-        rec_to_message(&rec, recipe_tool_result_max_chars()).expect("tool rec should convert");
+        rec_to_message(&rec, recipe_tool_result_max_tokens()).expect("tool rec should convert");
     assert!(
         matches!(msg, Message::Tool { ref content, ref tool_name, .. } if content == "result data" && tool_name == "search")
     );
@@ -2883,11 +2883,10 @@ fn test_g15_rec_to_message_tool() {
 #[test]
 fn test_g15_rec_to_message_tool_long_content_truncated() {
     // 重建路径与运行中回喂 wire 形态一致:超限 tool 记录重建时同样截断
-    // 元层先行批:上限 = 配方生效值(默认配方 48000,与原常量等价)
-    let max_chars = crate::agent::assembly::AssemblyRecipe::default()
-        .budget
-        .tool_result_max_chars;
-    let raw = "a".repeat(max_chars + 100);
+    // K-1 案 A:上限 = 配方生效 token 值(缺省 12000,ASCII 4 chars/1 token)
+    let max_tokens =
+        crate::agent::assembly::AssemblyExecutor::default_executor().tool_result_max_tokens();
+    let raw = "a".repeat(max_tokens * 4 + 100);
     let rec = MessageRecord {
         idx: 3,
         role: "tool".to_string(),
@@ -2898,17 +2897,17 @@ fn test_g15_rec_to_message_tool_long_content_truncated() {
         reasoning: None,
         fact_id: None,
     };
-    let msg = rec_to_message(&rec, max_chars).expect("tool rec should convert");
+    let msg = rec_to_message(&rec, max_tokens).expect("tool rec should convert");
     match msg {
         Message::Tool {
             content, tool_name, ..
         } => {
             assert_eq!(tool_name, "search");
             assert!(
-                content.contains("[truncated 100 chars]"),
+                content.contains("[truncated ") && content.contains(" chars]..."),
                 "reconstructed tool content must be truncated like the live feed path"
             );
-            assert!(content.chars().count() <= max_chars);
+            assert!(crate::agent::context_window::approx_token_len(&content) <= max_tokens);
         }
         other => panic!("expected Tool message, got {other:?}"),
     }
@@ -2927,7 +2926,7 @@ fn test_g15_rec_to_message_tool_missing_name() {
         fact_id: None,
     };
     assert!(
-        rec_to_message(&rec, recipe_tool_result_max_chars()).is_none(),
+        rec_to_message(&rec, recipe_tool_result_max_tokens()).is_none(),
         "tool without name should return None"
     );
 }
@@ -2945,7 +2944,7 @@ fn test_g15_rec_to_message_unknown_role() {
         fact_id: None,
     };
     assert!(
-        rec_to_message(&rec, recipe_tool_result_max_chars()).is_none(),
+        rec_to_message(&rec, recipe_tool_result_max_tokens()).is_none(),
         "unknown role should return None"
     );
 }
@@ -4381,53 +4380,58 @@ fn m5c_constraint_asset_domain_paths_are_exec_relative() {
 }
 
 // ----- tool_result 回喂截断 -----
-// 元层先行批:上限 = 配方生效值(默认配方 48000,与原常量等价)
-fn recipe_tool_result_max_chars() -> usize {
-    crate::agent::assembly::AssemblyRecipe::default()
-        .budget
-        .tool_result_max_chars
+// K-1 案 A:上限 = 配方生效 token 值(缺省 12000 ≈ 48K ASCII 字符/4,等价迁移)
+fn recipe_tool_result_max_tokens() -> usize {
+    crate::agent::assembly::AssemblyExecutor::default_executor().tool_result_max_tokens()
 }
 
 #[test]
 fn truncate_tool_result_short_unchanged() {
     assert_eq!(
-        truncate_tool_result("hello".to_string(), recipe_tool_result_max_chars()),
+        truncate_tool_result("hello".to_string(), recipe_tool_result_max_tokens()),
         "hello"
     );
 }
 
 #[test]
 fn truncate_tool_result_exact_boundary_unchanged() {
-    let cap = recipe_tool_result_max_chars();
-    let s = "x".repeat(cap);
+    // 精确边界:48K ASCII 字符 = 12000 token(ASCII 4 chars/1 token),不截
+    let cap = recipe_tool_result_max_tokens();
+    let s = "x".repeat(cap * 4);
     assert_eq!(truncate_tool_result(s.clone(), cap), s);
 }
 
 #[test]
 fn truncate_tool_result_long_truncated_with_marker() {
-    let cap = recipe_tool_result_max_chars();
-    let s = "a".repeat(cap + 100);
+    let cap = recipe_tool_result_max_tokens();
+    let s = "a".repeat(cap * 4 + 100);
     let out = truncate_tool_result(s, cap);
+    // 标注 N = 实际丢弃字符数(K-1 案 A 精确化;旧实现按 total-cap 低估)
     assert!(
-        out.contains("[truncated 100 chars]"),
-        "marker must carry exact truncated count, tail: {}",
+        out.contains("[truncated ") && out.contains(" chars]..."),
+        "marker shape must be preserved, tail: {}",
         &out[out.len().saturating_sub(80)..]
+    );
+    assert!(
+        !out.contains("[truncated 0 chars]"),
+        "must not claim zero drop"
     );
     assert!(out.starts_with("aaaa"), "head half must be preserved");
     assert!(out.ends_with("aaaa"), "tail half must be preserved");
     assert!(
-        out.chars().count() <= cap,
-        "truncated output must not exceed the cap"
+        crate::agent::context_window::approx_token_len(&out) <= cap,
+        "truncated output must not exceed the token cap"
     );
 }
 
 #[test]
 fn truncate_tool_result_cjk_char_boundary_safe() {
-    // CJK 3 字节/字符:字节超限但必须按字符边界切,不得 panic
-    let cap = recipe_tool_result_max_chars();
+    // CJK 1 char ≈ 1 token:12050 个汉字 > 12000 token 上限必须截,
+    // 且必须按字符边界切,不得 panic
+    let cap = recipe_tool_result_max_tokens();
     let s: String = std::iter::repeat_n('中', cap + 50).collect();
     let out = truncate_tool_result(s, cap);
-    assert!(out.contains("[truncated 50 chars]"));
+    assert!(out.contains("[truncated ") && out.contains(" chars]..."));
     assert!(out.starts_with('中'));
     assert!(out.ends_with('中'));
 }
@@ -4440,13 +4444,41 @@ fn truncate_tool_result_keeps_head_and_tail() {
         "M".repeat(30_000),
         "T".repeat(30_000)
     );
-    let out = truncate_tool_result(s, recipe_tool_result_max_chars());
+    let out = truncate_tool_result(s, recipe_tool_result_max_tokens());
     assert!(
         out.starts_with('H'),
         "head half must come from original head"
     );
     assert!(out.ends_with('T'), "tail half must come from original tail");
     assert!(!out.contains('M'), "middle section must be cut");
+}
+
+// K-1 案 A 测试矩阵 ④⑤:CJK/英文在 token 上限下的保留与截断边界
+#[test]
+fn truncate_tool_result_token_budget_matrix_cjk_and_ascii() {
+    let cap = recipe_tool_result_max_tokens();
+    // ④ CJK:12K 字全保留(1 字 ≈ 1 token),12.5K 字截断
+    // (修复前按字符计量 12K 中文字符仅折 3K token,预算系统性超发)
+    let cjk_fit: String = std::iter::repeat_n('字', cap).collect();
+    assert_eq!(
+        truncate_tool_result(cjk_fit.clone(), cap),
+        cjk_fit,
+        "CJK content exactly at token cap must be preserved"
+    );
+    let cjk_over: String = std::iter::repeat_n('字', cap + 500).collect();
+    let out = truncate_tool_result(cjk_over, cap);
+    assert!(out.contains("[truncated ") && out.contains(" chars]..."));
+    // ⑤ 英文:48K 字符等价保留(12000 token),48.1K 截断——与旧字符口径
+    // 等价迁移
+    let ascii_fit = "a".repeat(cap * 4);
+    assert_eq!(
+        truncate_tool_result(ascii_fit.clone(), cap),
+        ascii_fit,
+        "ASCII content at old char cap must be preserved"
+    );
+    let ascii_over = "a".repeat(cap * 4 + 100);
+    let out = truncate_tool_result(ascii_over, cap);
+    assert!(out.contains("[truncated ") && out.contains(" chars]..."));
 }
 
 // === 自省记忆工具接线测试(阶段 3 F-611)===
@@ -7034,11 +7066,11 @@ fn gate_offload_failure_records_truncation_event() {
             crate::agent::journal::JournalEvent::ToolResultTruncated {
                 tool,
                 size_bytes,
-                max_chars,
+                max_tokens,
                 reason,
             } if tool == "audit_get"
                 && *size_bytes == 60000
-                && *max_chars == 48000
+                && *max_tokens == 12000
                 && reason == "offload_failed"
         )
     });
