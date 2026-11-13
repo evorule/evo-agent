@@ -301,7 +301,18 @@ jobs:
         shell: bash
         run: |
           CARGO_BUILD_JOBS=2 cargo test --test pty_smoke --no-run
-          BIN=$(find target/debug/deps -maxdepth 1 -name 'pty_smoke-*' -type f -perm -u+x ! -name '*.d' | head -1)
+          # the executable path is printed by cargo and may live under
+          # target/debug/deps or target/debug/build/**/out (generated test
+          # target); search both instead of hardcoding one location
+          BIN=$(cargo test --test pty_smoke --no-run --message-format=json 2>/dev/null \
+            | grep -o '"executable":"[^"]*pty_smoke[^"]*"' | head -1 \
+            | sed 's/"executable":"//; s/"$//')
+          if [ -z "$BIN" ]; then
+            BIN=$(find target/debug/deps target/debug/build -name 'pty_smoke-*' -type f -perm -u+x ! -name '*.d' 2>/dev/null | head -1)
+          fi
+          test -n "$BIN" || { echo "pty_smoke binary not found under target/debug"; exit 1; }
+          BIN=${BIN#"$PWD/"}
+          test -f "$BIN" || { echo "pty_smoke binary missing after relativization: $BIN"; exit 1; }
           echo "pty smoke binary: $BIN"
           docker run --rm -v "$PWD:/work" -w /work ubuntu:22.04 "$BIN" --test-threads 1 --nocapture
 
