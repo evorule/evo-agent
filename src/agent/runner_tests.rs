@@ -3193,6 +3193,7 @@ async fn test_capability_boundary_sent_in_create_session() {
         sandbox_root: std::env::temp_dir(),
         tools: vec!["file_read".to_string()],
         read_root: None,
+        write_domain: None,
     };
 
     // 断言请求体含 initial_content.capability_boundary(PartialJson 子集匹配;
@@ -3695,6 +3696,7 @@ fn m5c_boundary() -> CapabilityBoundary {
         }),
         tools: vec!["file_read".to_string(), "file_write".to_string()],
         read_root: None,
+        write_domain: None,
     }
 }
 
@@ -6596,6 +6598,62 @@ fn test_emergency_trim_folds_oldest_and_compacts_keeps_recent_rounds() {
         "近程内工具结果保真"
     );
     assert!(report.after_chars < report.before_chars);
+}
+
+/// 紧急裁剪③层丢界补账(B-367):被压缩区角色分布随 report 落账
+#[test]
+fn test_emergency_trim_reports_removed_role_inventory() {
+    use super::emergency_trim_for_payload_limit;
+    let big = |n: usize| "x".repeat(n);
+    let mut msgs = vec![Message::System {
+        content: "sys".into(),
+    }];
+    for i in 0..(EMERGENCY_TRIM_KEEP_ROUNDS + 1) {
+        msgs.push(Message::User {
+            content: format!("u{i}"),
+            images: vec![],
+        });
+        msgs.push(Message::Assistant {
+            content: format!("a{i}"),
+            tool_calls: None,
+        });
+        msgs.push(Message::Tool {
+            content: big(40_000),
+            tool_name: "file_read".into(),
+            images: vec![],
+        });
+    }
+    let report = emergency_trim_for_payload_limit(&mut msgs);
+    assert!(report.history_compacted, "③必触发");
+    let (start, end) = report.region.expect("region 在场");
+    assert_eq!(end - start, 3, "被压缩区=最老一轮 3 条");
+    assert_eq!(
+        report.removed_by_role.get("user"),
+        Some(&1),
+        "实际: {:?}",
+        report.removed_by_role
+    );
+    assert_eq!(report.removed_by_role.get("assistant"), Some(&1));
+    assert_eq!(report.removed_by_role.get("tool"), Some(&1));
+    assert_eq!(
+        report.removed_by_role.values().sum::<usize>(),
+        end - start,
+        "角色分布合计=被移除消息数"
+    );
+    // ③未触发时角色分布为空(与 region None 同步)
+    let mut small = vec![
+        Message::System {
+            content: "sys".into(),
+        },
+        Message::User {
+            content: big(50_000),
+            images: vec![],
+        },
+    ];
+    let r2 = emergency_trim_for_payload_limit(&mut small);
+    assert!(!r2.history_compacted);
+    assert!(r2.removed_by_role.is_empty());
+    assert_eq!(r2.region, None);
 }
 
 /// 紧急裁剪②层:审批往返 User 轮收敛为单行决策记录

@@ -352,15 +352,24 @@ impl Default for StorageConfig {
 }
 
 /// 记忆配方规则集（F-610）：召回权重/生命周期/预算/源启用的策略声明面
+///
+/// 部分声明语义（B-367）：策略节（tools/sources/adjudication/promote_gate/
+/// storage/lex_ttl_secs）与本核四字段均带缺省——声明只需携带要覆盖的节，
+/// 未声明节取机制缺省（与 `MemoryRecipe::default()` 同源单点）。缺省不变式：
+/// 整份配方缺席（None）仍走词法 legacy 路径，行为零变化。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRecipe {
     /// 配方版本（memory-v1.0 起）
+    #[serde(default = "default_recipe_version")]
     pub recipe_version: String,
     /// 检索策略
+    #[serde(default = "default_retrieval_config")]
     pub retrieval: RetrievalConfig,
     /// 生命周期阈值
+    #[serde(default = "default_lifecycle_config")]
     pub lifecycle: LifecycleConfig,
     /// 预算降级序
+    #[serde(default = "default_budget_config")]
     pub budget: BudgetConfig,
     /// 自省工具暴露面（F-611；缺省=不暴露任何工具）
     #[serde(default)]
@@ -424,6 +433,21 @@ impl Default for MemoryRecipe {
             lex_ttl_secs: None,
         }
     }
+}
+
+/// 部分声明缺省源（B-367）：与 `MemoryRecipe::default()` 同源单点，
+/// 供 serde 字段级缺省引用——禁止第二处手抄默认值。
+fn default_recipe_version() -> String {
+    MemoryRecipe::default().recipe_version
+}
+fn default_retrieval_config() -> RetrievalConfig {
+    MemoryRecipe::default().retrieval
+}
+fn default_lifecycle_config() -> LifecycleConfig {
+    MemoryRecipe::default().lifecycle
+}
+fn default_budget_config() -> BudgetConfig {
+    MemoryRecipe::default().budget
 }
 
 /// R1：检索策略上下文——召回入口构造，贯穿候选→评分→截断→分档全链。
@@ -666,6 +690,28 @@ mod tests {
         assert_eq!(r.retrieval.w_recency, 0.3);
         assert_eq!(r.lifecycle.rollup_threshold, 10);
         assert_eq!(r.budget.degradation_order[0], "stable");
+    }
+
+    #[test]
+    fn test_recipe_partial_declaration_policy_only_sections() {
+        // B-367 部分声明硬化:仅声明策略节(tools/adjudication),核四字段
+        // (recipe_version/retrieval/lifecycle/budget)缺省补齐——未声明节取
+        // 机制缺省(与 MemoryRecipe::default() 同源单点)
+        let json = r#"{
+            "tools": { "expose": ["memory_search", "memory_get"] },
+            "adjudication": { "enabled": true }
+        }"#;
+        let r: MemoryRecipe = serde_json::from_str(json)
+            .expect("policy-only recipe must deserialize with core defaults");
+        assert_eq!(r.recipe_version, MemoryRecipe::default().recipe_version);
+        assert_eq!(r.retrieval, MemoryRecipe::default().retrieval);
+        assert_eq!(r.lifecycle, MemoryRecipe::default().lifecycle);
+        assert_eq!(r.budget, MemoryRecipe::default().budget);
+        assert_eq!(
+            r.tools.expose,
+            vec!["memory_search".to_string(), "memory_get".to_string()]
+        );
+        assert!(r.adjudication.enabled);
     }
 
     #[test]

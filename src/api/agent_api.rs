@@ -1752,6 +1752,7 @@ async fn run_agent(
         &def,
         boundary_root,
         state.read_root(),
+        Some(state.workdir()),
     );
     // S2 治理门禁段(S2 前移批):三段合并构造,经 runner 配置进组装层
     // (v2 序=权威紧跟 S1 身份段之后;不再改写 def.system_prompt——K-17②)
@@ -2244,6 +2245,7 @@ async fn run_agent_stream(
         &def,
         boundary_root,
         state.read_root(),
+        Some(state.workdir()),
     );
     // S2 治理门禁段(S2 前移批):同 run_agent 口径
     let governance_segment =

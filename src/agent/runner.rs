@@ -5760,6 +5760,8 @@ impl AgentRunner {
                         tr.elided_tool_results,
                         tr.folded_approvals,
                         tr.history_compacted,
+                        tr.removed_by_role.clone(),
+                        tr.region,
                     ) {
                         tracing::warn!(session_id = %session_id, error = %je, "emergency_trim_performed journal failed (best-effort)");
                     }
@@ -9565,6 +9567,8 @@ impl AgentRunner {
                                                                    tr.elided_tool_results,
                                                                    tr.folded_approvals,
                                                                    tr.history_compacted,
+                                                                   tr.removed_by_role.clone(),
+                                                                   tr.region,
                                                                ) {
                                                                    tracing::warn!(session_id = %session_id, error = %je, "emergency_trim_performed journal failed (best-effort)");
                                                                }
@@ -9762,6 +9766,8 @@ impl AgentRunner {
                                                                        report.elided_tool_results,
                                                                        report.folded_approvals,
                                                                        report.history_compacted,
+                                                                       report.removed_by_role.clone(),
+                                                                       report.region,
                                                                    ) {
                                                                        tracing::warn!(session_id = %session_id, error = %je, "emergency_trim_performed journal failed (best-effort)");
                                                                    }
@@ -12660,6 +12666,9 @@ pub(crate) struct EmergencyTrimReport {
     pub edits: Vec<(usize, String)>,
     /// 整段压缩区内容哈希(region 触发时=drain 前对当前区切片计;未触发=空串)
     pub region_hash: String,
+    /// 整段压缩区被移除消息的角色分布(③层触发时非空;B-367 丢界补账——
+    /// journal 载荷可回放「删了什么类型」,重建证据链免盲搜 JSONL)
+    pub removed_by_role: std::collections::BTreeMap<String, usize>,
 }
 
 /// ③层压缩占位符携带的图片指纹引用条数上限(超出收敛为 +N more)
@@ -12839,6 +12848,19 @@ pub(crate) fn emergency_trim_for_payload_limit(messages: &mut Vec<Message>) -> E
             };
             // 区内容哈希(drain 前对当前区切片计;与摘要缓存键同源)
             report.region_hash = region_hash_of(&messages[sys_end..split]);
+            // 丢界补账(B-367):被压缩区角色分布随载荷落账,压缩事件不再只有计数
+            let mut removed_by_role: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for m in &messages[sys_end..split] {
+                let role = match m {
+                    Message::System { .. } => "system",
+                    Message::User { .. } => "user",
+                    Message::Assistant { .. } => "assistant",
+                    Message::Tool { .. } => "tool",
+                };
+                *removed_by_role.entry(role.to_string()).or_insert(0) += 1;
+            }
+            report.removed_by_role = removed_by_role;
             let placeholder = format!(
                 "[history compacted due to request body limit: {elided} messages removed]{note}"
             );

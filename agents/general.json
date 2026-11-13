@@ -101,7 +101,15 @@
     "max_injected_events": 5,
     "enable_event_extraction": true,
     "summary_model": "MiniMax-M3",
-    "lex_store": "data/lex/general.db"
+    "lex_store": "data/lex/general.db",
+    "recipe": {
+      "tools": {
+        "expose": ["memory_search", "memory_get"]
+      },
+      "adjudication": {
+        "enabled": true
+      }
+    }
   },
   "verify": {
     "commands": [

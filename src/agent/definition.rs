@@ -297,6 +297,13 @@ pub struct CapabilityBoundary {
     /// 行为与 v1 完全一致。显式声明 def.json 亦可携带(同受绝对路径门卫)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_root: Option<PathBuf>,
+    /// 写面实域(可选,绝对路径):缺省合成路径由装配点注入(写面工具实际绑定
+    /// 域=toolkit workdir/DEFAULT_WRITABLE_DIR);显式声明路径不填——read_write
+    /// 声明经边界重绑按 sandbox_root 全域可写,可写域=sandbox_root 即准确。
+    /// awareness「可写域」行在场且异于 sandbox_root 时优先渲染本字段
+    /// (声明跟实现:修复「声明=全域、实际=workspace 子域」的文案失真)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_domain: Option<PathBuf>,
     /// 边界内工具清单(语义门卫:顶层 tools 中的沙箱类工具必须列于此;
     /// mode=read_only 时不得含 file_write)
     pub tools: Vec<String>,
@@ -327,6 +334,9 @@ impl CapabilityBoundary {
         if let Some(r) = &self.read_root {
             inner["read_root"] = serde_json::Value::from(r.display().to_string());
         }
+        if let Some(w) = &self.write_domain {
+            inner["write_domain"] = serde_json::Value::from(w.display().to_string());
+        }
         serde_json::json!({ "capability_boundary": inner })
     }
 
@@ -346,18 +356,37 @@ impl CapabilityBoundary {
         };
         // 双域拆分(B 批「读宽写窄」):读域异于写域时逐族说明,LLM 精确自知
         // 「哪里可读、哪里可写」;同域时逐字节保持 v1 单根文案(黄金样本锁定,
-        // 零变化)
-        let (root_desc, boundary_rule) = match &self.read_root {
-            Some(r) if r != &self.sandbox_root => (
+        // 零变化)。写面实域(B-367 声明跟实现):缺省合成路径 write_domain
+        // 在场且异于沙箱根时优先渲染实域;显式声明路径(write_domain=None)
+        // 两分支文案逐字节保持 v1。
+        let write_domain = self
+            .write_domain
+            .as_ref()
+            .filter(|w| w.as_path() != self.sandbox_root.as_path());
+        let (root_desc, boundary_rule) = match (&self.read_root, write_domain) {
+            (Some(r), _) if r != &self.sandbox_root => (
                 format!(
                     "- 可读根:{}(读面工具 file_read/file_list/search_files/grep_files/\
                      image_load/code_search/read_back 共 7 件,相对该根解析)\n- 可写域:{}\
                      (写面工具 file_write/edit_file/file_create/file_move/file_delete \
                      相对该根解析)",
                     r.display(),
-                    self.sandbox_root.display()
+                    write_domain.map_or_else(
+                        || self.sandbox_root.display().to_string(),
+                        |w| w.display().to_string()
+                    )
                 ),
                 "越出可读根或可写域的路径不可访问;尝试越界的操作会被拒绝并告知边界。",
+            ),
+            (None, Some(w)) => (
+                format!(
+                    "- 沙箱根目录:{}(读面工具与其余文件路径相对该根解析)\n- 可写域:{}\
+                     (写面工具 file_write/edit_file/file_create/file_move/file_delete \
+                     相对该域解析)",
+                    self.sandbox_root.display(),
+                    w.display()
+                ),
+                "越出沙箱根或可写域的路径不可访问;尝试越界的操作会被拒绝并告知边界。",
             ),
             _ => (
                 format!(
@@ -2684,6 +2713,7 @@ mod tests {
                 mode: mode.to_string(),
                 sandbox_root: PathBuf::from(root),
                 read_root: None,
+                write_domain: None,
                 tools: btools.into_iter().map(String::from).collect(),
             }),
             approval_mode: None,
@@ -2741,6 +2771,7 @@ mod tests {
             mode: "read_only".to_string(),
             sandbox_root: PathBuf::from("D:/evo-agent"),
             read_root: None,
+            write_domain: None,
             tools: vec!["file_read".to_string()],
         };
         // 会话事实形态:包裹键 capability_boundary(server initial_content 载体)
@@ -2768,6 +2799,7 @@ mod tests {
             mode: "read_only".to_string(),
             sandbox_root: PathBuf::from("D:/evo-agent"),
             read_root: Some(PathBuf::from("D:/")),
+            write_domain: None,
             tools: vec![
                 "file_read".to_string(),
                 "file_write".to_string(),
@@ -2800,6 +2832,7 @@ mod tests {
             mode: "read_write".to_string(),
             sandbox_root: PathBuf::from("D:/evo-agent"),
             read_root: Some(PathBuf::from("D:/")),
+            write_domain: None,
             tools: vec!["file_read".to_string(), "file_write".to_string()],
         };
         // to_json:read_root 在场即输出(状态面透明)
@@ -2821,12 +2854,97 @@ mod tests {
             mode: "read_write".to_string(),
             sandbox_root: PathBuf::from("D:/evo-agent"),
             read_root: Some(PathBuf::from("D:/evo-agent")),
+            write_domain: None,
             tools: vec!["file_read".to_string(), "file_write".to_string()],
         };
         let seg = b.awareness_segment();
         assert!(!seg.contains("可读根"));
         assert!(seg.contains("沙箱根目录:D:/evo-agent"));
         assert_eq!(b.effective_read_root(), &PathBuf::from("D:/evo-agent"));
+    }
+
+    #[test]
+    fn test_capability_boundary_write_domain_rendered_as_write_face() {
+        // B-367 声明跟实现:write_domain 在场且异于沙箱根 → 可写域行如实
+        // 渲染写面实域(toolkit workdir/workspace),不再拍 sandbox_root 全域
+        let b = CapabilityBoundary {
+            mode: "read_write".to_string(),
+            sandbox_root: PathBuf::from("D:/agent-root"),
+            read_root: Some(PathBuf::from("D:/read-root")),
+            write_domain: Some(PathBuf::from("D:/agent-root/workspace")),
+            tools: vec!["file_read".to_string(), "file_write".to_string()],
+        };
+        let seg = b.awareness_segment();
+        assert!(seg.contains("可写域:D:/agent-root/workspace"));
+        assert!(!seg.contains("可写域:D:/agent-root("));
+    }
+
+    #[test]
+    fn test_capability_boundary_write_domain_single_root_form_upgrades() {
+        // 单根形态 + 写面实域异于沙箱根 → 升级双行(沙箱根+可写域),
+        // 不再宣称「一切文件路径相对该根解析」
+        let b = CapabilityBoundary {
+            mode: "read_write".to_string(),
+            sandbox_root: PathBuf::from("D:/agent-root"),
+            read_root: None,
+            write_domain: Some(PathBuf::from("D:/agent-root/workspace")),
+            tools: vec!["file_read".to_string(), "file_write".to_string()],
+        };
+        let seg = b.awareness_segment();
+        assert!(seg.contains("可写域:D:/agent-root/workspace"));
+        assert!(!seg.contains("一切文件路径相对该根解析"));
+    }
+
+    #[test]
+    fn test_capability_boundary_write_domain_none_keeps_v1_text() {
+        // 显式声明路径(write_domain=None) → 两分支文案逐字节保持 v1
+        // (黄金样本锁定面;read_write 声明经重绑全域 ".",文案即准确)
+        let b = CapabilityBoundary {
+            mode: "read_write".to_string(),
+            sandbox_root: PathBuf::from("D:/evo-agent"),
+            read_root: None,
+            write_domain: None,
+            tools: vec!["file_read".to_string(), "file_write".to_string()],
+        };
+        let seg = b.awareness_segment();
+        assert!(seg.contains("沙箱根目录:D:/evo-agent(一切文件路径相对该根解析)"));
+        assert!(!seg.contains("可写域"));
+        // write_domain 与沙箱根同值时亦视为未分叉,保持 v1 单根文案
+        let same = CapabilityBoundary {
+            mode: "read_write".to_string(),
+            sandbox_root: PathBuf::from("D:/evo-agent"),
+            read_root: None,
+            write_domain: Some(PathBuf::from("D:/evo-agent")),
+            tools: vec!["file_read".to_string(), "file_write".to_string()],
+        };
+        let seg2 = same.awareness_segment();
+        assert!(seg2.contains("沙箱根目录:D:/evo-agent(一切文件路径相对该根解析)"));
+    }
+
+    #[test]
+    fn test_capability_boundary_write_domain_serde_roundtrip() {
+        // serde 往返:write_domain 在场不丢,缺省(旧 def)装载为 None(向后兼容)
+        let with_wd = CapabilityBoundary {
+            mode: "read_write".to_string(),
+            sandbox_root: PathBuf::from("D:/evo-agent"),
+            read_root: None,
+            write_domain: Some(PathBuf::from("D:/evo-agent/workspace")),
+            tools: vec!["file_write".to_string()],
+        };
+        let v = serde_json::to_value(&with_wd).unwrap();
+        assert_eq!(
+            v["write_domain"],
+            serde_json::json!("D:/evo-agent/workspace")
+        );
+        let back: CapabilityBoundary = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            back.write_domain,
+            Some(PathBuf::from("D:/evo-agent/workspace"))
+        );
+        let legacy: CapabilityBoundary =
+            serde_json::from_str(r#"{"mode":"read_write","sandbox_root":"D:/x","tools":[]}"#)
+                .unwrap();
+        assert_eq!(legacy.write_domain, None);
     }
 
     #[test]
@@ -2837,6 +2955,7 @@ mod tests {
             mode: "read_write".to_string(),
             sandbox_root: PathBuf::from("D:/evo-agent"),
             read_root: Some(PathBuf::from("D:/")),
+            write_domain: None,
             tools: vec!["file_read".to_string()],
         };
         let s = serde_json::to_string(&with_rr).unwrap();
