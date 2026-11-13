@@ -691,7 +691,7 @@ pub fn schema() -> Vec<SettingEntry> {
             enum_values: None,
             range: None,
             category: "长会话",
-            description: "长会话主动压缩：上下文用量达到阈值比例时，把近期轮次之外的早期对话生成滚动摘要，并清除区内大块工具结果原文（被清原文以 [cleared: 工具名] 引用替代，完整留存于会话 journal 可查；被动裁剪仍为最后防线）。默认开启——长会话保真（近摘要区全量保真+滚动摘要前置）；显式关闭后回落为仅被动裁剪",
+            description: "长会话主动压缩：上下文用量达到阈值比例时，把近期轮次之外的早期对话生成滚动摘要，并清除区内大块工具结果原文（被清原文以 [context-offloaded: source=compaction] 统一形态引用替代，完整留存于会话 journal 可查；被动裁剪仍为最后防线）。默认开启——长会话保真（近摘要区全量保真+滚动摘要前置）；显式关闭后回落为仅被动裁剪",
             scope: "window",
         },
         SettingEntry {
