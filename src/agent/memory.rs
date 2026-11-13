@@ -349,6 +349,77 @@ impl MemoryRecord {
     }
 }
 
+/// 召回期变体聚簇（D2-一期，B-369）：按路径首段聚簇，簇内仅保留 ranking
+/// 最高一条，其余退出本轮注入——直接消解「同首段异 path 变体挤占召回配额」
+/// （登记册 mf-001 观测形态：engine.location/true_location/locations 平行）。
+///
+/// - **簇键**：fact path 剥域包装（`shared.{ns}.stable.` 前缀，无该前缀则整键）
+///   后的首段（首个 `.` 前内容）；
+/// - **簇内 ranking**：confidence desc → timestamp desc → key 字典序（全序可复现）；
+/// - **读侧 only**：不落写面、不改存储状态；被剔除条目本轮不注入 prompt、
+///   不计 usage（下游 usage 驱动的重要性评分不受变体污染）；
+/// - 门控=Recipe.retrieval.variant_dedupe（缺省 false=既有行为零影响）；
+/// - 一期限制：只按首段聚簇——跨首段同语义变体（environment.real_location
+///   vs engine.location）不合并（二期提取端归并解决）。
+///
+/// 返回被剔除（demoted）条数。
+pub(crate) fn dedupe_recall_variants(records: &mut Vec<MemoryRecord>, ns: &str) -> usize {
+    // 簇键=语义首段:剥已知域包装(shared.{ns}.stable. / stable.llm.{model}.,
+    // B5 域结构保证 model 恒为单一路径段——无差别剥之,跨模型变体方能同簇)
+    fn semantic_head<'a>(path: &'a str, ns: &str) -> &'a str {
+        let s = path.strip_prefix("shared::").unwrap_or(path);
+        let segs: Vec<&str> = s.split('.').collect();
+        let mut i = 0usize;
+        if segs.first() == Some(&"shared") {
+            i += 1; // shared
+            if segs.get(i) == Some(&ns) {
+                i += 1; // ns
+            }
+            if segs.get(i) == Some(&"stable") {
+                i += 1;
+            }
+        } else if segs.first() == Some(&"stable") {
+            i += 1;
+        }
+        if segs.get(i) == Some(&"llm") {
+            i += 1; // llm
+            if segs.len() > i + 1 {
+                i += 1; // model 段(恒单段,无差别剥)
+            }
+        }
+        segs.get(i).copied().unwrap_or("stable")
+    }
+    let rank = |r: &MemoryRecord| (r.confidence.unwrap_or(0.0), r.timestamp);
+    let mut best: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (idx, r) in records.iter().enumerate() {
+        let head = semantic_head(&r.key, ns);
+        match best.get(head) {
+            Some(&b) => {
+                let cur = &records[b];
+                let better = rank(r) > rank(cur) || (rank(r) == rank(cur) && r.key < cur.key);
+                if better {
+                    best.insert(head, idx);
+                }
+            }
+            None => {
+                best.insert(head, idx);
+            }
+        }
+    }
+    if best.len() == records.len() {
+        return 0;
+    }
+    let demoted = records.len() - best.len();
+    let keep: std::collections::HashSet<usize> = best.into_values().collect();
+    let mut walk = 0usize;
+    records.retain(|_| {
+        let k = keep.contains(&walk);
+        walk += 1;
+        k
+    });
+    demoted
+}
+
 /// R01（S5/S6/E19 修复）：共享事实按 path 去重，取最新版本。
 ///
 /// 语义（与 [`MemoryManager::project_prefix`] 的 `latest_by_path` 对齐，
@@ -2860,6 +2931,20 @@ impl MemoryManager {
             // (败者退出本词 prompt;落链 best-effort)。门控=Recipe.adjudication
             // (缺省关=既有 agent 零影响)
             self.adjudicate_stable(&mut ctx).await;
+            // D2-一期(B-369):召回期变体聚簇——同首段异 path 变体仅存活
+            // ranking 最高一条(读侧 only,usage 不计)。门控=
+            // Recipe.retrieval.variant_dedupe(缺省关=既有行为零影响)
+            if self
+                .recipe
+                .as_ref()
+                .map(|r| r.retrieval.variant_dedupe)
+                .unwrap_or(false)
+            {
+                let demoted = dedupe_recall_variants(&mut ctx.stable, ns);
+                if demoted > 0 {
+                    tracing::info!(demoted, "recall variants deduped (D2-1)");
+                }
+            }
             // F-616:stable 命中计数(去重 fact_id)——usage 参与重要性评分
             for r in &ctx.stable {
                 if let Some(fid) = r.fact_id {
@@ -6918,6 +7003,50 @@ mod tests {
         // 墓碑：value=null → 整条抑制
         let out = latest_entries_by_path(vec![mk(6, 2, serde_json::Value::Null)]);
         assert!(out.is_empty(), "墓碑必须抑制");
+    }
+
+    /// D2-一期（B-369）：召回期变体聚簇——同首段异 path 变体仅存活 ranking
+    /// 最高一条；被剔除条目退出注入（读侧 only）。
+    #[test]
+    fn test_dedupe_recall_variants_head_cluster() {
+        let rec = |key: &str, conf: f32, ts: u64| -> MemoryRecord {
+            serde_json::from_value(serde_json::json!({
+                "key": key, "value": "v", "timestamp": ts, "confidence": conf
+            }))
+            .unwrap()
+        };
+        let mut recs = vec![
+            rec("shared.ns1.stable.llm.m3.engine.location", 0.5, 100),
+            rec("shared.ns1.stable.llm.m3.engine.true_location", 0.9, 200),
+            rec("shared.ns1.stable.llm.glm.engine.locations", 0.7, 300),
+            rec(
+                "shared.ns1.stable.llm.glm.project.current_engine_state",
+                0.6,
+                150,
+            ),
+        ];
+        let demoted = dedupe_recall_variants(&mut recs, "ns1");
+        assert_eq!(demoted, 2, "engine.* 簇 3→1（剔 2）,project.* 簇 1→1");
+        assert_eq!(recs.len(), 2, "存活=各簇 ranking 最高一条");
+        assert_eq!(
+            recs[0].key, "shared.ns1.stable.llm.m3.engine.true_location",
+            "engine 簇 confidence 0.9 最高者存活"
+        );
+        assert_eq!(
+            recs[1].key, "shared.ns1.stable.llm.glm.project.current_engine_state",
+            "project 簇单条存活;相对顺序保持"
+        );
+        // ranking 平局链:confidence 相同 → timestamp 新者胜
+        let mut tie = vec![
+            rec("shared.ns1.stable.llm.m3.engine.a", 0.8, 100),
+            rec("shared.ns1.stable.llm.glm.engine.b", 0.8, 200),
+        ];
+        assert_eq!(dedupe_recall_variants(&mut tie, "ns1"), 1);
+        assert_eq!(tie[0].key, "shared.ns1.stable.llm.glm.engine.b");
+        // 单条无聚簇效果
+        let mut single = vec![rec("shared.ns1.stable.llm.m3.engine.x", 0.5, 100)];
+        assert_eq!(dedupe_recall_variants(&mut single, "ns1"), 0);
+        assert_eq!(single.len(), 1);
     }
 
     // ===== F3（audit-chain 2026-08-28）：召回降级 fail-visible =====

@@ -39,6 +39,11 @@ pub struct RetrievalConfig {
     /// usage 计数封顶（k：min(usage,k) 防高频条目垄断排序）
     #[serde(default = "default_usage_cap")]
     pub usage_cap: u32,
+    /// 召回期变体聚簇（D2-一期，B-369）：recall 注入前按路径首段聚簇，
+    /// 簇内仅保留 ranking 最高一条，其余退出本轮注入（读侧 only，零写面
+    /// 变化）。缺省 false=既有行为零影响（缺省不变式）。
+    #[serde(default)]
+    pub variant_dedupe: bool,
     /// 半衰期（天）：情景/语义分型
     #[serde(default = "default_half_life")]
     pub half_life_days: HalfLifeDays,
@@ -402,6 +407,7 @@ impl Default for MemoryRecipe {
                 w_importance: default_w_importance(),
                 w_confidence: default_w_confidence(),
                 w_usage: default_w_usage(),
+                variant_dedupe: false,
                 w_authority: 0.0,
                 w_entity: 0.0,
                 usage_cap: default_usage_cap(),
