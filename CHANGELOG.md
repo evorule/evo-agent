@@ -36,6 +36,19 @@
 
 ## [Unreleased]
 
+### Extraction-side variant merging (opt-in)
+
+- 🆕 新增:提取端写前归并（D2-二期）——sediment 稳定事实落库前按
+  (语义首段, 归一属性) 对齐既有活跃事实：命中即复用既有 path 新版本覆写
+  （同 path 版本裁定链与 supersession 链跨模型自然贯通）；同极性值差异打
+  conflict 标记（merge_conflicts + tracing 落账，不自动 supersede）。
+- 属性词规范化 fail-safe 白名单（修饰前缀剥离/单复数归一/location-place
+  等价表，未知词永不归并）+ 四道防误合并护栏（同首段/可归一/同属性/值
+  形态相似）；promoted 标记域不参与；归并查询失败降级为不归并。
+- 门控:`Recipe.retrieval.normalize_attributes`（缺省 false=既有行为零
+  变化），`agents/general.json` 显式开启。与一期读侧聚簇叠加：一期兜底
+  存量变体、二期管新增量。
+
 ### Recall-time variant clustering (opt-in)
 
 - 🆕 新增:召回期变体聚簇（D2-一期）——recall 注入前按语义首段聚簇（剥
