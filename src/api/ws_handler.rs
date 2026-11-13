@@ -1057,6 +1057,7 @@ async fn construct_runner(
         &def,
         state.workdir(),
         state.read_root(),
+        Some(state.workdir()),
     );
     // skills 装配(C 形态):两源合并 —— definition 显式声明(最高优先,声明时刻=
     // 人工把关) + 两级目录注册项(经 REST 注册审批闸口 active + blake3 哈希钉死,

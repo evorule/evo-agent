@@ -34,6 +34,24 @@
 
 ---
 
+## [Unreleased]
+
+### Memory feedback repairs: boundary truth, memory tool exposure, trim inventory
+
+- 🐛 修复:能力边界「可写域」文案失真——未声明(缺省合成)路径下,边界文案此前宣示
+  sandbox_root 全域可写,而写面工具实际绑定 `workdir/workspace` 子域,LLM 按文案
+  推断的写路径会被拒(`path outside writable_dir 'workspace'`)。现合成边界按
+  装配点实根携带 `write_domain`(写面实域),「可写域」行如实渲染子域;显式声明
+  路径与同域形态文案逐字节保持不变(黄金样本锁定)。
+- 🆕 新增:`agents/general.json` 记忆配方(部分声明形态)——暴露只读自省工具
+  `memory_search`/`memory_get`(按需查询稳定事实与事件账本,替代每轮固定回灌
+  的旁路依赖);启用召回期矛盾裁决(冲突败者标记 `Superseded` 并落取代链,
+  行为面:召回呈现集变更)。`MemoryRecipe` 反序列化支持部分声明(未声明节取
+  机制缺省,整份配方缺席仍走 legacy 路径)。
+- 🆕 新增:紧急裁剪事件载荷增 `removed_by_role`(被压缩区消息角色分布)与
+  `removed_span`(被压缩区消息下标区间)——压缩事件不再只有字节计数,重建
+  证据链可按类型回放;旧 journal 事件缺省兼容。
+
 ## [0.7.0] - 2026-11-08
 
 ### Skills: governed supply-chain hardening

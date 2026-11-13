@@ -1661,6 +1661,8 @@ mod tests {
                 elided_tool_results: 0,
                 folded_approvals: 0,
                 history_compacted: false,
+                removed_by_role: std::collections::BTreeMap::new(),
+                removed_span: None,
             },
             JournalEvent::SedimentPerformed {
                 summary_written: true,

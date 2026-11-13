@@ -386,6 +386,14 @@ pub enum JournalEvent {
         folded_approvals: usize,
         /// 是否触发了整段历史压缩兜底层
         history_compacted: bool,
+        /// 整段压缩区被移除消息的角色分布（B-367 丢界补账；serde default
+        /// 保旧 journal 兼容——旧事件无此键反序列化为空表）
+        #[serde(default)]
+        removed_by_role: std::collections::BTreeMap<String, usize>,
+        /// 整段压缩区的消息下标区间 [start, end)（与 runner 侧 region
+        /// 同源；serde default 保旧 journal 兼容）
+        #[serde(default)]
+        removed_span: Option<(usize, usize)>,
     },
     /// 会话沉淀结果落账：sediment 四项持久化结果进步级账面。
     /// CacheOnly 事实仅本地 cache、由 B3 对账补偿——落账后「沉淀成功与否」有对账依据，
@@ -1728,6 +1736,7 @@ impl JournalWriter {
     }
 
     /// 请求体超限紧急裁剪落账（死亡线恢复路径审计同权）
+    #[allow(clippy::too_many_arguments)]
     pub fn emergency_trim_performed(
         &self,
         before_chars: usize,
@@ -1735,6 +1744,8 @@ impl JournalWriter {
         elided_tool_results: usize,
         folded_approvals: usize,
         history_compacted: bool,
+        removed_by_role: std::collections::BTreeMap<String, usize>,
+        removed_span: Option<(usize, usize)>,
     ) -> Result<u64, JournalError> {
         self.push(JournalEvent::EmergencyTrimPerformed {
             before_chars,
@@ -1742,6 +1753,8 @@ impl JournalWriter {
             elided_tool_results,
             folded_approvals,
             history_compacted,
+            removed_by_role,
+            removed_span,
         })
     }
 
@@ -3418,6 +3431,82 @@ mod tests {
         assert_eq!(seen[0].0, "s-recall");
         assert_eq!(seen[0].1.len(), 3);
         assert_eq!(seen[0].1[0], "stable@1:k.a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_emergency_trim_role_inventory_roundtrip_and_legacy_compat() {
+        // B-367 丢界补账:①新载荷(角色分布+区间)落账读回;②旧事件(无新键)
+        // serde default 反序列化兼容
+        let dir = std::env::temp_dir().join(format!("jf-emtrim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut roles = std::collections::BTreeMap::new();
+        roles.insert("user".to_string(), 12usize);
+        roles.insert("assistant".to_string(), 11usize);
+        roles.insert("tool".to_string(), 415usize);
+        {
+            let w = JournalWriter::open(&dir, "s-emtrim").unwrap();
+            w.emergency_trim_performed(
+                2_506_025,
+                52_593,
+                313,
+                0,
+                true,
+                roles.clone(),
+                Some((6, 448)),
+            )
+            .unwrap();
+        }
+        let lines = read_all(&JournalWriter::path_for(&dir, "s-emtrim")).unwrap();
+        let mut seen = Vec::new();
+        for l in lines {
+            if let JournalEvent::EmergencyTrimPerformed {
+                before_chars,
+                after_chars,
+                history_compacted,
+                removed_by_role,
+                removed_span,
+                ..
+            } = l.event
+            {
+                seen.push((
+                    before_chars,
+                    after_chars,
+                    history_compacted,
+                    removed_by_role,
+                    removed_span,
+                ));
+            }
+        }
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, 2_506_025);
+        assert!(seen[0].2);
+        assert_eq!(seen[0].3, roles);
+        assert_eq!(seen[0].4, Some((6, 448)));
+        // 旧形态兼容:无新键载荷 → serde default 空/None
+        let legacy: JournalEvent = serde_json::from_value(serde_json::json!({
+            "type": "emergency_trim_performed",
+            "payload": {
+                "before_chars": 100,
+                "after_chars": 50,
+                "elided_tool_results": 3,
+                "folded_approvals": 0,
+                "history_compacted": true
+            }
+        }))
+        .expect("legacy payload without new keys must deserialize");
+        match legacy {
+            JournalEvent::EmergencyTrimPerformed {
+                removed_by_role,
+                removed_span,
+                ..
+            } => {
+                assert!(removed_by_role.is_empty());
+                assert_eq!(removed_span, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -749,17 +749,24 @@ pub fn effective_capability_boundary(
     def: &crate::agent::definition::AgentDefinition,
     startup_workdir: &Path,
 ) -> crate::agent::definition::CapabilityBoundary {
-    effective_capability_boundary_with_read_root(def, startup_workdir, None)
+    effective_capability_boundary_with_read_root(def, startup_workdir, None, None)
 }
 
 /// 「读宽写窄」变体(B 批,serve `--read-root`):`read_root` 显式供给且异于
 /// 写域时,合成边界的 `read_root` 字段在场(awareness 双域自报)。显式声明
 /// `def.capability_boundary` 在场时整份以声明为准(单一事实源,--read-root
 /// 不覆盖声明;声明自带 read_root 字段能力)。
+///
+/// `write_face_root`(B-367 声明跟实现):写面工具实际绑定基根(=toolkit 装配
+/// workdir 单源)。在场时合成边界携带 `write_domain`=该根/DEFAULT_WRITABLE_DIR,
+/// awareness「可写域」如实渲染子域——修复「声明=sandbox_root 全域、实际=
+/// workspace 子域」的文案失真。None(声明整份覆盖路径)=不携带,可写域=
+/// sandbox_root(声明 read_write 经边界重绑全域 ".",文案准确)。
 pub fn effective_capability_boundary_with_read_root(
     def: &crate::agent::definition::AgentDefinition,
     startup_workdir: &Path,
     read_root: Option<&Path>,
+    write_face_root: Option<&Path>,
 ) -> crate::agent::definition::CapabilityBoundary {
     use crate::agent::definition::{CapabilityBoundary, SANDBOX_CAPABLE_TOOLS};
     if let Some(b) = &def.capability_boundary {
@@ -792,10 +799,22 @@ pub fn effective_capability_boundary_with_read_root(
     let read_root = read_root
         .map(|r| simplify_verbatim(r.canonicalize().unwrap_or_else(|_| r.to_path_buf())))
         .filter(|r| r != &sandbox_root);
+    // 写面实域(B-367):toolkit 写面缺省绑定 workdir/DEFAULT_WRITABLE_DIR
+    // 子域;规范化口径与 sandbox_root 一致——基根 canonicalize(失败 fallback
+    // cwd 拼接),叶子(workspace/ 尚不存在等)不参与 canonicalize,仅 join
+    let write_domain = write_face_root.map(|w| {
+        let base = simplify_verbatim(w.canonicalize().unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(w)
+        }));
+        base.join(crate::builtin_tools::file_write::DEFAULT_WRITABLE_DIR)
+    });
     CapabilityBoundary {
         mode: mode.to_string(),
         sandbox_root,
         read_root,
+        write_domain,
         tools: sandbox_tools,
     }
 }
@@ -917,20 +936,36 @@ pub fn wire_capability_boundary(
     def: &crate::agent::definition::AgentDefinition,
     startup_workdir: &Path,
 ) -> crate::agent::definition::CapabilityBoundary {
-    wire_capability_boundary_with_read_root(handler, def, startup_workdir, None)
+    wire_capability_boundary_with_read_root(
+        handler,
+        def,
+        startup_workdir,
+        None,
+        Some(startup_workdir),
+    )
 }
 
 /// 「读宽写窄」变体(B 批,serve `--read-root`):读域根经 state 传入,合成
 /// 边界携带双域信息(awareness 自报);union toolkit 实例已在启动期按双根
 /// 绑定,此处合成仅产出 LLM 自报与状态面数据。
+///
+/// `write_face_root`(B-367):写面工具实际绑定基根(=toolkit 装配 workdir
+/// 单源;与边界根 `--agent-root` 旋钮分存的部署形态下二者可异)。None=
+/// 不携带写面实域(声明整份覆盖路径,可写域=sandbox_root 即准确)。
 pub fn wire_capability_boundary_with_read_root(
     handler: &mut ToolHandler,
     def: &crate::agent::definition::AgentDefinition,
     startup_workdir: &Path,
     read_root: Option<&Path>,
+    write_face_root: Option<&Path>,
 ) -> crate::agent::definition::CapabilityBoundary {
     let declared = def.capability_boundary.clone();
-    let effective = effective_capability_boundary_with_read_root(def, startup_workdir, read_root);
+    let effective = effective_capability_boundary_with_read_root(
+        def,
+        startup_workdir,
+        read_root,
+        write_face_root,
+    );
     apply_capability_boundary(handler, declared.as_ref());
     effective
 }
@@ -2123,6 +2158,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             mode: mode.to_string(),
             sandbox_root: root,
             read_root: None,
+            write_domain: None,
             tools: tools.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -2212,6 +2248,46 @@ service_tools = ["config_persist", "rule_sandbox"]
     }
 
     #[test]
+    fn test_effective_boundary_write_face_root_carries_write_domain() {
+        // B-367 声明跟实现:write_face_root 在场 → 合成边界携带 write_domain
+        // (=该根/DEFAULT_WRITABLE_DIR 子域);None → 不携带(声明整份覆盖语义)
+        let def = make_def(&["file_read", "file_write"], None);
+        let eff = effective_capability_boundary_with_read_root(
+            &def,
+            Path::new("."),
+            None,
+            Some(Path::new(".")),
+        );
+        assert!(eff.write_domain.is_some());
+        let wd = eff.write_domain.unwrap();
+        assert!(wd.is_absolute());
+        assert!(
+            wd.ends_with(crate::builtin_tools::file_write::DEFAULT_WRITABLE_DIR),
+            "write_domain must end with the default writable dir, got: {}",
+            wd.display()
+        );
+        // 声明整份覆盖路径(apply_workspace_boundary 语义):write_face_root=None
+        let eff2 = effective_capability_boundary_with_read_root(&def, Path::new("."), None, None);
+        assert_eq!(eff2.write_domain, None);
+    }
+
+    #[test]
+    fn test_wire_capability_boundary_forwards_write_face_root() {
+        // wire 面穿线:3 参便捷形=write_face_root 取 startup_workdir(CLI 单
+        // workdir 部署,写面实域=workdir/workspace);5 参形显式分存两根
+        let def = make_def(&["file_read", "file_write"], None);
+        let mut handler = ToolHandler::new();
+        let root = std::env::temp_dir().join("wt-b367-wire-fwd");
+        let eff = wire_capability_boundary(&mut handler, &def, &root);
+        assert_eq!(
+            eff.write_domain,
+            Some(super::simplify_verbatim(root.join(
+                crate::builtin_tools::file_write::DEFAULT_WRITABLE_DIR
+            )))
+        );
+    }
+
+    #[test]
     fn test_effective_boundary_default_root_absolute() {
         // 相对启动 workdir → 合成绝对沙箱根;目录不存在时 fallback
         // cwd 拼接(join 绝对路径自动替换基准),相对尾段保留
@@ -2282,6 +2358,7 @@ service_tools = ["config_persist", "rule_sandbox"]
                 mode: mode.to_string(),
                 sandbox_root: std::path::PathBuf::from("."),
                 read_root: None,
+                write_domain: None,
                 tools: vec![],
             }
         }
@@ -2317,8 +2394,13 @@ service_tools = ["config_persist", "rule_sandbox"]
         let (ws, ev) = make_clients();
         let mut handler = build_union_toolkit_with_read_root(&root, &read_root, &ws, &ev);
         let def = make_def(&["file_read", "file_write"], None);
-        let eff =
-            wire_capability_boundary_with_read_root(&mut handler, &def, &root, Some(&read_root));
+        let eff = wire_capability_boundary_with_read_root(
+            &mut handler,
+            &def,
+            &root,
+            Some(&read_root),
+            None,
+        );
 
         // 合成边界:写域=workdir、读域=read_root(双域在场)
         assert_eq!(eff.sandbox_root, super::simplify_verbatim(root.clone()));
@@ -2365,7 +2447,8 @@ service_tools = ["config_persist", "rule_sandbox"]
         let (ws, ev) = make_clients();
         let mut handler = build_union_toolkit(&root, &ws, &ev);
         let def = make_def(&["file_read"], None);
-        let eff = wire_capability_boundary_with_read_root(&mut handler, &def, &root, Some(&root));
+        let eff =
+            wire_capability_boundary_with_read_root(&mut handler, &def, &root, Some(&root), None);
         assert_eq!(
             eff.read_root, None,
             "same-domain read_root must normalize to None"
@@ -2383,8 +2466,13 @@ service_tools = ["config_persist", "rule_sandbox"]
         let mut handler = build_union_toolkit(&root, &ws, &ev);
         let declared = make_boundary("read_only", root.clone(), &["file_read"]);
         let def = make_def(&["file_read"], Some(declared));
-        let eff =
-            wire_capability_boundary_with_read_root(&mut handler, &def, &root, Some(&read_root));
+        let eff = wire_capability_boundary_with_read_root(
+            &mut handler,
+            &def,
+            &root,
+            Some(&read_root),
+            None,
+        );
         assert_eq!(
             eff.read_root, None,
             "declared boundary without read_root must win over --read-root"
@@ -2411,8 +2499,13 @@ service_tools = ["config_persist", "rule_sandbox"]
         let mut def = make_def(&["file_read", "file_list", "file_write"], None);
         // 生产同路径:请求级 workspace → 声明态注入(REST/WS 会话级同口径)
         apply_workspace_boundary(&mut def, ws_root.to_str().unwrap()).unwrap();
-        let eff =
-            wire_capability_boundary_with_read_root(&mut handler, &def, &root, Some(&read_root));
+        let eff = wire_capability_boundary_with_read_root(
+            &mut handler,
+            &def,
+            &root,
+            Some(&read_root),
+            None,
+        );
 
         // 生效边界:整域 = workspace(--read-root 不参与)
         assert_eq!(eff.sandbox_root, super::simplify_verbatim(ws_root.clone()));
