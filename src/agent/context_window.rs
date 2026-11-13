@@ -406,6 +406,12 @@ impl TokenCounter for ApproxTokenCounter {
     }
 }
 
+/// hint 消息 token 预留缺省值(R-2:与装配配方 default_hint_budget_tokens
+/// 同值 15;配方声明经 runner 构造点注入覆盖,缺省构造零变化)
+fn default_hint_budget_tokens() -> usize {
+    15
+}
+
 /// 裁剪策略
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrimStrategy {
@@ -424,6 +430,10 @@ pub struct ContextWindowManager {
     /// 预留给响应的 token 数(默认 max_tokens 的 1/4)
     reserve_for_response: usize,
     strategy: TrimStrategy,
+    /// trim 时为裁剪提示消息预留的 token(R-2 单源化:缺省 15 = 原硬编码;
+    /// 唯一事实源=装配配方 TrimSpec.hint_budget_tokens,经 runner 构造点
+    /// [`Self::with_hint_budget_tokens`] 注入,缺省构造保持 15 兼容)
+    hint_budget_tokens: usize,
 }
 
 impl ContextWindowManager {
@@ -443,7 +453,20 @@ impl ContextWindowManager {
             max_tokens,
             reserve_for_response,
             strategy,
+            hint_budget_tokens: default_hint_budget_tokens(),
         }
+    }
+
+    /// 注入 trim 提示消息的 token 预留(R-2:配方 TrimSpec.hint_budget_tokens
+    /// 单一事实源;不调即保持缺省 15,行为零变化)
+    pub fn with_hint_budget_tokens(mut self, tokens: usize) -> Self {
+        self.hint_budget_tokens = tokens;
+        self
+    }
+
+    /// trim 提示消息的 token 预留生效值(观测/测试面)
+    pub fn hint_budget_tokens(&self) -> usize {
+        self.hint_budget_tokens
     }
 
     /// 使用默认 `ApproxTokenCounter` 构造
@@ -551,7 +574,9 @@ impl ContextWindowManager {
         let always_tokens = self.counter.count_messages(&always);
         // hint 消息约 13 token("[earlier N messages trimmed due to context window limit]")
         // buffer 按 budget 的 5% 预留,最低 5 token,应对计数误差
-        let hint_overhead = 15usize;
+        // R-2 单源化:预留量=配方 TrimSpec.hint_budget_tokens 注入值(缺省 15,
+        // 与原硬编码等价)
+        let hint_overhead = self.hint_budget_tokens;
         let buffer = (budget / 20).max(5);
         let available_for_recent = budget
             .saturating_sub(always_tokens)
@@ -730,7 +755,7 @@ impl ContextWindowManager {
 impl ContextWindowManager {
     /// 四轮审计 G13(B-285):摘要回填前的预算收顶。
     ///
-    /// trim 只为 hint 预留 `hint_overhead=15` token,摘要回填若不限长,
+    /// trim 只为 hint 预留 `hint_overhead`(配方注入值,缺省 15)token,摘要回填若不限长,
     /// 刚 fit 的发送视图会被重新撑爆。本方法按当前预算对摘要文本收顶:
     ///
     /// - 本就放得下 → 原样放行;
@@ -778,6 +803,7 @@ impl Clone for ContextWindowManager {
             max_tokens: self.max_tokens,
             reserve_for_response: self.reserve_for_response,
             strategy: self.strategy,
+            hint_budget_tokens: self.hint_budget_tokens,
         }
     }
 }
@@ -1063,6 +1089,46 @@ mod tests {
         let (trimmed, dropped) = mgr.trim(&msgs);
         assert_eq!(dropped, 0);
         assert_eq!(trimmed.len(), 2);
+    }
+
+    /// R-2:hint 预留量单源化——注入 20 生效(旧实现硬编码 15 时此测试红),
+    /// 缺省构造保持 15 兼容(行为零变化)。
+    /// 尾部无条件保留语义(与 G16 分层保底同族)使 hint 差异体现在
+    /// 「尾部之外还能保留几条」,以多条小消息放大差值。
+    #[test]
+    fn test_trim_hint_budget_tokens_injectable() {
+        // 每条 user "a"*4 = overhead 4 + 1 (4/4) + tail 3 = 8 token
+        // system "sys" = 7 (3 ascii → 0 text token);buffer = 200/20 = 10
+        // hint=15(缺省): available = 200-7-15-10 = 168 → 保留 21 条(168/8)
+        // hint=20(注入): available = 200-7-20-10 = 163 → 保留 20 条
+        let msgs: Vec<Message> = std::iter::once(system("sys"))
+            .chain((0..40).map(|_| user("aaaa")))
+            .collect();
+
+        let mgr_default =
+            ContextWindowManager::with_approx_counter(200, 0, TrimStrategy::KeepSystemKeepLast);
+        assert_eq!(
+            mgr_default.hint_budget_tokens(),
+            15,
+            "缺省=原硬编码等价(兼容)"
+        );
+        let (trimmed_default, _) = mgr_default.trim(&msgs);
+        let users_default = trimmed_default
+            .iter()
+            .filter(|m| matches!(m, Message::User { .. }))
+            .count();
+        assert_eq!(users_default, 21, "缺省 15:保留 21 条 user");
+
+        let mgr20 =
+            ContextWindowManager::with_approx_counter(200, 0, TrimStrategy::KeepSystemKeepLast)
+                .with_hint_budget_tokens(20);
+        assert_eq!(mgr20.hint_budget_tokens(), 20);
+        let (trimmed_20, _) = mgr20.trim(&msgs);
+        let users_20 = trimmed_20
+            .iter()
+            .filter(|m| matches!(m, Message::User { .. }))
+            .count();
+        assert_eq!(users_20, 20, "注入 20:保留 20 条(预算扣 20 生效)");
     }
 
     #[test]

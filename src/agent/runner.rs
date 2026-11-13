@@ -1629,7 +1629,9 @@ pub struct AgentRunner {
     /// 近摘要区摘要缓存(键=区内容哈希,插入序 FIFO,容量上限 256):
     /// 压缩命中缓存时零 LLM 重算;重建读账时从压缩视图种子恢复,运行期与
     /// 重建面同源。上限防长驻进程无界增长(同 hash 重复写=原位替换不增容)。
-    region_summary_cache: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// O-2:VecDeque——队尾入/队首出 O(1),原位替换按下标赋值。
+    region_summary_cache:
+        std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(String, String)>>>,
 }
 
 /// 管道阶段⑦执行器：runner 的 call_service 通路
@@ -1762,7 +1764,9 @@ impl AgentRunner {
             verify: None,
             verify_config: None,
             persist_idx_delta: std::sync::atomic::AtomicUsize::new(0),
-            region_summary_cache: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            region_summary_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
         }
     }
 
@@ -2441,6 +2445,14 @@ impl AgentRunner {
             max_tokens,
             reserve,
             TrimStrategy::KeepSystemKeepLast,
+        )
+        // R-2 单源化:trim 提示预留=配方 TrimSpec.hint_budget_tokens(缺省 15
+        // =原硬编码等价;配方未声明 S7 trim 时回落缺省)
+        .with_hint_budget_tokens(
+            self.assembly
+                .trim_params()
+                .map(|(_, _, hint)| hint)
+                .unwrap_or(15),
         );
         self.context_window = Some(ctx_mgr);
         // C3:记录总窗口 token,供组装执行器作记忆区预算基准
@@ -3272,11 +3284,14 @@ impl AgentRunner {
         const REGION_SUMMARY_CACHE_CAP: usize = 256;
         if let Ok(mut cache) = self.region_summary_cache.lock() {
             if let Some(pos) = cache.iter().position(|(k, _)| k == region_hash) {
+                // 同 hash 原位替换(VecDeque 支持下标赋值,迭代序不变)
                 cache[pos] = (region_hash.to_string(), text.to_string());
             } else {
-                cache.push((region_hash.to_string(), text.to_string()));
+                // O-2:push_back 入队尾;淘汰 pop_front 出队首,O(1) 替代
+                // 原 Vec remove(0) 的 O(n) 搬移(FIFO 语义不变)
+                cache.push_back((region_hash.to_string(), text.to_string()));
                 while cache.len() > REGION_SUMMARY_CACHE_CAP {
-                    cache.remove(0);
+                    cache.pop_front();
                 }
             }
         }
@@ -5206,12 +5221,22 @@ impl AgentRunner {
                     crate::agent::context_window::ApproxTokenCounter::new(),
                 )),
             );
-            let context_window = Some(ContextWindowManager::new(
-                Box::new(usage_counter.clone()),
-                max_context_tokens,
-                reserve,
-                TrimStrategy::KeepSystemKeepLast,
-            ));
+            let context_window = Some(
+                ContextWindowManager::new(
+                    Box::new(usage_counter.clone()),
+                    max_context_tokens,
+                    reserve,
+                    TrimStrategy::KeepSystemKeepLast,
+                )
+                // R-2 单源化:与主构造同源(配方 TrimSpec.hint_budget_tokens,
+                // 缺省 15 等价)
+                .with_hint_budget_tokens(
+                    assembly
+                        .trim_params()
+                        .map(|(_, _, hint)| hint)
+                        .unwrap_or(15),
+                ),
+            );
             AgentRunner {
                 config: config.clone(),
                 evorule_client: evorule_client.clone(),
@@ -5301,7 +5326,9 @@ impl AgentRunner {
                 verify: None,
                 verify_config: None,
                 persist_idx_delta: std::sync::atomic::AtomicUsize::new(0),
-                region_summary_cache: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                region_summary_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
             }
         })
     }

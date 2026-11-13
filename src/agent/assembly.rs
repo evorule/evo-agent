@@ -1743,14 +1743,14 @@ mod tests {
                 { "id": "S1_base", "source": "definition.system_prompt" },
                 { "id": "S5_task", "source": "goal", "role": "user" },
                 { "id": "S7_history", "source": "messages",
-                  "trim": { "strategy": "KeepSystemKeepLast", "buffer_pct": 10, "hint_budget_tokens": 20 } }
+                  "trim": { "strategy": "KeepSystemKeepLast", "buffer_pct": 5, "hint_budget_tokens": 15 } }
             ],
             "budget": { "reserve_for_response_pct": 30, "tool_result_max_chars": 10000 }
         }"#;
         let r: AssemblyRecipe = serde_json::from_str(json).unwrap();
         r.validate().expect("custom recipe must be valid");
         assert_eq!(r.budget.reserve_for_response_pct, 30);
-        assert_eq!(r.slots[2].trim.as_ref().unwrap().buffer_pct, 10);
+        assert_eq!(r.slots[2].trim.as_ref().unwrap().buffer_pct, 5);
     }
 
     /// $ref 解析:正例 + 穿越拒绝 + 绝对路径拒绝 + 混合形态拒绝 + 未声明无操作

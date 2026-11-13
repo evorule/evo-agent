@@ -1602,7 +1602,7 @@ mod tests {
                     { "id": "S1_base", "source": "definition.system_prompt" },
                     { "id": "S5_task", "source": "goal", "role": "user" },
                     { "id": "S7_history", "source": "messages",
-                      "trim": { "strategy": "KeepSystemKeepLast", "buffer_pct": 10, "hint_budget_tokens": 20 } }
+                      "trim": { "strategy": "KeepSystemKeepLast", "buffer_pct": 5, "hint_budget_tokens": 15 } }
                 ],
                 "budget": { "reserve_for_response_pct": 30, "tool_result_max_chars": 9000 }
             }}"#,
@@ -1612,7 +1612,7 @@ mod tests {
         let recipe = def.assembly.expect("assembly present");
         assert_eq!(recipe.budget.reserve_for_response_pct, 30);
         assert_eq!(recipe.budget.tool_result_max_chars, 9000);
-        assert_eq!(recipe.slots[2].trim.as_ref().unwrap().buffer_pct, 10);
+        assert_eq!(recipe.slots[2].trim.as_ref().unwrap().buffer_pct, 5);
     }
 
     /// 元层先行批:$ref 外部配方文件加载(相对 definition 目录解析后等价内嵌)
