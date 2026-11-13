@@ -613,13 +613,29 @@ impl LexStore {
             .map_err(|e| LexError(format!("delete postings: {e}")))?;
         tx.execute("DELETE FROM entities WHERE prefix = ?1", [prefix])
             .map_err(|e| LexError(format!("delete entities: {e}")))?;
+        // 时序修正：先收集待删 timeline 行的 fact_id 再删——原顺序先删
+        // timeline 后以子查询删 causes，子查询恒空集 → causes（全局表，
+        // 无 prefix 列）陈旧因果行永久累积（存储泄漏+fact_id 复用误关联）。
+        let stale_ids: Vec<i64> = {
+            let mut stmt = tx
+                .prepare("SELECT fact_id FROM timeline WHERE prefix = ?1")
+                .map_err(|e| LexError(format!("select timeline: {e}")))?;
+            let rows = stmt
+                .query_map([prefix], |row| row.get::<_, i64>(0))
+                .map_err(|e| LexError(format!("select timeline: {e}")))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| LexError(format!("select timeline: {e}")))?
+        };
         tx.execute("DELETE FROM timeline WHERE prefix = ?1", [prefix])
             .map_err(|e| LexError(format!("delete timeline: {e}")))?;
-        tx.execute(
-            "DELETE FROM causes WHERE fact_id IN (SELECT fact_id FROM timeline WHERE prefix = ?1)",
-            [prefix],
-        )
-        .map_err(|e| LexError(format!("delete causes: {e}")))?;
+        if !stale_ids.is_empty() {
+            let placeholders = stale_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            tx.execute(
+                &format!("DELETE FROM causes WHERE fact_id IN ({placeholders})"),
+                rusqlite::params_from_iter(stale_ids.iter()),
+            )
+            .map_err(|e| LexError(format!("delete causes: {e}")))?;
+        }
         for (fact_id, path, value, version) in facts {
             let value_json =
                 serde_json::to_string(value).map_err(|e| LexError(format!("serialize: {e}")))?;
@@ -1280,6 +1296,37 @@ mod tests {
             .unwrap();
         let got2 = store2.cached_facts("shared.ns.stable.", 60).unwrap();
         assert!(got2.iter().all(|f| f.version == 0), "旧入口 version=0");
+    }
+
+    #[test]
+    fn test_replace_partition_purges_stale_causes() {
+        // causes 清理时序：先收集 fact_id 再删两表——修复前红：timeline 先
+        // 删导致子查询恒空，causes（全局表）陈旧因果行永久累积。
+        let store = LexStore::open(&temp_db("causes")).unwrap();
+        {
+            let conn = store.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.execute(
+                "INSERT INTO timeline(fact_id, prefix, kind, valid_at, lifecycle_state, superseded_by)
+                 VALUES (7, 'shared.ns.stable.', 'set', 1, 'Settled', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO causes(fact_id, cause_id) VALUES (7, 3), (7, 4)",
+                [],
+            )
+            .unwrap();
+        }
+        store.replace_partition("shared.ns.stable.", &[]).unwrap();
+        let remaining: i64 = {
+            let conn = store.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row("SELECT COUNT(*) FROM causes", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            remaining, 0,
+            "stale causes must be purged (修复前红=2 行残留)"
+        );
     }
 
     #[test]

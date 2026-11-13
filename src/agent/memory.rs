@@ -3895,6 +3895,25 @@ impl MemoryManager {
                 }
             }
         }
+        // 闲置判定时钟预取：闲置态候选 key 的访问戳批量读取（借用法——
+        // values_mut 循环内不可 await 读 stamp）
+        let idle_candidates: Vec<String> = self
+            .cache
+            .values()
+            .filter(|r| {
+                matches!(
+                    r.lifecycle_state.as_deref(),
+                    Some("Settled") | Some("Promoted") | Some("Reinforced")
+                )
+            })
+            .map(|r| r.key.clone())
+            .collect();
+        let mut access_stamps: std::collections::HashMap<String, Option<u64>> =
+            std::collections::HashMap::new();
+        for k in &idle_candidates {
+            let stamp = self.read_shared_access_stamp(session_id, k).await;
+            access_stamps.insert(k.clone(), stamp);
+        }
         for rec in self.cache.values_mut() {
             // L1 修复(断点5-资格):flush_usage 回写时会把命中条目标 Reinforced——
             // 旧判定只认 Captured → usage 达标(恰是晋升条件)反而丧失资格,自相矛盾。
@@ -3926,8 +3945,17 @@ impl MemoryManager {
                         continue;
                     }
                     rec.lifecycle_state = Some("Promoted".to_string());
-                    let stable_key =
-                        format!("stable.llm.promoted.{}", rec.key.replace(".events.", "."));
+                    // key 归一（顶域/嵌套双形态统一）：顶域事件 key 形态
+                    // events.{id} 不含 .events. 子串，replace 恒不命中 →
+                    // 副本残留 events 段（与嵌套形态产出不一致的 key 拓扑，
+                    // 且未来经普通 set_scoped 重写会被 is_episodic 误标）。
+                    // 先剥顶域前缀再归一内部段。
+                    let promoted_base = rec
+                        .key
+                        .strip_prefix("events.")
+                        .unwrap_or(&rec.key)
+                        .replace(".events.", ".");
+                    let stable_key = format!("stable.llm.promoted.{promoted_base}");
                     let mut p = MemoryRecord::new(&stable_key, &rec.value, now);
                     p.confidence = rec.confidence;
                     p.usage_count = rec.usage_count;
@@ -3941,7 +3969,14 @@ impl MemoryManager {
                 rec.lifecycle_state.as_deref(),
                 Some("Settled") | Some("Promoted") | Some("Reinforced")
             ) {
-                let idle_days = (now.saturating_sub(rec.timestamp)) as f64 / 86400.0;
+                // 闲置口径与 decay 读面同源统一：decay_effective_ts 取访问戳
+                // 与写入时间较新者——读写两面对同一「闲置」概念一个定义。
+                // Reinforced 逃逸衰减带为有意设计：usage_count>0=活跃记忆
+                // 不衰减（只剩 Archive 终态可达）——本注释即档面声明。
+                let last_access = access_stamps.get(&rec.key).copied().flatten();
+                let effective_ts =
+                    crate::agent::memory_decay::decay_effective_ts(last_access, rec.timestamp);
+                let idle_days = (now.saturating_sub(effective_ts)) as f64 / 86400.0;
                 // 迁移序:归档终态优先(超 archive 限);decay 为中间带
                 // [decay 限,archive 限)的零引用降权(账本记忆设计档 §4.2 异常迁移②,
                 // confidence 半衰一次性——Decayed 态不再进入本分支)
@@ -4061,8 +4096,12 @@ impl MemoryManager {
                             }
                         }
                     }
-                    let stable_key =
-                        format!("stable.llm.promoted.{}", key.replace(".events.", "."));
+                    // key 归一同晋升直通道：顶域/嵌套双口径统一（见上）
+                    let promoted_base = key
+                        .strip_prefix("events.")
+                        .unwrap_or(key)
+                        .replace(".events.", ".");
+                    let stable_key = format!("stable.llm.promoted.{promoted_base}");
                     let mut p = MemoryRecord::new(&stable_key, &candidate.value, now_secs());
                     p.confidence = candidate.confidence;
                     p.usage_count = candidate.usage_count;
@@ -4788,6 +4827,79 @@ mod tests {
             assert!(mgr.is_empty());
             assert_eq!(mgr.len(), 0);
         });
+    }
+
+    #[test]
+    fn test_promotion_key_top_level_events_normalized() {
+        // key 归一（顶域/嵌套双形态统一）：顶域事件 key 形态 events.{id}
+        // 不含 .events. 子串——修复前红：replace 恒不命中，副本残留
+        // events 段（stable.llm.promoted.events.E-top）。
+        let mut mgr = MemoryManager::new("test", make_test_client()).with_session_id("s1");
+        let recipe = crate::agent::recipe::MemoryRecipe::default();
+        let now = now_secs();
+        let mut rec = MemoryRecord::new("events.E-top", "{\"conf\":1}", now);
+        rec.confidence = Some(0.9);
+        rec.usage_count = 5;
+        rec.lifecycle_state = Some("Captured".to_string());
+        mgr.cache.insert("shared::events.E-top".to_string(), rec);
+
+        tokio_test::block_on(async {
+            mgr.apply_lifecycle_transitions("s1", &recipe).await;
+        });
+
+        assert!(
+            mgr.cache.contains_key("shared::stable.llm.promoted.E-top"),
+            "顶域形态晋升副本必须归一（修复前红=key 含 events 段）: keys={:?}",
+            mgr.cache.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_archive_idle_uses_access_stamp_not_write_ts() {
+        // 闲置口径与 decay 读面同源统一：写入时间老旧但访问戳新——修复前
+        // 红：idle_days 按写入时间算超 archive 限 → Archived；修复后：
+        // decay_effective_ts 取较新访问戳 → 不归档。
+        let mut server = mockito::Server::new_async().await;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut mgr = MemoryManager::new("test", client).with_session_id("s1");
+        let recipe = crate::agent::recipe::MemoryRecipe::default();
+        let now = now_secs();
+        let old = now.saturating_sub(400 * 86400);
+        let mut rec = MemoryRecord::new("stable.acc", "v", old);
+        rec.lifecycle_state = Some("Settled".to_string());
+        mgr.cache.insert("shared::stable.acc".to_string(), rec);
+        let stamp_path = crate::agent::memory_decay::access_stamp_path("test", "stable.acc");
+        let stamp_body = serde_json::json!([
+            {
+                "fact_id": 1,
+                "path": stamp_path,
+                "value": {
+                    "kind": crate::agent::memory_decay::ACCESS_STAMP_KIND,
+                    "v": 1,
+                    "key": "stable.acc",
+                    "last_access_secs": now
+                },
+                "source_session_id": 1,
+                "version": 1
+            }
+        ]);
+        server
+            .mock(
+                "GET",
+                format!("/api/sessions/s1/facts?prefix={stamp_path}").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(stamp_body.to_string())
+            .create_async()
+            .await;
+        mgr.apply_lifecycle_transitions("s1", &recipe).await;
+        let after = mgr.cache.get("shared::stable.acc").unwrap();
+        assert_ne!(
+            after.lifecycle_state.as_deref(),
+            Some("Archived"),
+            "近期被访问的记忆不得按写入时间归档（修复前红=Archived）"
+        );
     }
 
     #[test]
