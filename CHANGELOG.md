@@ -86,6 +86,8 @@
 
 - **桌面壳向 serve 传递鉴权令牌改经环境变量（收敛命令行暴露面）** — 桌面壳此前经命令行参数 `--auth-token` 向 serve 传递鉴权令牌，而本机所有进程可读任意进程的命令行，令牌上命令行即等于本机可见。现改为环境变量载体（`EVO_AGENT_AUTH__ENABLED` / `EVO_AGENT_AUTH__TOKENS`）注入，serve 侧鉴权配置固化后立即清除自身环境变量副本（与 service 身份令牌的捕获即清纪律同款），serve 期内启动的一切工作区子进程（shell_exec/python_exec/MCP 等）不再经继承环境变量见到令牌。CLI `--auth-token` 参数保留不变（手动/CLI 用户面）；工作台前端取令牌路径（webview 初始化脚本注入）零变化
 
+- **工具输出回喂上限计量口径由字符切换为 token（中文等非 ASCII 内容显著收紧）** — 装配配方新增 `budget.tool_result_max_tokens`（缺省 12000 ≈ 48K 英文字符，生效值钳制 1000..=100000；新键显式声明优先）。旧键 `tool_result_max_chars` 仍可配置，按 4 chars ≈ 1 token 的 ASCII 基准折算，既有配置语义近似保留。超大工具输出的截断与引用化阈值由「字符数」改为「token 估算」（ASCII 4 chars ≈ 1 token 向下取整、非 ASCII 1 char ≈ 1 token）：英文内容与旧字符口径等价（48K 字符边界不变）；**中文等非 ASCII 重内容的回喂量显著收紧**——此前 48K 个汉字按字符口径全额回喂，现按 1 token/字计受 12K token 上限约束，超出部分走既有截断标注（标注保留头尾、声明被丢弃字符数）或引用化落盘（完整原文可经 `tool_result_fetch` 按 ref_id 分页取回），引用化触发频率相应上升。截断标注文案形态与审计链保留原始全文的原则均不变
+
 ### 🐛 修复
 
 - **超大结果取回件 `tool_result_fetch` 挂载 LLM 契约面（schema 可见性缺口）** — 超大工具结果被引用化后，引用块尾部指引「调用 tool_result_fetch 工具按 ref_id 分页取回」，但该工具此前不在任何工具集的 schema 面注册（执行器是 runner 保留名直拦，先于治理管道）：schema 严格的模型见到不存在的工具名会拒调，取回链对这类模型断裂（offload 数据在盘但取不回）。现补齐三面：静态 manifest（ReadOnly 只读分级）+ 默认工具集注册（schema 挂载；注册的占位执行器仅并行预取臂路径可达，fail-visible 后单独重调即走 runner 真执行）+ `general` agent 定义白名单。参数语义（ref_id/offset/max_chars）与 runner 实现一致，行为零变化（真执行点不变）
