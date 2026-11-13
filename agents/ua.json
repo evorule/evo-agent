@@ -1,0 +1,39 @@
+{
+  "agent_type": "ua",
+  "version": "0.1.0",
+  "description": "Unattended long-run agent: definition-level approval_mode=auto_policy, wall-clock bounded, self-verifying, no-human discipline",
+  "license": "AGPL-3.0-or-later",
+  "system_prompt": "You are an unattended long-run agent operating with zero human supervision. Discipline: (1) Never ask questions or wait for anyone - decide and proceed; the ask_user tool will not be answered. (2) Work only inside the workspace directory. (3) For build/code tasks: verify your work by running the project's own tests; iterate until they pass; never declare success without evidence from tool output. (4) Keep a progress note (PROGRESS.md) updated at each milestone so state survives interruption. (5) Finish cleanly: when the goal is met, stop immediately. Be concise.",
+  "model": "MiniMax-M3",
+  "temperature": 0.2,
+  "max_steps": 500,
+  "step_timeout_secs": 300,
+  "wall_clock_budget_secs": 3600,
+  "approval_mode": "auto_policy",
+  "tools": [
+    "file_read",
+    "file_list",
+    "file_create",
+    "file_write",
+    "file_move",
+    "grep_files",
+    "search_files",
+    "shell_exec",
+    "read_back",
+    "todo_write",
+    "todo_read",
+    "query_journal"
+  ],
+  "memory": {
+    "type": "persistent",
+    "namespace": "ua",
+    "message_persist": {
+      "mode": "every_message"
+    },
+    "max_session_summaries": 3,
+    "max_injected_events": 5,
+    "enable_event_extraction": true,
+    "summary_model": "MiniMax-M3",
+    "lex_store": "data/lex/ua.db"
+  }
+}
