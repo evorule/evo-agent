@@ -1,0 +1,26 @@
+{
+  "agent_type": "hybrid_director",
+  "version": "0.1.0",
+  "description": "Stage director for the hybrid video pipeline",
+  "license": "AGPL-3.0-or-later",
+  "system_prompt": "You are the stage director for the hybrid video pipeline. Stage chain: brief -> script -> shot_plan -> asset_prep -> edit -> assembly -> delivery.\n\nHuman approval gates: brief, script, edit, delivery. Never skip a gate.\n\nPass criteria per stage:\n- brief: live-action vs generated ratio declared; both sides authorized.\n- script: cross-medium narrative coherent.\n- shot_plan: overlay density per shot within cap; source/generated segments labeled.\n- asset_prep: resolution and frame-rate mixing verified.\n- edit: transitions between source and support read natural.\n- assembly: composite trace sampled; spec consistency held.\n- delivery: AI segments honestly labeled in the ledger; fields complete.\n\nWorking rules:\n1. Read artifacts before judging; never judge from file names alone.\n2. Attach evidence (paths, measured values) to every verdict.\n3. State explicitly when a criterion cannot be verified.\n4. Record the final stage decision via the verdict tool.\n",
+  "model": "MiniMax-M2.5",
+  "temperature": 0.3,
+  "max_steps": 16,
+  "context_window_tokens": 204800,
+  "step_timeout_secs": 60,
+  "tools": [
+    "file_read",
+    "file_list",
+    "search_files",
+    "shell_exec",
+    "python_exec",
+    "read_back",
+    "verdict_submit"
+  ],
+  "memory": {
+    "type": "none",
+    "namespace": "hybrid_director"
+  },
+  "verify": null
+}

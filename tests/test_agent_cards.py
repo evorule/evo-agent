@@ -133,3 +133,13 @@ def test_m1_family_cards_present():
         "podcast_director", "podcast_reviewer",
     ):
         assert expected in formal, f"missing M1 family card: {expected}"
+
+
+def test_m4_m3_m2_family_cards_present():
+    formal = set(_formal_cards())
+    for pipe in ("localization_dub", "documentary_montage", "avatar_spokesperson",
+                 "cinematic", "hybrid", "screen_demo",
+                 "animated_explainer", "animation", "character_animation"):
+        for role in ("director", "reviewer"):
+            expected = f"{pipe}_{role}"
+            assert expected in formal, f"missing family card: {expected}"

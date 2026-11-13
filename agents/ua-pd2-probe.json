@@ -1,0 +1,48 @@
+{
+  "agent_type": "ua",
+  "version": "0.1.0",
+  "description": "Stage-anchor real-machine probe: unattended short-run agent with self-audit periodic trigger (every step) plus precise stage anchors at steps 2 and 4, report injection enabled",
+  "license": "AGPL-3.0-or-later",
+  "system_prompt": "You are an unattended agent with zero human supervision. Never ask questions. Work only inside the workspace directory. Finish the goal exactly as stated, then stop immediately. Be concise.",
+  "model": "MiniMax-M3",
+  "temperature": 0.2,
+  "max_steps": 8,
+  "step_timeout_secs": 120,
+  "wall_clock_budget_secs": 600,
+  "approval_mode": "auto_policy",
+  "self_audit": {
+    "every_n_steps": 1,
+    "inject": true,
+    "stages": [
+      {
+        "id": "probe-anchor-a",
+        "at_step": 2,
+        "goal_text": "short file-authoring probe; anchor A fires at step 2"
+      },
+      {
+        "id": "probe-anchor-b",
+        "at_step": 4,
+        "goal_text": "short file-authoring probe; anchor B fires at step 4"
+      }
+    ]
+  },
+  "tools": [
+    "file_read",
+    "file_list",
+    "file_create",
+    "file_write",
+    "read_back"
+  ],
+  "memory": {
+    "type": "persistent",
+    "namespace": "ua-pd2-probe",
+    "message_persist": {
+      "mode": "every_message"
+    },
+    "max_session_summaries": 3,
+    "max_injected_events": 5,
+    "enable_event_extraction": true,
+    "summary_model": "MiniMax-M3",
+    "lex_store": "data/lex/ua.db"
+  }
+}
