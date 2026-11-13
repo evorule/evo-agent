@@ -1142,7 +1142,7 @@ async fn construct_runner(
             crate::agent::runner::load_agents_md_segment(state.workdir()).clone(),
         )
         // M5-a:注入生效能力边界(声明重绑工具面 + 会话边界段/边界事实)
-        .with_capability_boundary(capability_boundary)
+        .with_capability_boundary(capability_boundary.clone())
         // 挂 filtered toolkit(同 HTTP 端点口径,见 run_agent)
         .with_tool_handler(filtered)
         // G8:注入审批决策端(人工审查开合)——定义级 approval_mode 三态路由:
@@ -1171,14 +1171,13 @@ async fn construct_runner(
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源;
         // run_streaming_inner 内按会话创建 {sid}.jsonl)
         .with_journal_dir(state.workdir().join("data").join("sessions"))
-        // checkpoint 仓库跟随会话工作区(与写工具族 apply_workspace_boundary
-        // 同根统一解析);未声明会话工作区时回落 agent 工作区根(--agent-root
-        // 优先,缺省=workdir;与 undo 工具 store/toolkit 构建期绑定同 root,
-        // 不落 runtime)
+        // checkpoint 仓库根跟生效边界（B-368 案 A：快照链与写面同根；
+        // 合成态=write_face 基根=toolkit workdir，与 undo store 构建期绑定一致）
         .with_workspace_checkpoint_writable(
-            &crate::api::serve_tools::session_workspace_root(
+            &crate::api::serve_tools::checkpoint_repo_root(
                 workspace.map(std::path::Path::new),
                 state.agent_workspace_root(),
+                &capability_boundary,
             ),
             crate::api::serve_tools::checkpoint_writable_dir(def.capability_boundary.as_ref()),
         )

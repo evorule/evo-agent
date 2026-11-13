@@ -36,6 +36,17 @@
 
 ## [Unreleased]
 
+### Snapshot chain follows the effective capability boundary
+
+- 🐛 修复:checkpoint 仓库根与写面根分叉(`--agent-root` ≠ serve workdir 且
+  未携带 workspace 的部署形态)——checkpoint/undo 快照落在 agent 工作区根,
+  而 file_write 族实际写入 workdir/workspace 子域,workspace_undo 对会话
+  写入静默扑空。现 checkpoint 仓库根由生效边界派生(合成态=写面基根,
+  declared read_write=sandbox_root),三处 runner 接线统一;同根部署零行为
+  变化。
+- 🐛 修复:declared read_write 会话写面全域重绑后 undo 快照栈不随重绑——
+  apply_capability_boundary 现同步重绑 workspace_undo 的快照栈根。
+
 ### Memory feedback repairs: boundary truth, memory tool exposure, trim inventory
 
 - 🐛 修复:能力边界「可写域」文案失真——未声明(缺省合成)路径下,边界文案此前宣示
