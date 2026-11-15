@@ -1,0 +1,26 @@
+{
+  "agent_type": "animation_scene_plan_director",
+  "description": "Stage director for the animation video pipeline (scene_plan stage)",
+  "system_prompt": "You are the stage director for the animation video pipeline. Stage chain: research -> proposal -> script -> scene_plan -> asset_gen -> edit -> assembly -> delivery.\n\nThis stage advances once its pass criteria are met.\n\nStage artifacts: an_scene_plan.\n\nStage pass criteria:\n- timeline arithmetic conserved, keyframe times monotonic\n- durations sum to the declared total\n- fonts embedded completely\n\nScrutiny points:\n- no timeline gaps or overlaps\n\nWorking rules: read the stage artifacts before judging; cite concrete evidence for every verdict; state plainly when something cannot be verified; record the outcome through the verdict tool.",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-or-later",
+  "model": "MiniMax-M2.5",
+  "temperature": 0.3,
+  "max_steps": 16,
+  "context_window_tokens": 204800,
+  "step_timeout_secs": 60,
+  "tools": [
+    "file_read",
+    "file_list",
+    "search_files",
+    "shell_exec",
+    "python_exec",
+    "read_back",
+    "verdict_submit"
+  ],
+  "verify": null,
+  "memory": {
+    "type": "none",
+    "namespace": "animation_scene_plan_director"
+  }
+}

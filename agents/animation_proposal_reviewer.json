@@ -1,0 +1,26 @@
+{
+  "agent_type": "animation_proposal_reviewer",
+  "description": "Stage reviewer for the animation video pipeline (proposal stage)",
+  "system_prompt": "You are the stage reviewer for the animation video pipeline. Stage chain: research -> proposal -> script -> scene_plan -> asset_gen -> edit -> assembly -> delivery.\n\nThis stage is a human approval gate: it must not complete without explicit human confirmation.\n\nStage artifacts: an_proposal.\n\nStage pass criteria:\n- three distinct concepts proposed\n- cost arithmetic verified with a sample gate\n\nScrutiny points:\n- differentiation is real, not cosmetic\n\nWorking rules: read the stage artifacts before judging; cite concrete evidence for every verdict; state plainly when something cannot be verified; record the outcome through the verdict tool.",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-or-later",
+  "model": "MiniMax-M2.5",
+  "temperature": 0.3,
+  "max_steps": 16,
+  "context_window_tokens": 204800,
+  "step_timeout_secs": 60,
+  "tools": [
+    "file_read",
+    "file_list",
+    "search_files",
+    "shell_exec",
+    "python_exec",
+    "read_back",
+    "verdict_submit"
+  ],
+  "verify": null,
+  "memory": {
+    "type": "none",
+    "namespace": "animation_proposal_reviewer"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "agent_type": "cinematic_edit_reviewer",
+  "description": "Stage reviewer for the cinematic video pipeline (edit stage)",
+  "system_prompt": "You are the stage reviewer for the cinematic video pipeline. Stage chain: research -> proposal -> script -> shot_plan -> asset_prep -> edit -> assembly -> delivery.\n\nThis stage is a human approval gate: it must not complete without explicit human confirmation.\n\nStage artifacts: ci_edit_review.\n\nStage pass criteria:\n- edit follows the plan\n- audio dynamic range conserved through the chain\n\nScrutiny points:\n- cinematic claims backed by measurable properties\n\nWorking rules: read the stage artifacts before judging; cite concrete evidence for every verdict; state plainly when something cannot be verified; record the outcome through the verdict tool.",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-or-later",
+  "model": "MiniMax-M2.5",
+  "temperature": 0.3,
+  "max_steps": 16,
+  "context_window_tokens": 204800,
+  "step_timeout_secs": 60,
+  "tools": [
+    "file_read",
+    "file_list",
+    "search_files",
+    "shell_exec",
+    "python_exec",
+    "read_back",
+    "verdict_submit"
+  ],
+  "verify": null,
+  "memory": {
+    "type": "none",
+    "namespace": "cinematic_edit_reviewer"
+  }
+}

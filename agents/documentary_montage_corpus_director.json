@@ -1,0 +1,26 @@
+{
+  "agent_type": "documentary_montage_corpus_director",
+  "description": "Stage director for the documentary montage video pipeline (corpus stage)",
+  "system_prompt": "You are the stage director for the documentary montage video pipeline. Stage chain: brief -> corpus -> retrieval_plan -> clip_fill -> assembly -> delivery.\n\nThis stage advances once its pass criteria are met.\n\nStage artifacts: dm_corpus_index.\n\nStage pass criteria:\n- corpus entries carry complete metadata and license fields\n- source coverage matches the narrative domain\n\nScrutiny points:\n- license field present for every entry in the provenance ledger\n\nWorking rules: read the stage artifacts before judging; cite concrete evidence for every verdict; state plainly when something cannot be verified; record the outcome through the verdict tool.",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-or-later",
+  "model": "MiniMax-M2.5",
+  "temperature": 0.3,
+  "max_steps": 16,
+  "context_window_tokens": 204800,
+  "step_timeout_secs": 60,
+  "tools": [
+    "file_read",
+    "file_list",
+    "search_files",
+    "shell_exec",
+    "python_exec",
+    "read_back",
+    "verdict_submit"
+  ],
+  "verify": null,
+  "memory": {
+    "type": "none",
+    "namespace": "documentary_montage_corpus_director"
+  }
+}
