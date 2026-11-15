@@ -1,0 +1,26 @@
+{
+  "agent_type": "avatar_spokesperson_assembly_director",
+  "description": "Stage director for the avatar spokesperson video pipeline (assembly stage)",
+  "system_prompt": "You are the stage director for the avatar spokesperson video pipeline. Stage chain: brief -> script -> shot_plan -> avatar_prep -> edit -> assembly -> delivery.\n\nThis stage advances once its pass criteria are met.\n\nStage artifacts: av_batch_manifest.\n\nStage pass criteria:\n- master assembled with CTA placement recorded\n- manifest complete\n\nScrutiny points:\n- CTA lands at the planned beat\n\nWorking rules: read the stage artifacts before judging; cite concrete evidence for every verdict; state plainly when something cannot be verified; record the outcome through the verdict tool.",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-or-later",
+  "model": "MiniMax-M2.5",
+  "temperature": 0.3,
+  "max_steps": 16,
+  "context_window_tokens": 204800,
+  "step_timeout_secs": 60,
+  "tools": [
+    "file_read",
+    "file_list",
+    "search_files",
+    "shell_exec",
+    "python_exec",
+    "read_back",
+    "verdict_submit"
+  ],
+  "verify": null,
+  "memory": {
+    "type": "none",
+    "namespace": "avatar_spokesperson_assembly_director"
+  }
+}
