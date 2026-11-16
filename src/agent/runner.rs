@@ -6920,7 +6920,7 @@ impl AgentRunner {
 
         let final_result = if !decision.approved {
             warn!(%session_id, tool = %tool_name, "G8: tool call rejected");
-            Value::from(r#"{"status":"rejected","message":"User denied approval"}"#)
+            g8_rejection_payload(&decision_label, decision.auto_rejected, &decision.reason)
         } else {
             // 批准 → 管道 ApprovalReexec 重执行(不递归检查 proposal):
             // 预供给决策由⑤消费(收编型直通⑦真实执行),args 注入 approved:true
@@ -7388,7 +7388,7 @@ impl AgentRunner {
                 tt.attach_approval_to_last(approval_record.clone());
             }
             return Ok((
-                Value::from(r#"{"status":"rejected","message":"User denied approval"}"#),
+                g8_rejection_payload(&decision_label, decision.auto_rejected, &decision.reason),
                 Some(approval_record),
             ));
         }
@@ -12936,3 +12936,25 @@ pub(crate) fn enforce_payload_byte_gate(messages: &mut Vec<Message>) -> PayloadG
 #[cfg(test)]
 #[path = "runner_tests.rs"]
 mod runner_tests;
+
+/// G8 拒绝结果载荷——agent 可见面区分「超时自动拒绝」vs「用户真实拒绝」
+/// （o109/design-102 M3：decision_label 与 reason 透传；status 语义只加不改，
+/// 既有消费方按 status=rejected 的解析保持兼容。三站点统一走本助手=编译期强制。）
+pub(crate) fn g8_rejection_payload(
+    decision_label: &str,
+    auto_rejected: bool,
+    reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "rejected",
+        "decision": decision_label,
+        "auto_rejected": auto_rejected,
+        "message": if auto_rejected {
+            "approval timed out and was auto-denied (the user may not have seen the request)"
+        } else {
+            "User denied approval"
+        },
+        "reason": reason,
+    })
+}
+

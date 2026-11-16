@@ -152,6 +152,22 @@ impl FileWriteTool {
 
         // 写入
         std::fs::write(&target, content.as_bytes()).map_err(|e| format!("write failed: {}", e))?;
+        // o107 传输校验:写后回读逐字节比对(防传输层吞字);不匹配重写一次,仍不匹配显式报错 fail-visible
+        let written_back = std::fs::read(&target)
+            .map_err(|e| format!("post-write verify read failed: {}", e))?;
+        if written_back.as_slice() != content.as_bytes() {
+            std::fs::write(&target, content.as_bytes())
+                .map_err(|e| format!("rewrite after verify mismatch failed: {}", e))?;
+            let reread = std::fs::read(&target)
+                .map_err(|e| format!("post-rewrite verify read failed: {}", e))?;
+            if reread.as_slice() != content.as_bytes() {
+                return Err(format!(
+                    "write verification failed after rewrite: disk {} bytes != intended {} bytes (possible storage/transport fault)",
+                    reread.len(),
+                    content.len()
+                ));
+            }
+        }
         let bytes_written = content.len();
 
         let mut map = serde_json::Map::new();
@@ -163,6 +179,7 @@ impl FileWriteTool {
             "bytes_written".to_string(),
             Value::from(bytes_written as i64),
         );
+        map.insert("verified".to_string(), Value::Bool(true));
         map.insert("created".to_string(), Value::Bool(!overwrite));
         map.insert(
             "writable_dir".to_string(),
@@ -247,6 +264,23 @@ mod tests {
         let written = std::fs::read_to_string(dir.path().join("workspace/new.txt")).unwrap();
         assert_eq!(written, "hello");
     }
+
+    #[test]
+    fn test_write_result_reports_verified() {
+        let dir = temp_workdir_with_workspace();
+        let tool = FileWriteTool::new(dir.path().to_path_buf());
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("workspace/v.txt"));
+            m.insert("content".to_string(), Value::from("payload"));
+            m
+        }));
+        let obj = result.expect("write should succeed");
+        assert_eq!(obj["verified"], serde_json::Value::Bool(true));
+        let on_disk = std::fs::read(dir.path().join("workspace/v.txt")).unwrap();
+        assert_eq!(on_disk, b"payload");
+    }
+
 
     #[test]
     fn test_reject_overwrite_without_flag() {
@@ -549,3 +583,5 @@ mod tests {
         let _ = std::fs::remove_file(&link_path);
     }
 }
+
+
