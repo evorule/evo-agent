@@ -558,6 +558,7 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             JournalEvent::ApprovalResolved {
                 approval_id,
                 decision,
+                ..
             } => {
                 if let Some(a) = acc.as_mut() {
                     if let Some(c) = a.calls.iter_mut().rev().find(|c| {
@@ -2245,6 +2246,9 @@ mod tests {
         j.push(JE::ApprovalResolved {
             approval_id: "p1".into(),
             decision: "approved".into(),
+            approver: None,
+            verified: None,
+            reason: None,
         });
         j.push(JE::ToolResult {
             call_id: "t3".into(),

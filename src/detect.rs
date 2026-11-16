@@ -933,6 +933,9 @@ mod tests {
                 JE::ApprovalResolved {
                     approval_id: "p1".into(),
                     decision: "rejected".into(),
+                    approver: None,
+                    verified: None,
+                    reason: None,
                 },
             ),
             line(
@@ -1041,6 +1044,9 @@ mod tests {
                 JE::ApprovalResolved {
                     approval_id: "p1".into(),
                     decision: "rejected".into(),
+                    approver: None,
+                    verified: None,
+                    reason: None,
                 },
             ),
             invoked(3, 1200, "t9", "file_read"),
@@ -1073,6 +1079,9 @@ mod tests {
                 JE::ApprovalResolved {
                     approval_id: "p1".into(),
                     decision: "rejected".into(),
+                    approver: None,
+                    verified: None,
+                    reason: None,
                 },
             ),
             invoked(3, 1200, "t9", "file_read"),
@@ -1098,6 +1107,9 @@ mod tests {
                 JE::ApprovalResolved {
                     approval_id: "p1".into(),
                     decision: "rejected".into(),
+                    approver: None,
+                    verified: None,
+                    reason: None,
                 },
             ),
         ];

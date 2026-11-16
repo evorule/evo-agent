@@ -206,6 +206,63 @@ fn test_agent_config_default() {
     assert!(config.step_timeout.is_zero());
     assert!(config.tool_names.is_empty());
     assert_eq!(config.llm_retry_count, 3);
+    assert_eq!(
+        config.max_chain_depth,
+        crate::agent::session_spawn_tool::MAX_CHAIN_DEPTH
+    );
+}
+
+#[test]
+fn test_chain_budget_four_windows_and_shared_arc_accounting() {
+    use crate::agent::session_spawn_tool::{
+        check_budget, ChainRuntimeState, CHAIN_BUDGET_WINDOW_MULT,
+    };
+
+    let context_window_tokens = 2_500_u64;
+    let budget = context_window_tokens * CHAIN_BUDGET_WINDOW_MULT;
+    let chain = ChainRuntimeState::with_max_chain_depth(budget, 5);
+    assert_eq!(chain.budget_tokens(), 10_000);
+    assert_eq!(chain.max_chain_depth(), 5);
+    assert!(check_budget(budget - 1, budget).is_ok());
+
+    let root_counter = chain.token_counter();
+    let child_counter = chain.token_counter();
+    root_counter.fetch_add(6_000, std::sync::atomic::Ordering::Relaxed);
+    child_counter.fetch_add(3_999, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(chain.tokens_used(), 9_999, "跨 Arc 消耗必须汇总到同一链账");
+    assert!(check_budget(chain.tokens_used(), chain.budget_tokens()).is_ok());
+    child_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        check_budget(chain.tokens_used(), chain.budget_tokens()).is_err(),
+        "恰好达到 context_window × 4 即拒绝下一次 spawn"
+    );
+}
+
+#[test]
+fn test_spawn_factory_inherits_runaway_and_immutable_chain_cap() {
+    use crate::agent::session_spawn_tool::ChainRuntimeState;
+
+    let runner = AgentRunner::new(
+        AgentConfig {
+            max_chain_depth: 9,
+            ..AgentConfig::default()
+        },
+        make_test_client(),
+    )
+    .with_runaway_policy(Some(RunawayPolicy {
+        max_actions_per_run: 500,
+        restate_conditions: vec!["keep goal".to_string()],
+    }));
+    let chain = std::sync::Arc::new(ChainRuntimeState::with_max_chain_depth(400, 2));
+    let child = runner.spawn_factory(chain.clone())("child");
+
+    let inherited = child.runaway_policy.as_ref().expect("Runaway inherited");
+    assert_eq!(inherited.max_actions_per_run, 500);
+    assert_eq!(inherited.restate_conditions, vec!["keep goal"]);
+    let child_chain = child.chain.as_ref().expect("chain inherited");
+    assert!(std::sync::Arc::ptr_eq(child_chain, &chain));
+    assert_eq!(child_chain.max_chain_depth(), 2, "子配置不得提高根链上限");
+    assert_eq!(child_chain.budget_tokens(), 400);
 }
 
 #[test]
@@ -990,6 +1047,7 @@ fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
         step_timeout_secs: 30,
         step_timeout_floor_from_budget: None,
         approval_wait_timeout_secs: None,
+        max_chain_depth: None,
         tools,
         memory: MemoryConfig::default(), // type = "none"
         output_format: None,
@@ -4804,6 +4862,15 @@ fn test_runaway_guard_bump_trips_over_quota() {
 }
 
 #[test]
+fn test_unattended_runaway_allows_500_and_pauses_501() {
+    let mut guard = RunawayGuard::new(500);
+    for action in 1..=500 {
+        assert!(!guard.bump(), "第 {action} 次应在无人值守配额内放行");
+    }
+    assert!(guard.bump(), "第 501 次必须触发既有 Runaway 暂停");
+}
+
+#[test]
 fn test_runaway_guard_restored_from_journal_count() {
     // 跨重启回填(修订⑦):按 journal 回填值恢复累计数,阈值不变;
     // 回填后剩余配额内放行、超限即触发(护栏不可绕过)
@@ -6527,6 +6594,103 @@ async fn test_non_payload_error_no_trim_no_retry() {
         "现行错误透传面保持: {:?}",
         done.error
     );
+}
+
+/// H3 墙钟预算是 ReAct 回喂循环顶的看门狗，不是任意 await 的硬 deadline。
+/// 0 秒小预算在首个 LLM await 前触发，必须按既有 Error+Done 收尾并落 turn_ended(error)。
+#[tokio::test]
+async fn test_wall_clock_budget_zero_emits_error_done_and_journal() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let session_id = "s-wall-clock-zero";
+    let _state = server
+        .mock("GET", format!("/api/sessions/{session_id}/state").as_str())
+        .with_status(200)
+        .with_body(r#"{"payload":{}}"#)
+        .create_async()
+        .await;
+    let _payload = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/payload").as_str(),
+        )
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    let _command = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/command").as_str(),
+        )
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    let _events = server
+        .mock("GET", format!("/api/sessions/{session_id}/events").as_str())
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("data: {\"type\":\"IoRequest\",\"id\":1,\"io_type\":\"call_external\",\"params\":{}}\n\n")
+        .create_async()
+        .await;
+    let io_response = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/io_response").as_str(),
+        )
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create_async()
+        .await;
+
+    let llm = LlmHandler::mock_scripted(Vec::new());
+    let llm_probe = llm.clone();
+    let journal_dir = tempfile::tempdir().unwrap();
+    let runner = AgentRunner::new(
+        AgentConfig {
+            wall_clock_budget_secs: Some(0),
+            ..AgentConfig::default()
+        },
+        client,
+    )
+    .with_llm_handler(llm)
+    .with_journal_dir(journal_dir.path().to_path_buf());
+    let mut stream = runner.run_continuation(
+        session_id.to_string(),
+        "stop at the loop-top watchdog".to_string(),
+        Vec::new(),
+    );
+    let mut error_text = String::new();
+    let mut done = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(AgentEvent::Error(error)) => error_text.push_str(&error.to_string()),
+            Ok(AgentEvent::Done(result)) => {
+                done = Some(result);
+                break;
+            }
+            Err(error) => {
+                panic!("wall-clock watchdog must use Error+Done, got stream Err: {error:?}")
+            }
+            _ => {}
+        }
+    }
+
+    let done = done.expect("wall-clock watchdog must emit Done");
+    assert!(!done.success);
+    assert!(error_text.contains("全局时限预算耗尽"), "{error_text}");
+    assert!(
+        llm_probe.mock_observed_params().is_empty(),
+        "看门狗必须先于 LLM await 触发"
+    );
+    io_response.assert_async().await;
+    let journal_path =
+        crate::agent::journal::JournalWriter::path_for(journal_dir.path(), session_id);
+    let journal = std::fs::read_to_string(journal_path).expect("read wall-clock journal");
+    assert!(journal.contains("\"type\":\"turn_ended\""), "{journal}");
+    assert!(journal.contains("\"status\":\"error\""), "{journal}");
 }
 
 /// 413 类错误识别:三种形态取或,非 413 不误伤

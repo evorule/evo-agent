@@ -1639,6 +1639,9 @@ mod tests {
             JournalEvent::ApprovalResolved {
                 approval_id: "a".into(),
                 decision: "approved".into(),
+                approver: None,
+                verified: None,
+                reason: None,
             },
             JournalEvent::PolicyJudged {
                 judgement_id: "j1".into(),

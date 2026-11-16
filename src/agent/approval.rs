@@ -330,6 +330,12 @@ impl HttpApproval {
     pub fn new_standalone() -> Self {
         Self::new(Arc::new(Mutex::new(HashMap::new())))
     }
+
+    /// 覆盖审批等待上限；未调用时保持 60 秒缺省。
+    pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = timeout_secs;
+        self
+    }
 }
 
 #[async_trait]
@@ -803,6 +809,14 @@ mod tests {
         assert!(!decision.auto_rejected);
     }
 
+    #[test]
+    fn http_approval_timeout_builder_preserves_default_and_applies_override() {
+        let default = HttpApproval::new_standalone();
+        assert_eq!(default.timeout_secs, HTTP_APPROVAL_TIMEOUT_SECS);
+        let custom = HttpApproval::new_standalone().with_timeout_secs(7);
+        assert_eq!(custom.timeout_secs, 7);
+    }
+
     // ===== 无人值守审批等待看护(等待上限,超时自动拒绝 deny 默认向) =====
 
     #[tokio::test(start_paused = true)]
@@ -1247,10 +1261,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_approval_timeout_auto_denies() {
-        let approval = HttpApproval {
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            timeout_secs: 1, // 1 秒超时
-        };
+        let approval = HttpApproval::new_standalone().with_timeout_secs(1);
         let pending = approval.pending.clone();
 
         let req = ApprovalRequest {

@@ -53,12 +53,17 @@ pub const CHAIN_BUDGET_WINDOW_MULT: u64 = 4;
 
 // ===== 护栏判据（纯函数，测试锁确定性） =====
 
-/// 深度硬顶检查：child_depth 超过 [`MAX_CHAIN_DEPTH`] 即拒
+/// 深度硬顶检查：未显式配置时使用 [`MAX_CHAIN_DEPTH`]。
 pub fn check_depth(child_depth: u32) -> Result<(), String> {
-    if child_depth > MAX_CHAIN_DEPTH {
+    check_depth_with_cap(child_depth, MAX_CHAIN_DEPTH)
+}
+
+/// 以共享链运行态的不可变上限检查子会话深度；0 禁止首个子 spawn。
+pub fn check_depth_with_cap(child_depth: u32, max_chain_depth: u32) -> Result<(), String> {
+    if child_depth > max_chain_depth {
         Err(format!(
             "session_spawn rejected: chain depth cap reached (child depth {child_depth} > \
-             max {MAX_CHAIN_DEPTH}); finish this session and hand over to a human instead"
+             max {max_chain_depth}); finish this session and hand over to a human instead"
         ))
     } else {
         Ok(())
@@ -114,16 +119,23 @@ pub struct ChainRuntimeState {
     halted: Mutex<Option<String>>,
     tokens_used: Arc<AtomicU64>,
     budget_tokens: u64,
+    max_chain_depth: u32,
     spawn_repeats: Mutex<SpawnRepeatGuard>,
 }
 
 impl ChainRuntimeState {
-    /// 构造（budget_tokens = 链累计 token 预算上限）
+    /// 构造（budget_tokens = 链累计 token 预算上限），链深取缺省值 3。
     pub fn new(budget_tokens: u64) -> Self {
+        Self::with_max_chain_depth(budget_tokens, MAX_CHAIN_DEPTH)
+    }
+
+    /// 以定义解析出的链深上限构造；该上限随同一 Arc 沿链共享，不可被子定义提高。
+    pub fn with_max_chain_depth(budget_tokens: u64, max_chain_depth: u32) -> Self {
         Self {
             halted: Mutex::new(None),
             tokens_used: Arc::new(AtomicU64::new(0)),
             budget_tokens,
+            max_chain_depth,
             spawn_repeats: Mutex::new(SpawnRepeatGuard::default()),
         }
     }
@@ -157,6 +169,11 @@ impl ChainRuntimeState {
     /// 链预算上限
     pub fn budget_tokens(&self) -> u64 {
         self.budget_tokens
+    }
+
+    /// 全链共享的不可变链深上限
+    pub fn max_chain_depth(&self) -> u32 {
+        self.max_chain_depth
     }
 
     /// spawn 同签名观察（见 [`SpawnRepeatGuard`]）；true = 触发停链判据
@@ -330,10 +347,11 @@ impl ToolFunction for SessionSpawnTool {
         if let Some(reason) = w.chain.halt_reason() {
             return Err(format!("session_spawn rejected: chain halted ({reason})"));
         }
-        // 护栏 1：链深度硬顶（深度上溯链权威=server）
-        let hops = chain_ancestor_hops(&w.client, &w.session_id).await?;
+        // 护栏 1：链深度硬顶（深度上溯链权威=server，上限来自共享链运行态）
+        let max_chain_depth = w.chain.max_chain_depth();
+        let hops = chain_ancestor_hops(&w.client, &w.session_id, max_chain_depth).await?;
         let child_depth = hops + 1;
-        check_depth(child_depth)?;
+        check_depth_with_cap(child_depth, max_chain_depth)?;
         // 护栏 2：链累计 token 预算
         let used = w.chain.tokens_used();
         check_budget(used, w.chain.budget_tokens())?;
@@ -399,11 +417,15 @@ impl ToolFunction for SessionSpawnTool {
 
 /// 深度上溯（权威=server）：返回会话的祖先跳数（根=0）。有环防护：超过
 /// 深度硬顶 +1 跳即停止（调用方按超深拒绝，不无限上溯）。
-async fn chain_ancestor_hops(client: &EvoruleApiClient, session_id: &str) -> Result<u32, String> {
+async fn chain_ancestor_hops(
+    client: &EvoruleApiClient,
+    session_id: &str,
+    max_chain_depth: u32,
+) -> Result<u32, String> {
     let mut sid = session_id.to_string();
     let mut hops = 0u32;
     loop {
-        if hops > MAX_CHAIN_DEPTH {
+        if hops > max_chain_depth {
             // 已经深过硬顶+1：无需继续上溯，调用方按 child_depth 拒绝
             return Ok(hops);
         }
@@ -432,6 +454,15 @@ mod tests {
         assert!(check_depth(MAX_CHAIN_DEPTH + 1).is_err());
         let err = check_depth(MAX_CHAIN_DEPTH + 1).unwrap_err();
         assert!(err.contains("depth cap"), "{err}");
+    }
+
+    #[test]
+    fn depth_guard_uses_shared_configured_cap() {
+        assert!(check_depth_with_cap(5, 5).is_ok());
+        assert!(check_depth_with_cap(6, 5).is_err());
+        assert!(check_depth_with_cap(1, 0).is_err());
+        let state = ChainRuntimeState::with_max_chain_depth(1000, 5);
+        assert_eq!(state.max_chain_depth(), 5);
     }
 
     #[test]

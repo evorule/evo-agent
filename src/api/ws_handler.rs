@@ -717,12 +717,11 @@ async fn forward_turn_events(
 /// - `Some("policy")`:PolicyReview 评审式——条件文件 `.evo/approval-policy.toml`
 ///   serve 侧独占读取，加载失败 fail-visible 降级 HttpApproval（显式留痕，
 ///   绝不静默按无条件放行处理）；评审调用经 AuditedLlm sidecar（评审 prompt
-///   与判定全文入审计链），fallback 为 HttpApproval 60s 人工审批窗
+///   与判定全文入审计链），fallback 为 HttpApproval 人工审批窗
 /// - 其余（manual/缺省）:HttpApproval（现状行为零变化）
 ///
-/// 返回 `(决策端, Runaway 护栏策略)`:policy 模式加载成功时同时产出
-/// [`RunawayPolicy`]（护栏注入面——计数阈值+复述条件清单复用
-/// 同一份加载结果）；其余模式护栏为 None（不启用，行为零变化）。
+/// 返回 `(决策端, Runaway 护栏策略)`:policy 模式加载成功时复用条件文件产出
+/// [`RunawayPolicy`]；auto_policy/yolo 固定产出 500 次有限配额；manual 不启用。
 ///
 /// crate 内共享：WS 面（construct_runner）与 HTTP 面（run_agent /
 /// run_agent_stream）同口径调用，避免三态路由在 serve 各执行面分叉。
@@ -821,10 +820,41 @@ impl crate::agent::approval::ApprovalCallback for GroupedApproval {
     }
 }
 
+const UNATTENDED_MAX_ACTIONS_PER_RUN: u32 = 500;
+
+fn unattended_runaway_policy() -> crate::agent::runner::RunawayPolicy {
+    crate::agent::runner::RunawayPolicy {
+        max_actions_per_run: UNATTENDED_MAX_ACTIONS_PER_RUN,
+        restate_conditions: Vec::new(),
+    }
+}
+
+/// 混配档位共用一条 run 级计数器：配额取最小值，条件按装配顺序合并并去重。
+fn merge_runaway_policy(
+    current: &mut Option<crate::agent::runner::RunawayPolicy>,
+    next: Option<crate::agent::runner::RunawayPolicy>,
+) {
+    let Some(next) = next else {
+        return;
+    };
+    match current {
+        Some(current) => {
+            current.max_actions_per_run = current.max_actions_per_run.min(next.max_actions_per_run);
+            for condition in next.restate_conditions {
+                if !current.restate_conditions.contains(&condition) {
+                    current.restate_conditions.push(condition);
+                }
+            }
+        }
+        None => *current = Some(next),
+    }
+}
+
 pub(crate) fn build_approval_callback(
     state: &AgentApiState,
     mode: Option<&str>,
     def_override: bool,
+    approval_wait_timeout_secs: Option<u64>,
 ) -> (
     Arc<dyn crate::agent::approval::ApprovalCallback>,
     Option<crate::agent::runner::RunawayPolicy>,
@@ -838,33 +868,32 @@ pub(crate) fn build_approval_callback(
     let needs_router =
         !def_override && (file_edit_override.is_some() || file_delete_override.is_some());
     if !needs_router {
-        return build_mode_callback(state, mode);
+        return build_mode_callback(state, mode, approval_wait_timeout_secs);
     }
 
     // 差异装配:逐组构建独立回调栈(组键未设的组回落会话缺省栈)。
-    // Runaway 护栏取首个 policy 组产出(各 policy 组共享同一份条件文件,
-    // 护栏形态同源)。
-    let (default_cb, runaway) = build_mode_callback(state, session_default.as_deref());
+    // 所有生效档位的 Runaway 配额取最小值，防止混配后放大总动作预算。
+    let (default_cb, runaway) = build_mode_callback(
+        state,
+        session_default.as_deref(),
+        approval_wait_timeout_secs,
+    );
     let mut runaway = runaway;
     let mut file_edit_stack: Option<Arc<dyn crate::agent::approval::ApprovalCallback>> = None;
     if let Some(m) = file_edit_override.as_deref() {
         // None 会话缺省 = workspace 缺省语义装配,与显式 manual 装配不同——
         // 按解析值整体比较,None ≠ Some("manual") 须建独立栈
         if session_default.as_deref() != Some(m) {
-            let (cb, r) = build_mode_callback(state, Some(m));
-            if runaway.is_none() {
-                runaway = r;
-            }
+            let (cb, r) = build_mode_callback(state, Some(m), approval_wait_timeout_secs);
+            merge_runaway_policy(&mut runaway, r);
             file_edit_stack = Some(cb);
         }
     }
     let mut file_delete_stack: Option<Arc<dyn crate::agent::approval::ApprovalCallback>> = None;
     if let Some(m) = file_delete_override.as_deref() {
         if session_default.as_deref() != Some(m) {
-            let (cb, r) = build_mode_callback(state, Some(m));
-            if runaway.is_none() {
-                runaway = r;
-            }
+            let (cb, r) = build_mode_callback(state, Some(m), approval_wait_timeout_secs);
+            merge_runaway_policy(&mut runaway, r);
             file_delete_stack = Some(cb);
         }
     }
@@ -883,23 +912,28 @@ pub(crate) fn build_approval_callback(
     )
 }
 
-/// 单档位回调栈构建原语(会话缺省档位或单组档位的统一装配面;
-/// 每工具组档位扩面前的 [`build_approval_callback`] 全文原样迁入,
-/// 各档位装配逻辑逐位未动)
+/// 单档位回调栈构建原语(会话缺省档位或单组档位的统一装配面)。
 fn build_mode_callback(
     state: &AgentApiState,
     mode: Option<&str>,
+    approval_wait_timeout_secs: Option<u64>,
 ) -> (
     Arc<dyn crate::agent::approval::ApprovalCallback>,
     Option<crate::agent::runner::RunawayPolicy>,
 ) {
     use crate::agent::approval_policy::{ApprovalPolicyFile, AuditedReviewInvoker, PolicyReview};
+    let approval_timeout_secs =
+        approval_wait_timeout_secs.unwrap_or(crate::agent::approval::HTTP_APPROVAL_TIMEOUT_SECS);
+    let http_approval = || {
+        crate::agent::approval::HttpApproval::new(state.pending_approvals().clone())
+            .with_timeout_secs(approval_timeout_secs)
+    };
     if mode == Some("plan") {
         // 只读陪跑档(设计 §3.4):全部写操作必问——人工窗直连(无 Tiered
         // 分级,allowlist 不参与自动批准),治理留痕照产(决策可回放)。
         return (
             Arc::new(crate::governance::GovAuditedApproval::new(Arc::new(
-                crate::agent::approval::HttpApproval::new(state.pending_approvals().clone()),
+                http_approval(),
             ))),
             None,
         );
@@ -907,13 +941,13 @@ fn build_mode_callback(
     if mode == Some("auto_policy") || mode == Some("yolo") {
         // 全自动+审计档(§3.4 yolo = auto_policy 判定式语义别名):红线豁免
         // 前置闸:豁免清单适用于所有档位——命中且未显式关闭时
-        // 回落人工审批卡(无人值守场景 60s 窗超时自动拒,保守安全);
-        // 自动决策守卫前置闸:逃逸意图/危险子命令提案永不自动批准,同样回落审批卡
+        // 回落人工审批卡(定义值或缺省 60s 窗超时自动拒,保守安全);
+        // 自动决策守卫前置闸:逃逸意图/危险子命令提案永不自动批准,同样回落审批卡。
+        // 无人值守档每次 run 最多放行 500 个动作，第 501 个动作由既有护栏暂停。
         let override_flag = approval_exemption_override(state);
-        let manual: Arc<dyn crate::agent::approval::ApprovalCallback> =
-            Arc::new(crate::governance::GovAuditedApproval::new(Arc::new(
-                crate::agent::approval::HttpApproval::new(state.pending_approvals().clone()),
-            )));
+        let manual: Arc<dyn crate::agent::approval::ApprovalCallback> = Arc::new(
+            crate::governance::GovAuditedApproval::new(Arc::new(http_approval())),
+        );
         let guarded = crate::agent::approval::RedLineGuardApproval::new(
             Arc::new(crate::agent::approval::AutoDecisionGuardApproval::new(
                 Arc::new(crate::agent::approval::PolicyApproval),
@@ -922,7 +956,7 @@ fn build_mode_callback(
             manual,
             override_flag,
         );
-        return (Arc::new(guarded), None);
+        return (Arc::new(guarded), Some(unattended_runaway_policy()));
     }
     if mode == Some("policy") {
         let policy_path = state.workdir().join(".evo").join("approval-policy.toml");
@@ -940,9 +974,7 @@ fn build_mode_callback(
                         Arc::new(AuditedReviewInvoker::new(audited)),
                         // B22:降级人工窗接审批卡留痕装饰器(仅此路会产生人工审批卡)
                         Arc::new(crate::governance::GovAuditedApproval::new(Arc::new(
-                            crate::agent::approval::HttpApproval::new(
-                                state.pending_approvals().clone(),
-                            ),
+                            http_approval(),
                         ))),
                         override_flag,
                         // verify 条目的执行工作目录=会话工作区根(serve 侧独占)
@@ -970,9 +1002,7 @@ fn build_mode_callback(
     (
         Arc::new(crate::governance::GovAuditedApproval::new(Arc::new(
             crate::agent::approval_tier::TieredApproval::new(
-                Arc::new(crate::agent::approval::HttpApproval::new(
-                    state.pending_approvals().clone(),
-                )),
+                Arc::new(http_approval()),
                 state.workdir(),
             ),
         ))),
@@ -1126,8 +1156,12 @@ async fn construct_runner(
     // 档位解析单源:定义级优先,未指定回落设置键 approval.mode.shellExec;
     // 组档位键(approval.mode.fileEdit/fileDelete)在 def 未指定时生效
     let resolved_mode = resolve_approval_mode(state, def.approval_mode.as_deref());
-    let (approval_callback, runaway_policy) =
-        build_approval_callback(state, resolved_mode.as_deref(), def.approval_mode.is_some());
+    let (approval_callback, runaway_policy) = build_approval_callback(
+        state,
+        resolved_mode.as_deref(),
+        def.approval_mode.is_some(),
+        def.approval_wait_timeout_secs,
+    );
     let mut runner = AgentRunner::new(config, state.evorule_client().clone())
         // LLM handler 统一解析产物下放(与 HTTP 端点/CLI 同口径:env 优先、
         // toml 兜底)——缺这步 runner 落 with_defaults 4096 硬兜底,推理模型
@@ -1650,6 +1684,36 @@ mod tests {
                 crate::io_handlers::tool_handler::ToolHandler::new(),
             )),
         )
+    }
+
+    #[test]
+    fn unattended_modes_have_finite_runaway_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = resolver_state(dir.path());
+        for mode in ["auto_policy", "yolo"] {
+            let (_, runaway) = build_approval_callback(&state, Some(mode), false, None);
+            let policy = runaway.expect("unattended mode must have a finite quota");
+            assert_eq!(policy.max_actions_per_run, 500);
+            assert!(policy.restate_conditions.is_empty());
+        }
+    }
+
+    #[test]
+    fn mixed_modes_use_minimum_quota_and_ordered_unique_conditions() {
+        let mut runaway = Some(crate::agent::runner::RunawayPolicy {
+            max_actions_per_run: 500,
+            restate_conditions: vec!["first".into(), "shared".into()],
+        });
+        merge_runaway_policy(
+            &mut runaway,
+            Some(crate::agent::runner::RunawayPolicy {
+                max_actions_per_run: 200,
+                restate_conditions: vec!["shared".into(), "last".into()],
+            }),
+        );
+        let runaway = runaway.unwrap();
+        assert_eq!(runaway.max_actions_per_run, 200);
+        assert_eq!(runaway.restate_conditions, ["first", "shared", "last"]);
     }
 
     #[test]

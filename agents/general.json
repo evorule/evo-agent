@@ -8,7 +8,9 @@
   "temperature": 0.3,
   "max_steps": 500,
   "context_window_tokens": 1000000,
-  "step_timeout_secs": 300,
+  "wall_clock_budget_secs": 28800,
+  "step_timeout_secs": 3600,
+  "max_chain_depth": 5,
   "tools": [
     "file_read",
     "image_load",
