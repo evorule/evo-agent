@@ -113,6 +113,20 @@ impl ToolFunction for PythonExecTool {
         if code.len() > 64 * 1024 {
             return Err("code 超过 64KB 限制".to_string());
         }
+        // o10①型坏字防线(P1 编辑面):载荷传输层单字节丢失会把多字节 UTF-8
+        // 解成 U+FFFD 替换符——代码参数含替换符=载荷在途损坏的强信号(代码
+        // 不含合法 U+FFFD,零误伤),fail-visible+重试指引(实测重试成功率高;
+        // file_write/edit_file 已有 o107 写层校验,本守卫补齐 python_exec
+        // 中转路径的工具入口检出)
+        let fffd = code.matches('\u{FFFD}').count();
+        if fffd > 0 {
+            return Err(format!(
+                "code payload contains {fffd} U+FFFD replacement character(s): \
+                 transport corruption suspected (byte loss in transit). Re-issue the \
+                 call — retries have a high success rate; if it persists, split the \
+                 payload into smaller calls"
+            ));
+        }
         let out = {
             let mut cmd = tokio::process::Command::new(python_exe());
             cmd.arg("-c").arg(code);
@@ -496,5 +510,18 @@ open(r\"{}\", \"w\").write(\"done\")
             "write must land in workdir"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// o10①型坏字防线:含 U+FFFD 的 code 载荷 fail-visible 拒执(守卫先于
+    /// 执行,无需解释器在位;工具入口零成本检出=中转路径坏字的第一道闸)
+    #[tokio::test]
+    async fn test_rejects_fffd_payload_before_execution() {
+        use crate::io_handlers::tool_handler::ToolFunction;
+        let tool = PythonExecTool::new();
+        let err = tool
+            .call(&serde_json::json!({"code": "print('a\u{FFFD}b')"}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("U+FFFD replacement character"), "got: {err}");
+        assert!(err.contains("Re-issue"), "须带重试指引: {err}");
     }
 }
