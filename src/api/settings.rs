@@ -681,7 +681,7 @@ pub fn schema() -> Vec<SettingEntry> {
             enum_values: None,
             range: None,
             category: "语言服务器",
-            description: "LSP 语言服务器接入（rust-analyzer / typescript-language-server，PATH 检测，缺失自动灰置；关闭即断开连接并清除全部 lsp.* 诊断）",
+            description: "LSP 语言服务器接入（rust-analyzer / typescript-language-server / pyright-langserver，PATH 检测，缺失自动灰置；关闭即断开连接并清除全部 lsp.* 诊断）",
             scope: "window",
         },
         SettingEntry {

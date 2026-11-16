@@ -51,6 +51,12 @@ pub const TYPESCRIPT_SERVER: ServerSpec = ServerSpec {
     args: &["--stdio"],
 };
 
+/// Python 门:pyright-langserver(--stdio 模式;npm `pyright` 包随附)
+pub const PYRIGHT_SERVER: ServerSpec = ServerSpec {
+    program: "pyright-langserver",
+    args: &["--stdio"],
+};
+
 /// spawn 候选名:Windows 下 npm 全局安装的可执行是 `.cmd` shim(无 `.exe`),
 /// 而 CreateProcess 只认确切名——按「原名 → `.cmd`」顺序尝试(Rust 对 `.cmd`
 /// 经 cmd.exe 包装启动,含参数转义加固);POSIX 只试原名。
