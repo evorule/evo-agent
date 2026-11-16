@@ -43,6 +43,7 @@ pub mod output_validator;
 pub mod pipeline;
 pub mod recipe;
 pub mod replan;
+pub mod repo_map;
 pub mod runner;
 pub mod safety_auditor;
 pub mod sediment;
