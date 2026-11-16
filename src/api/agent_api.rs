@@ -1764,6 +1764,7 @@ async fn run_agent(
     // 档位解析单源:定义级优先,未指定回落设置键 approval.mode.shellExec
     let approval_mode =
         crate::api::ws_handler::resolve_approval_mode(&state, def.approval_mode.as_deref());
+    let approval_wait_timeout_secs = def.approval_wait_timeout_secs;
     // 39 号项 A:项目记忆段(AGENTS.md 层级,随 serve workdir 解析)
     let agents_md = crate::agent::runner::load_agents_md_segment(state.workdir());
     // checkpoint 写域与写面工具同源:def move 前捕获声明边界判据(同
@@ -1824,33 +1825,16 @@ async fn run_agent(
     // 挂点在流式面随之生效);manual 态维持本端点既定行为(不注入=缺省
     // 拒绝,安全优先,行为零变化)
     let runner = match approval_mode.as_deref() {
-        Some("auto_policy") => {
-            // 红线豁免前置闸(与 WS 面同口径):命中且未显式关闭时回落人工审批卡
-            let override_flag = crate::api::ws_handler::approval_exemption_override(&state);
-            // 自动决策守卫前置闸:逃逸意图/危险子命令提案永不自动批准,回落审批卡
-            // (60s 窗超时自动拒,保守安全)
-            let manual: std::sync::Arc<dyn crate::agent::approval::ApprovalCallback> =
-                std::sync::Arc::new(crate::governance::GovAuditedApproval::new(
-                    std::sync::Arc::new(crate::agent::approval::HttpApproval::new(
-                        state.pending_approvals().clone(),
-                    )),
-                ));
-            let guarded = crate::agent::approval::RedLineGuardApproval::new(
-                std::sync::Arc::new(crate::agent::approval::AutoDecisionGuardApproval::new(
-                    std::sync::Arc::new(crate::agent::approval::PolicyApproval),
-                    manual.clone(),
-                )),
-                manual,
-                override_flag,
-            );
-            let callback: std::sync::Arc<dyn crate::agent::approval::ApprovalCallback> =
-                std::sync::Arc::new(guarded);
-            runner.with_approval_callback(callback)
-        }
-        Some("policy") => {
-            // 强制 policy 档=显式档位覆写(定义级同权),组档位键不生效
+        Some("auto_policy") | Some("yolo") | Some("policy") => {
+            // 与 WS/HTTP stream 共用装配：无人值守档获得 500 次有限配额，
+            // 审批等待值取定义声明，缺省仍为 60 秒。
             let (approval_callback, runaway_policy) =
-                crate::api::ws_handler::build_approval_callback(&state, Some("policy"), true);
+                crate::api::ws_handler::build_approval_callback(
+                    &state,
+                    approval_mode.as_deref(),
+                    true,
+                    approval_wait_timeout_secs,
+                );
             runner
                 .with_approval_callback(approval_callback)
                 .with_runaway_policy(runaway_policy)
@@ -2091,7 +2075,11 @@ async fn run_plan_execute_request(
     // 缺省/缺档 = 通道不注入，既有行为零变化。恢复路径在驱动内不触发。
     let plan_approval = match state.definitions.load("workflow_root") {
         Ok(def) if def.plan_confirmation => Some(std::sync::Arc::new(
-            crate::agent::approval::HttpApproval::new(state.pending_approvals().clone()),
+            crate::agent::approval::HttpApproval::new(state.pending_approvals().clone())
+                .with_timeout_secs(
+                    def.approval_wait_timeout_secs
+                        .unwrap_or(crate::agent::approval::HTTP_APPROVAL_TIMEOUT_SECS),
+                ),
         )
             as std::sync::Arc<dyn crate::agent::approval::ApprovalCallback>),
         _ => None,
@@ -2259,7 +2247,7 @@ async fn run_agent_stream(
     // 补接前本端点为 auto_policy/其余二元路由,policy 档静默降 manual=缺口):
     // build_approval_callback 三态一次判别双产出——auto_policy=PolicyApproval/
     // policy=PolicyReview 评审式+Runaway 护栏策略(本端点消费 run_streaming,
-    // 护栏挂点随之生效)/其余=HttpApproval 60s 人工审批窗(manual 态现状行为);
+    // 护栏挂点随之生效)/其余=HttpApproval 定义值或缺省 60s 人工审批窗(manual 态现状行为);
     // 组档位键(approval.mode.fileEdit/fileDelete)在 def 未指定时生效
     let resolved_mode =
         crate::api::ws_handler::resolve_approval_mode(&state, def.approval_mode.as_deref());
@@ -2267,6 +2255,7 @@ async fn run_agent_stream(
         &state,
         resolved_mode.as_deref(),
         def.approval_mode.is_some(),
+        def.approval_wait_timeout_secs,
     );
     // 39 号项 A:项目记忆段(AGENTS.md 层级,随 serve workdir 解析)
     let agents_md = crate::agent::runner::load_agents_md_segment(state.workdir());
@@ -3607,9 +3596,13 @@ async fn spawn_background_task(
     // 链护栏:预算=4×会话窗口(与 runner 内链懒建口径一致)
     let budget = (def.context_window_tokens.unwrap_or(8192) as u64)
         .saturating_mul(crate::agent::session_spawn_tool::CHAIN_BUDGET_WINDOW_MULT);
-    let chain = std::sync::Arc::new(crate::agent::session_spawn_tool::ChainRuntimeState::new(
-        budget,
-    ));
+    let chain = std::sync::Arc::new(
+        crate::agent::session_spawn_tool::ChainRuntimeState::with_max_chain_depth(
+            budget,
+            def.max_chain_depth
+                .unwrap_or(crate::agent::session_spawn_tool::MAX_CHAIN_DEPTH),
+        ),
+    );
     let factory = runner.spawn_factory(chain.clone());
     let child_runner = factory(&child_id);
     let goal = body.goal.clone();

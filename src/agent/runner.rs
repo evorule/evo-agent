@@ -616,6 +616,8 @@ pub struct AgentConfig {
     pub i2_lexicon: Option<crate::agent::context_inspector::I2Lexicon>,
     /// 全局时限预算秒(H3 看门狗;None=不启用——既有定义零影响)
     pub wall_clock_budget_secs: Option<u64>,
+    /// 同一 session_spawn 链的不可变深度上限；缺省 3，0 禁止首个子 spawn。
+    pub max_chain_depth: u32,
     /// 跑中自审自检器配置(None=机制不存在=既有定义零影响。
     /// 声明后 inner 步界按周期触发 trace-audit 只读服务族,结论落 journal
     /// SelfAudit 账;帧捕获在外层 wrapper 面)
@@ -653,6 +655,7 @@ impl Default for AgentConfig {
             knowledge_datasets: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
+            max_chain_depth: crate::agent::session_spawn_tool::MAX_CHAIN_DEPTH,
             self_audit: None,
         }
     }
@@ -5158,7 +5161,10 @@ impl AgentRunner {
                     let budget = (self.max_context_tokens as u64)
                         .saturating_mul(crate::agent::session_spawn_tool::CHAIN_BUDGET_WINDOW_MULT);
                     let c = std::sync::Arc::new(
-                        crate::agent::session_spawn_tool::ChainRuntimeState::new(budget),
+                        crate::agent::session_spawn_tool::ChainRuntimeState::with_max_chain_depth(
+                            budget,
+                            self.config.max_chain_depth,
+                        ),
                     );
                     self.chain = Some(c.clone());
                     if self.token_counter.is_none() {
@@ -5279,6 +5285,7 @@ impl AgentRunner {
         let summary_model = self.summary_model.clone();
         let summarizer = self.summarizer.clone();
         let approval_callback = self.approval_callback.clone();
+        let runaway_policy = self.runaway_policy.clone();
         let metrics = self.metrics.clone();
         let event_callbacks = self.event_callbacks.clone();
         let memory_event_store = self.memory_event_store.clone();
@@ -5371,7 +5378,7 @@ impl AgentRunner {
                 approval_callback: approval_callback.clone(),
                 // 批K 段7:子代理无人值守——ask callback 缺位 = 立即无人态(不干等)
                 ask_user_callback: None,
-                runaway_policy: None,
+                runaway_policy: runaway_policy.clone(),
                 parallel_tool_cache: Arc::new(std::sync::Mutex::new(
                     std::collections::HashMap::new(),
                 )),
@@ -10475,14 +10482,7 @@ impl AgentRunner {
                                                                        });
                                                                        // B21:approval_resolved(approval_id = proposal_id)
                                                                        if let Some(j) = &journal {
-                                                                           let label = if decision.approved {
-                                                                               "approved"
-                                                                           } else if decision.auto_rejected {
-                                                                               "auto_rejected"
-                                                                           } else {
-                                                                               "rejected"
-                                                                           };
-                                                                           if let Err(e) = j.approval_resolved(&req0.proposal_id, label) {
+                                                                           if let Err(e) = j.approval_resolved_with_decision(&req0.proposal_id, decision) {
                                                                                warn!(%session_id, error = %e, "approval_resolved journal failed");
                                                                            }
                                                                        }
@@ -11272,14 +11272,7 @@ impl AgentRunner {
                                                                });
                                                                // B21:approval_resolved(approval_id = proposal_id)
                                                                if let Some(j) = &journal {
-                                                                   let label = if decision.approved {
-                                                                       "approved"
-                                                                   } else if decision.auto_rejected {
-                                                                       "auto_rejected"
-                                                                   } else {
-                                                                       "rejected"
-                                                                   };
-                                                                   if let Err(e) = j.approval_resolved(&req0.proposal_id, label) {
+                                                                   if let Err(e) = j.approval_resolved_with_decision(&req0.proposal_id, decision) {
                                                                        warn!(%session_id, error = %e, "approval_resolved journal failed");
                                                                    }
                                                                }
@@ -12159,7 +12152,8 @@ impl RewindBudget {
 ///
 /// 由 serve/CLI 接线层从 `.evo/approval-policy.toml` 构造(见
 /// [`RunawayPolicy::from_policy_file`]),经 [`AgentRunner::with_runaway_policy`]
-/// 注入;None=不启用(manual/auto 档与未接线面行为零变化)。
+/// 注入;None=不启用(manual/default 与未接线面行为零变化)。serve 的
+/// auto_policy/yolo 统一注入 500 次有限配额，混配取各组最小值。
 #[derive(Debug, Clone)]
 pub struct RunawayPolicy {
     /// 连续自动操作累计配额(policy_limits.max_actions_per_run,缺省 200;

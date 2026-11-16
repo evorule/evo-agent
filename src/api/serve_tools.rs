@@ -2240,6 +2240,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             step_timeout_secs: 30,
             step_timeout_floor_from_budget: None,
             approval_wait_timeout_secs: None,
+            max_chain_depth: None,
             tools: tools.iter().map(|s| s.to_string()).collect(),
             memory: Default::default(),
             output_format: None,

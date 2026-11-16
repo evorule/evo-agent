@@ -10,6 +10,7 @@
 //   (forwarded to get_state on the mock server), NOT from the LLM response.
 
 use evo_agent::agent::approval::AutoApprove;
+use evo_agent::agent::context_window::{ContextWindowManager, TrimStrategy};
 use evo_agent::agent::memory::MemoryManager;
 use evo_agent::agent::runner::{AgentConfig, AgentRunner};
 use evo_agent::agent::sediment::{sediment, SedimentConfig, SedimentDeps};
@@ -24,7 +25,7 @@ use serde_json::json;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -1076,6 +1077,249 @@ impl ToolFunction for RecordingTool {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(Value::from(self.result))
     }
+}
+
+// ===== 长程真实 ReAct 压测：动态 LLM HTTP × 真实工具 × 终态 AgentResult =====
+
+#[derive(Default)]
+struct LongRunLlmObservations {
+    calls: AtomicUsize,
+    max_messages: AtomicUsize,
+    saw_tool_result: AtomicBool,
+    saw_trim: AtomicBool,
+}
+
+struct LongRunEvidence {
+    result: evo_agent::AgentResult,
+    llm_calls: usize,
+    tool_calls: usize,
+    tokens_used: u64,
+    max_messages: usize,
+    saw_tool_result: bool,
+    saw_trim: bool,
+}
+
+/// 每次请求都返回真实 HTTP JSON；奇数步校准的最后一次 LLM 返回 stop，
+/// 偶数步正式压测的最后一次 LLM 仍返回 tool_call，由最后一个 call_service 后
+/// 的 Stable 收尾。provider usage 固定为 7，供共享 token counter 精确对账。
+async fn spawn_longrun_llm(
+    total_calls: usize,
+    stop_on_last: bool,
+) -> (String, Arc<LongRunLlmObservations>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind longrun LLM listener");
+    let addr = listener.local_addr().expect("longrun LLM address");
+    let observations = Arc::new(LongRunLlmObservations::default());
+    let handler_observations = observations.clone();
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let observations = handler_observations.clone();
+            async move {
+                let call_index = observations.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let message_count = body["messages"].as_array().map_or(0, Vec::len);
+                observations
+                    .max_messages
+                    .fetch_max(message_count, Ordering::SeqCst);
+                let request_text = body.to_string();
+                if request_text.contains("TOOL_RESULT_MARKER") {
+                    observations.saw_tool_result.store(true, Ordering::SeqCst);
+                }
+                if request_text.contains("messages trimmed due to context window limit") {
+                    observations.saw_trim.store(true, Ordering::SeqCst);
+                }
+                let usage = json!({
+                    "prompt_tokens": 5,
+                    "completion_tokens": 2,
+                    "total_tokens": 7,
+                    "cached_tokens": 0
+                });
+                let response = if stop_on_last && call_index == total_calls {
+                    json!({
+                        "content": "longrun calibration complete",
+                        "tool_calls": null,
+                        "finish_reason": "stop",
+                        "token_usage": usage
+                    })
+                } else {
+                    json!({
+                        "content": "",
+                        "tool_calls": [{
+                            "tool_name": "lookup",
+                            "args": {"q": format!("longrun-{call_index}")}
+                        }],
+                        "finish_reason": "tool_calls",
+                        "token_usage": usage
+                    })
+                };
+                axum::Json(response)
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve longrun LLM");
+    });
+    (format!("http://{addr}"), observations)
+}
+
+async fn run_longrun_react(steps: usize) -> LongRunEvidence {
+    assert!(
+        steps >= 3,
+        "calibration and stress runs need multiple ReAct rounds"
+    );
+    let expected_llm_calls = steps.div_ceil(2);
+    let (llm_url, observations) = spawn_longrun_llm(expected_llm_calls, steps % 2 == 1).await;
+
+    let mut sse = String::new();
+    for step in 1..=steps {
+        let event = if step % 2 == 1 {
+            io_request(step as u64, "call_external", json!({"model":"mock-model"}))
+        } else {
+            io_request(
+                step as u64,
+                "call_service",
+                json!({
+                    "tool_name": "lookup",
+                    "args": {"q": format!("longrun-{}", step / 2)}
+                }),
+            )
+        };
+        sse.push_str(&sse_line(&event));
+    }
+    sse.push_str(&sse_line(&json!({"type":"Stable"})));
+
+    let mut server = Server::new_async().await;
+    let _fallback = mock_evorule_base(&mut server, "777", sse).await;
+    let client = EvoruleApiClient::new(&server.url());
+    let llm = LlmHandler::new("mock-model", &llm_url).with_retry_config(0, 0.001, 0.01);
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    let mut tools: BTreeMap<String, Arc<dyn ToolFunction>> = BTreeMap::new();
+    tools.insert(
+        "lookup".to_string(),
+        Arc::new(RecordingTool {
+            calls: tool_calls.clone(),
+            result: "TOOL_RESULT_MARKER deterministic longrun result",
+        }),
+    );
+    let token_counter = Arc::new(AtomicU64::new(0));
+    let config = AgentConfig {
+        max_steps: steps,
+        ..AgentConfig::default()
+    };
+    let mut runner = AgentRunner::new(config, client)
+        .with_llm_handler(llm)
+        .with_tool_handler(evo_agent::io_handlers::ToolHandler::with_functions(tools))
+        .with_context_window(ContextWindowManager::with_approx_counter(
+            160,
+            40,
+            TrimStrategy::KeepSystemKeepLast,
+        ))
+        .with_token_counter(token_counter.clone());
+    let result = runner
+        .run("execute the longrun ReAct script")
+        .await
+        .expect("longrun run must not Err");
+
+    LongRunEvidence {
+        result,
+        llm_calls: observations.calls.load(Ordering::SeqCst),
+        tool_calls: tool_calls.load(Ordering::SeqCst),
+        tokens_used: token_counter.load(Ordering::SeqCst),
+        max_messages: observations.max_messages.load(Ordering::SeqCst),
+        saw_tool_result: observations.saw_tool_result.load(Ordering::SeqCst),
+        saw_trim: observations.saw_trim.load(Ordering::SeqCst),
+    }
+}
+
+fn assert_longrun_evidence(evidence: &LongRunEvidence, steps: usize) {
+    let expected_llm_calls = steps.div_ceil(2);
+    assert!(
+        evidence.result.success,
+        "longrun {steps} steps must succeed: {:?}; llm={} tools={} done_steps={} tokens={}",
+        evidence.result.error,
+        evidence.llm_calls,
+        evidence.tool_calls,
+        evidence.result.steps,
+        evidence.tokens_used
+    );
+    assert_eq!(
+        evidence.result.steps, steps,
+        "Done.steps must equal IoRequest count"
+    );
+    assert_eq!(
+        evidence.llm_calls, expected_llm_calls,
+        "real LLM HTTP call count"
+    );
+    assert_eq!(evidence.tool_calls, steps / 2, "real tool execution count");
+    assert_eq!(
+        evidence.result.tool_calls.len(),
+        steps / 2,
+        "Done tool trajectory length"
+    );
+    assert_eq!(
+        evidence.tokens_used,
+        expected_llm_calls as u64 * 7,
+        "provider total_tokens must accumulate in the shared counter"
+    );
+    assert!(
+        evidence.saw_tool_result,
+        "later LLM requests must contain real tool results"
+    );
+    assert!(
+        evidence.max_messages > 0,
+        "LLM requests must contain messages"
+    );
+    println!(
+        "longrun steps={steps} llm={} tools={} tokens={} max_messages={} trimmed={}",
+        evidence.llm_calls,
+        evidence.tool_calls,
+        evidence.tokens_used,
+        evidence.max_messages,
+        evidence.saw_trim
+    );
+}
+
+fn assert_longrun_context_bounded(evidence: &LongRunEvidence) {
+    assert!(
+        evidence.saw_trim,
+        "small context must exercise production trimming"
+    );
+    assert!(
+        evidence.max_messages <= 64,
+        "trimmed request history must stay bounded, got {} messages",
+        evidence.max_messages
+    );
+}
+
+#[tokio::test]
+async fn longrun_react_three_step_calibration() {
+    let evidence = run_longrun_react(3).await;
+    assert_longrun_evidence(&evidence, 3);
+}
+
+#[tokio::test]
+#[ignore]
+async fn longrun_react_1000_steps() {
+    let evidence = run_longrun_react(1_000).await;
+    assert_longrun_evidence(&evidence, 1_000);
+    assert_longrun_context_bounded(&evidence);
+}
+
+#[tokio::test]
+#[ignore]
+async fn longrun_react_5000_steps() {
+    let evidence = run_longrun_react(5_000).await;
+    assert_longrun_evidence(&evidence, 5_000);
+    assert_longrun_context_bounded(&evidence);
+}
+
+#[tokio::test]
+#[ignore]
+async fn longrun_react_10000_steps() {
+    let evidence = run_longrun_react(10_000).await;
+    assert_longrun_evidence(&evidence, 10_000);
+    assert_longrun_context_bounded(&evidence);
 }
 
 /// 多轮 ReAct 循环:LLM turn1 返回 tool_calls(OpenAI 形状) → 工具执行 →

@@ -356,12 +356,7 @@ async fn plan_confirmation_gate(
     );
     let decision = approval.request_approval(&req).await;
     if let Some(j) = journal {
-        let verdict = if decision.approved {
-            "approved"
-        } else {
-            "rejected"
-        };
-        if let Err(e) = j.approval_resolved(&proposal_id, verdict) {
+        if let Err(e) = j.approval_resolved_with_decision(&proposal_id, &decision) {
             tracing::warn!(error = %e, "plan confirmation gate: journal write failed (best-effort)");
         }
     }
@@ -2108,8 +2103,12 @@ mod tests {
         );
         assert!(
             lines.iter().any(|l| matches!(&l.event,
-                JournalEvent::ApprovalResolved { decision, .. } if decision == "approved")),
-            "approval_resolved=approved 落账"
+                JournalEvent::ApprovalResolved { decision, approver, verified, reason, .. }
+                    if decision == "approved"
+                        && approver.as_deref() == Some("cli-user")
+                        && verified == &Some(false)
+                        && reason.as_deref() == Some("ok"))),
+            "完整人工批准决策落账"
         );
     }
 
@@ -2132,8 +2131,12 @@ mod tests {
         let lines = read_all(&JournalWriter::path_for(&dir, sid)).unwrap();
         assert!(
             lines.iter().any(|l| matches!(&l.event,
-                JournalEvent::ApprovalResolved { decision, .. } if decision == "rejected")),
-            "approval_resolved=rejected 落账"
+                JournalEvent::ApprovalResolved { decision, approver, verified, reason, .. }
+                    if decision == "auto_rejected"
+                        && approver.as_deref() == Some("auto")
+                        && verified == &Some(false)
+                        && reason.as_deref() == Some("not now"))),
+            "完整自动拒绝决策落账"
         );
     }
 

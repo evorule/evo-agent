@@ -1299,6 +1299,7 @@ async fn harvest_procedural_materials(
             JournalEvent::ApprovalResolved {
                 approval_id,
                 decision,
+                ..
             } => {
                 if decision == "rejected" || decision == "auto_rejected" {
                     let (tool, payload) = requested
@@ -2335,6 +2336,9 @@ mod tests {
                 event: JournalEvent::ApprovalResolved {
                     approval_id: "ap1".into(),
                     decision: "rejected".into(),
+                    approver: None,
+                    verified: None,
+                    reason: None,
                 },
                 hashes: None,
             },
@@ -2365,6 +2369,9 @@ mod tests {
                 event: JournalEvent::ApprovalResolved {
                     approval_id: "ap2".into(),
                     decision: "rejected".into(),
+                    approver: None,
+                    verified: None,
+                    reason: None,
                 },
                 hashes: None,
             },

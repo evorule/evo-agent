@@ -5733,6 +5733,7 @@ mod run_policy_gate_tests {
             step_timeout_secs: 30,
             step_timeout_floor_from_budget: None,
             approval_wait_timeout_secs: None,
+            max_chain_depth: None,
             tools: Vec::new(),
             memory: evo_agent::agent::definition::MemoryConfig::default(),
             http_get_allowed_hosts: None,

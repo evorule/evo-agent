@@ -334,6 +334,15 @@ pub enum JournalEvent {
         approval_id: String,
         /// 决定标签
         decision: String,
+        /// 决策者标识(旧账缺省为 None)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approver: Option<String>,
+        /// 身份是否经平台认证验证(Some(false) 必须保留)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verified: Option<bool>,
+        /// 决策理由(旧账缺省为 None)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// 治理裁决输出(意图裁决 allowed / blocked)
     PolicyJudged {
@@ -1863,7 +1872,7 @@ impl JournalWriter {
         })
     }
 
-    /// 审批决定
+    /// 审批决定(保留旧写入口;无完整决策上下文时三个附加字段缺省)
     pub fn approval_resolved(
         &self,
         approval_id: &str,
@@ -1872,6 +1881,31 @@ impl JournalWriter {
         self.push(JournalEvent::ApprovalResolved {
             approval_id: approval_id.to_string(),
             decision: decision.to_string(),
+            approver: None,
+            verified: None,
+            reason: None,
+        })
+    }
+
+    /// 完整审批决定落账(决定标签、决策者、验证状态与理由同源)
+    pub fn approval_resolved_with_decision(
+        &self,
+        approval_id: &str,
+        decision: &crate::agent::approval::ApprovalDecision,
+    ) -> Result<u64, JournalError> {
+        let label = if decision.approved {
+            "approved"
+        } else if decision.auto_rejected {
+            "auto_rejected"
+        } else {
+            "rejected"
+        };
+        self.push(JournalEvent::ApprovalResolved {
+            approval_id: approval_id.to_string(),
+            decision: label.to_string(),
+            approver: Some(decision.approver.clone()),
+            verified: Some(decision.verified),
+            reason: Some(decision.reason.clone()),
         })
     }
 
@@ -2314,6 +2348,15 @@ pub struct JournalApproval {
     pub command: String,
     /// 决定标签:approved / rejected / auto_rejected(写入侧原样)
     pub decision: String,
+    /// 决策者标识(旧账缺省为 None)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<String>,
+    /// 身份是否经平台认证验证(Some(false) 必须保留)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    /// 决策理由(旧账缺省为 None)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// 审批事件对投影(读侧):ApprovalRequested/ApprovalResolved 按 approval_id
@@ -2344,6 +2387,9 @@ pub fn project_approvals(path: &Path) -> Vec<JournalApproval> {
             JournalEvent::ApprovalResolved {
                 approval_id,
                 decision,
+                approver,
+                verified,
+                reason,
             } => {
                 if let Some(p) = pending.remove(&approval_id) {
                     out.push((
@@ -2353,6 +2399,9 @@ pub fn project_approvals(path: &Path) -> Vec<JournalApproval> {
                             tool: p.tool,
                             command: p.payload,
                             decision,
+                            approver,
+                            verified,
+                            reason,
                         },
                     ));
                 }
@@ -2797,6 +2846,159 @@ mod tests {
         assert_eq!(approvals[0].decision, "approved");
         assert_eq!(approvals[1].tool, "shell_exec");
         assert_eq!(approvals[1].command, "find src");
+    }
+
+    #[test]
+    fn test_approval_decision_preserves_actor_verification_and_reason() {
+        let dir = std::env::temp_dir().join(format!("jf-pa-decision-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = JournalWriter::path_for(&dir, "s-pa-decision");
+        {
+            let w = JournalWriter::open(&dir, "s-pa-decision").unwrap();
+            let decisions = [
+                (
+                    "ap-auto-policy",
+                    crate::agent::approval::ApprovalDecision {
+                        approved: true,
+                        approver: "auto_policy".into(),
+                        verified: false,
+                        reason: "auto_policy: accepted in unattended mode".into(),
+                        auto_rejected: false,
+                        verdict_json: None,
+                    },
+                ),
+                (
+                    "ap-human-approved",
+                    crate::agent::approval::ApprovalDecision {
+                        approved: true,
+                        approver: "alice".into(),
+                        verified: true,
+                        reason: "confirmed".into(),
+                        auto_rejected: false,
+                        verdict_json: None,
+                    },
+                ),
+                (
+                    "ap-human-rejected",
+                    crate::agent::approval::ApprovalDecision {
+                        approved: false,
+                        approver: "cli-user".into(),
+                        verified: false,
+                        reason: "not now".into(),
+                        auto_rejected: false,
+                        verdict_json: None,
+                    },
+                ),
+                (
+                    "ap-auto-rejected",
+                    crate::agent::approval::ApprovalDecision {
+                        approved: false,
+                        approver: "auto".into(),
+                        verified: false,
+                        reason: "timeout".into(),
+                        auto_rejected: true,
+                        verdict_json: None,
+                    },
+                ),
+            ];
+            for (id, decision) in &decisions {
+                w.approval_requested(id, "shell_exec", "cargo test")
+                    .unwrap();
+                w.approval_resolved_with_decision(id, decision).unwrap();
+            }
+        }
+
+        let lines = read_all(&path).unwrap();
+        let resolved: Vec<_> = lines
+            .iter()
+            .filter_map(|line| match &line.event {
+                JournalEvent::ApprovalResolved {
+                    decision,
+                    approver,
+                    verified,
+                    reason,
+                    ..
+                } => Some((decision, approver, verified, reason)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resolved.len(), 4);
+        assert_eq!(resolved[0].0, "approved");
+        assert_eq!(resolved[0].1.as_deref(), Some("auto_policy"));
+        assert_eq!(resolved[0].2, &Some(false));
+        assert!(resolved[0]
+            .3
+            .as_deref()
+            .unwrap()
+            .starts_with("auto_policy:"));
+        assert_eq!(resolved[1].0, "approved");
+        assert_eq!(resolved[1].1.as_deref(), Some("alice"));
+        assert_eq!(resolved[1].2, &Some(true));
+        assert_eq!(resolved[1].3.as_deref(), Some("confirmed"));
+        assert_eq!(resolved[2].0, "rejected");
+        assert_eq!(resolved[2].1.as_deref(), Some("cli-user"));
+        assert_eq!(resolved[2].2, &Some(false));
+        assert_eq!(resolved[2].3.as_deref(), Some("not now"));
+        assert_eq!(resolved[3].0, "auto_rejected");
+        assert_eq!(resolved[3].1.as_deref(), Some("auto"));
+        assert_eq!(resolved[3].2, &Some(false));
+        assert_eq!(resolved[3].3.as_deref(), Some("timeout"));
+
+        let approvals = project_approvals(&path);
+        assert_eq!(approvals.len(), 4);
+        for (projected, event) in approvals.iter().zip(resolved.iter()) {
+            assert_eq!(projected.decision, event.0.as_str());
+            assert_eq!(projected.approver.as_deref(), event.1.as_deref());
+            assert_eq!(projected.verified, *event.2);
+            assert_eq!(projected.reason.as_deref(), event.3.as_deref());
+        }
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"verified\":false"));
+        assert!(raw.contains("\"verified\":true"));
+    }
+
+    #[test]
+    fn test_approval_resolved_legacy_json_and_writer_remain_compatible() {
+        let old = r#"{"seq":1,"ts":123,"type":"approval_resolved","payload":{"approval_id":"ap-old","decision":"approved"}}"#;
+        let line = decode_line(old).unwrap();
+        match &line.event {
+            JournalEvent::ApprovalResolved {
+                approver,
+                verified,
+                reason,
+                ..
+            } => {
+                assert_eq!(approver, &None);
+                assert_eq!(verified, &None);
+                assert_eq!(reason, &None);
+            }
+            other => panic!("expected approval_resolved, got {other:?}"),
+        }
+        let encoded = serde_json::to_value(&line.event).unwrap();
+        for key in ["approver", "verified", "reason"] {
+            assert!(encoded["payload"].get(key).is_none(), "None 字段不得入行");
+        }
+
+        let dir = std::env::temp_dir().join(format!("jf-pa-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = JournalWriter::path_for(&dir, "s-pa-legacy");
+        {
+            let w = JournalWriter::open(&dir, "s-pa-legacy").unwrap();
+            w.approval_requested("ap-legacy", "shell_exec", "ls")
+                .unwrap();
+            w.approval_resolved("ap-legacy", "rejected").unwrap();
+        }
+        let approvals = project_approvals(&path);
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].approver, None);
+        assert_eq!(approvals[0].verified, None);
+        assert_eq!(approvals[0].reason, None);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("\"approver\""));
+        assert!(!raw.contains("\"verified\""));
+        assert!(!raw.contains("\"reason\""));
     }
 
     #[test]
@@ -3853,6 +4055,9 @@ mod tests {
             JE::ApprovalResolved {
                 approval_id: "p1".into(),
                 decision: "approved".into(),
+                approver: None,
+                verified: None,
+                reason: None,
             },
             JE::PolicyJudged {
                 judgement_id: "j7".into(),

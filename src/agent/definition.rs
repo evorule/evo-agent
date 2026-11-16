@@ -733,6 +733,10 @@ pub struct AgentDefinition {
     /// 强制 H3 停机,不依赖 LLM 合作）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_clock_budget_secs: Option<u64>,
+    /// 会话链深度上限（可选，缺省 3；0 禁止首个子 spawn）。同一运行链共享
+    /// 根定义解析出的不可变上限，子定义不得提高。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chain_depth: Option<u32>,
     /// G13:单轮内并行工具调用上限(可选,默认 1 = 串行)
     ///
     /// - `1`(默认):工具按顺序串行执行(向后兼容旧行为)
@@ -761,12 +765,10 @@ pub struct AgentDefinition {
     ///   serve 侧独占读取,加载失败同样 fail-visible 降级 manual
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
-    /// 无人值守审批等待上限(可选;CLI run 档审批挂起看护)。None(缺省)=
-    /// 交互现行为(stdin 无限等待,既有定义零变化);显式声明秒数后,CLI 档
-    /// 审批提示(真红线升级人工/降级人工/交互 candidate)超过该秒数未决 →
-    /// 自动拒绝(deny 默认向,绝不自动批准,决策 approver=auto+
-    /// auto_rejected 标记+reason 落账)。仅作用于 CLI run 档 stdin 等待;
-    /// serve 面 HTTP 审批已有 60 秒等待窗不受影响。校验:Some(0) 非法
+    /// 无人值守审批等待上限(可选)。None(缺省)=CLI stdin 无限等待、serve
+    /// HTTP 60 秒等待窗（既有定义零变化）；显式声明秒数后，CLI 与 serve 的
+    /// 审批提示超过该秒数未决均自动拒绝(deny 默认向，绝不自动批准，决策
+    /// approver=auto+auto_rejected 标记+reason 落账)。校验:Some(0) 非法
     /// fail-fast
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_wait_timeout_secs: Option<u64>,
@@ -1394,6 +1396,10 @@ impl AgentDefinition {
             i2_lexicon: self.i2_lexicon.clone(),
             // H3 时限预算直拷(数据化;None=不启用)
             wall_clock_budget_secs: self.wall_clock_budget_secs,
+            // 未声明使用既有缺省 3；0 禁止首个子 spawn。
+            max_chain_depth: self
+                .max_chain_depth
+                .unwrap_or(crate::agent::session_spawn_tool::MAX_CHAIN_DEPTH),
             // 治理知识数据集声明直拷(声明面数据,同身份段口径——声明即生效;
             // 拉取渲染在 runner 组装期做,运行时产物不进 definition)
             knowledge_datasets: self.knowledge_datasets.clone(),
@@ -1567,20 +1573,44 @@ mod tests {
             "model": "m",
             "temperature": 0.5,
             "max_steps": 5,
-            "step_timeout_secs": 30,
+            "step_timeout_secs": 3600,
             "tools": [],
-            "wall_clock_budget_secs": 28800
+            "wall_clock_budget_secs": 28800,
+            "max_chain_depth": 5
         }"#;
         write_json(dir.path(), "longhorizon", json);
         let def = AgentDefinition::load_from_dir(dir.path(), "longhorizon").expect("load");
         assert_eq!(def.wall_clock_budget_secs, Some(28800));
+        assert_eq!(def.max_chain_depth, Some(5));
         let cfg = def.to_agent_config();
         assert_eq!(cfg.wall_clock_budget_secs, Some(28800), "直拷透传");
+        assert_eq!(cfg.step_timeout, std::time::Duration::from_secs(3600));
+        assert_eq!(cfg.max_chain_depth, 5);
         // 缺省 None(无字段=不启用,既有定义零影响)
         write_json(dir.path(), "plain", &minimal_def_json());
         let def2 = AgentDefinition::load_from_dir(dir.path(), "plain").expect("load");
         assert_eq!(def2.wall_clock_budget_secs, None);
+        assert_eq!(def2.max_chain_depth, None);
         assert_eq!(def2.to_agent_config().wall_clock_budget_secs, None);
+        assert_eq!(
+            def2.to_agent_config().max_chain_depth,
+            crate::agent::session_spawn_tool::MAX_CHAIN_DEPTH
+        );
+    }
+
+    #[test]
+    fn test_general_longrun_budgets_load_from_shipped_definition() {
+        let agents_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agents");
+        let def =
+            AgentDefinition::load_from_dir(&agents_dir, "general").expect("load general.json");
+        assert_eq!(def.max_steps, 500);
+        assert_eq!(def.wall_clock_budget_secs, Some(28_800));
+        assert_eq!(def.step_timeout_secs, 3_600);
+        assert_eq!(def.max_chain_depth, Some(5));
+        let cfg = def.to_agent_config();
+        assert_eq!(cfg.wall_clock_budget_secs, Some(28_800));
+        assert_eq!(cfg.step_timeout, std::time::Duration::from_secs(3_600));
+        assert_eq!(cfg.max_chain_depth, 5);
     }
 
     /// 治理知识数据集声明:definition 解析 → AgentConfig 直拷;缺省 None=不注入
@@ -2316,6 +2346,7 @@ mod tests {
             step_timeout_secs: 45,
             step_timeout_floor_from_budget: None,
             approval_wait_timeout_secs: None,
+            max_chain_depth: None,
             tools: vec!["write_file".to_string()],
             memory: MemoryConfig::default(),
             output_format: None,
@@ -2697,6 +2728,7 @@ mod tests {
             step_timeout_secs: 1,
             step_timeout_floor_from_budget: None,
             approval_wait_timeout_secs: None,
+            max_chain_depth: None,
             tools: tools.into_iter().map(String::from).collect(),
             memory: MemoryConfig::default(),
             output_format: None,
@@ -3087,6 +3119,7 @@ mod tests {
             step_timeout_secs: 1,
             step_timeout_floor_from_budget: None,
             approval_wait_timeout_secs: None,
+            max_chain_depth: None,
             tools: vec![],
             memory: MemoryConfig::default(),
             output_format: None,
@@ -3331,6 +3364,7 @@ mod tests {
             step_timeout_secs: 1,
             step_timeout_floor_from_budget: None,
             approval_wait_timeout_secs: None,
+            max_chain_depth: None,
             tools: vec![],
             memory: MemoryConfig::default(),
             output_format: None,
