@@ -870,16 +870,27 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "build_check".to_string(),
-            description: "Run a workspace build check (cargo check) and return STRUCTURED \
-                          diagnostics instead of raw build output: {verdict, counts, \
-                          diagnostics: [{path, line, col, severity, code, message}]}, capped \
-                          at 50 entries. Use this to see the current error/warning list for \
-                          the workspace on demand (e.g. before editing, or when the \
-                          write-triggered verification summary points here). Takes no \
-                          arguments; the command and workspace are fixed. In a non-Rust \
-                          workspace it returns verdict=unknown instead of pretending success."
+            description: "Run a workspace check and return STRUCTURED diagnostics instead \
+                          of raw output: {profile, command, verdict, counts, diagnostics: \
+                          [{path, line, col, severity, code, message}]}, capped at 50 \
+                          entries. Profiles (each maps to one fixed command - you cannot \
+                          pass arbitrary commands): \"cargo_check\" (default), \
+                          \"cargo_clippy\", \"cargo_test\", \"pytest\". Use it to see the \
+                          current error/warning/failure list on demand (e.g. before \
+                          editing, or when the write-triggered verification summary \
+                          points here). Cargo profiles return verdict=unknown in a \
+                          non-Rust workspace instead of pretending success; the pytest \
+                          profile runs against the workspace Python environment."
                 .to_string(),
-            parameters: vec![],
+            parameters: vec![ParameterSpec {
+                name: "profile".to_string(),
+                r#type: "string".to_string(),
+                description: "Which fixed check command to run: cargo_check (default), \
+                              cargo_clippy, cargo_test, or pytest. Unknown values are \
+                              rejected with the valid list."
+                    .to_string(),
+                required: false,
+            }],
         },
         ToolSpec {
             name: "http_get".to_string(),
