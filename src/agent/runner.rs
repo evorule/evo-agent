@@ -1546,6 +1546,12 @@ pub struct AgentRunner {
     /// 坑账本注入段(装载期按触及面关键词过滤+预算帽渲染一次;None=不注入,
     /// 治理段槽位与现行为逐字节一致)
     governance_pit_segment: Option<String>,
+    /// P2 coding profile 旗标(workspace 层 `.evo/settings.json` 的
+    /// `session.profile=coding` 激活;false=manual=现状零变化)。效果=常驻
+    /// 服务目录槽位内容替换为工作区地图(裁剪治理常驻目录+注入 repo map)
+    session_coding_profile: bool,
+    /// 工作区地图段(装载期确定性渲染一次的会话开工快照;None=未激活)
+    coding_repo_map_segment: Option<String>,
     /// 会话执行环境 profile 标记(serve 请求级>定义级、CLI 定义级
     /// 显式声明才注入)。随 tool_result 落账进 journal——trusted 环境下工具
     /// 结果在审计事件中明文可追溯。None=既有行为零变化(旧账无标记语义)
@@ -1761,6 +1767,8 @@ impl AgentRunner {
             governance: None,
             governance_workspace: None,
             governance_pit_segment: None,
+            session_coding_profile: false,
+            coding_repo_map_segment: None,
             execution_profile: None,
             compaction_policy: None,
             acceptance_command: None,
@@ -2215,6 +2223,18 @@ impl AgentRunner {
         self.governance_segment_with_pit()
     }
 
+    /// 测试观测口:coding profile 旗标(workspace 层 session.profile 激活态)
+    #[cfg(test)]
+    pub(crate) fn session_coding_profile_for_test(&self) -> bool {
+        self.session_coding_profile
+    }
+
+    /// 测试观测口:工作区地图段(coding 档 S2d 槽位内容)
+    #[cfg(test)]
+    pub(crate) fn coding_repo_map_segment_for_test(&self) -> Option<&str> {
+        self.coding_repo_map_segment.as_deref()
+    }
+
     /// TODO: doc
     pub fn with_tool_handler(mut self, tool_handler: ToolHandler) -> Self {
         self.tool_handler = tool_handler;
@@ -2592,6 +2612,22 @@ impl AgentRunner {
                         crate::agent::governance::GovernancePack::render_pit_segment(&lines);
                     self.governance_workspace = Some(ws.to_path_buf());
                     self.governance = Some(pack);
+                }
+            }
+        }
+        // P2 coding profile:workspace 层设置直读(`.evo/settings.json`=
+        // 合并语义中最高优先级的人工文件面;CLI/serve 全路径共用本单点;
+        // 缺文件/键/非法值=manual=现状零变化)。repo map 会话开工快照
+        // 同点渲染(coding 档下 S2d 槽位内容替换为工作区地图)。
+        if let Some(ws) = dir.parent().and_then(std::path::Path::parent) {
+            let settings_path = ws.join(".evo").join("settings.json");
+            if let Ok(text) = std::fs::read_to_string(&settings_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if v.get("session.profile").and_then(|s| s.as_str()) == Some("coding") {
+                        self.session_coding_profile = true;
+                        self.coding_repo_map_segment =
+                            crate::agent::repo_map::render_workspace_map(ws);
+                    }
                 }
             }
         }
@@ -4068,7 +4104,13 @@ impl AgentRunner {
             _ => None,
         };
         // S2d 服务目录段(service_tools 注册面渲染;None=零注册静默跳过)
-        let service_catalog_segment = crate::service_tools::render_service_catalog();
+        // P2 coding profile:常驻治理目录裁剪,槽位内容替换为工作区地图
+        // (同槽位=同静态尾位=前缀缓存友好;会话能力锚语义等价替换)
+        let service_catalog_segment = if self.session_coding_profile {
+            self.coding_repo_map_segment.clone()
+        } else {
+            crate::service_tools::render_service_catalog()
+        };
         // 会话治理包坑账注入段与 serve 构造期治理段合并入同一槽位
         // (两者皆 None=槽位 None=与现行为逐字节一致)
         let governance_slot = self.governance_segment_with_pit();
@@ -5418,6 +5460,9 @@ impl AgentRunner {
                 governance: None,
                 governance_workspace: None,
                 governance_pit_segment: None,
+                // coding profile:子代理不继承(会话级治理面,缺省不变式)
+                session_coding_profile: false,
+                coding_repo_map_segment: None,
                 acceptance_command: acceptance_command.clone(),
                 // G4:子代理不继承判据生成开关(生成判据=父任务开工时的内存锁态,
                 // 跨 runner 实例不继承;子任务门禁走静态判据穿线,本字段恒 false
@@ -8392,8 +8437,11 @@ impl AgentRunner {
                                _ => None,
                            };
                            // S2d 服务目录段(同 run() 组装点口径)
-                           let service_catalog_segment =
-                               crate::service_tools::render_service_catalog();
+                           let service_catalog_segment = if runner.session_coding_profile {
+                               runner.coding_repo_map_segment.clone()
+                           } else {
+                               crate::service_tools::render_service_catalog()
+                           };
                            // 会话治理包坑账注入段与 serve 构造期治理段合并同一槽位
                            // (两者皆 None=槽位 None=与现行为逐字节一致)
                            let governance_slot = runner.governance_segment_with_pit();

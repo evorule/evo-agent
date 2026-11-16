@@ -8886,3 +8886,47 @@ mod g8_rejection_payload_tests {
         assert_eq!(v["message"], "User denied approval");
     }
 }
+
+// === P2 coding profile:workspace 层 session.profile 激活链 ===
+
+#[test]
+fn coding_profile_activates_map_and_flag_via_workspace_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("data").join("sessions")).unwrap();
+    std::fs::create_dir_all(ws.join(".evo")).unwrap();
+    std::fs::write(
+        ws.join(".evo").join("settings.json"),
+        r#"{"session.profile": "coding"}"#,
+    )
+    .unwrap();
+    std::fs::write(ws.join("src_main.rs"), b"").unwrap();
+
+    let runner = AgentRunner::new(AgentConfig::default(), make_test_client())
+        .with_journal_dir(ws.join("data").join("sessions"));
+    assert!(
+        runner.session_coding_profile_for_test(),
+        "coding 档旗标激活"
+    );
+    let seg = runner
+        .coding_repo_map_segment_for_test()
+        .expect("repo map rendered");
+    assert!(seg.contains("## Workspace Map"));
+    assert!(seg.contains("src_main.rs"), "地图含工作区条目: {seg}");
+}
+
+#[test]
+fn coding_profile_absent_defaults_manual_zero_change() {
+    // 缺省不变式:缺文件/缺键/非法值 = manual = 零旗标零地图
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("data").join("sessions")).unwrap();
+    std::fs::create_dir_all(ws.join(".evo")).unwrap();
+    // 非法 JSON 也如实降 manual
+    std::fs::write(ws.join(".evo").join("settings.json"), b"{broken").unwrap();
+
+    let runner = AgentRunner::new(AgentConfig::default(), make_test_client())
+        .with_journal_dir(ws.join("data").join("sessions"));
+    assert!(!runner.session_coding_profile_for_test());
+    assert!(runner.coding_repo_map_segment_for_test().is_none());
+}
