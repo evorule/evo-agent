@@ -12938,7 +12938,7 @@ pub(crate) fn enforce_payload_byte_gate(messages: &mut Vec<Message>) -> PayloadG
 mod runner_tests;
 
 /// G8 拒绝结果载荷——agent 可见面区分「超时自动拒绝」vs「用户真实拒绝」
-/// （o109/design-102 M3：decision_label 与 reason 透传；status 语义只加不改，
+/// （o109 审批信号改进：decision_label 与 reason 透传；status 语义只加不改，
 /// 既有消费方按 status=rejected 的解析保持兼容。三站点统一走本助手=编译期强制。）
 pub(crate) fn g8_rejection_payload(
     decision_label: &str,
