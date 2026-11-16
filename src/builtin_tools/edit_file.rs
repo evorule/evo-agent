@@ -110,6 +110,55 @@ fn normalize_newlines(s: &str, crlf_file: bool) -> String {
     }
 }
 
+// =============================================================================
+// P1 容错:行 trim 归一模糊对齐 + 最近区域诊断
+// =============================================================================
+
+/// 行 trim 归一形(等价键):两侧空白全剥——缩进漂移/行尾空白差异的锚失配
+/// 容错键。窗口唯一性闸照常适用于归一命中计数(exact 优先,字节保真不变)。
+fn trimmed(line: &str) -> &str {
+    line.trim()
+}
+
+/// 行级模糊对齐(纯函数):在文件行归一序列中找锚归一序列的连续命中窗口,
+/// 返回全部窗口行区间 `[start, end)`(end 排他)。计数由调用方按唯一性闸
+/// 裁决;锚全空行=返回空(空白锚处处可配,拒绝配对)。
+fn fuzzy_windows(file_norm: &[&str], anchor_norm: &[&str]) -> Vec<(usize, usize)> {
+    if anchor_norm.is_empty() || file_norm.len() < anchor_norm.len() {
+        return Vec::new();
+    }
+    let mut wins = Vec::new();
+    for i in 0..=file_norm.len() - anchor_norm.len() {
+        if file_norm[i..i + anchor_norm.len()]
+            .iter()
+            .zip(anchor_norm.iter())
+            .all(|(f, a)| *f == *a)
+        {
+            wins.push((i, i + anchor_norm.len()));
+        }
+    }
+    wins
+}
+
+/// 最近区域诊断(容错二级,纯函数):取锚最长非空行按词元计与文件行的
+/// 重叠数,取首个最大者,返回 (1-based 行号, 行原文)。零重叠=None。
+fn nearest_region<'a>(file_lines: &[&'a str], anchor_lines: &[&str]) -> Option<(usize, &'a str)> {
+    let probe = anchor_lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .max_by_key(|l| l.len())?
+        .trim();
+    let tokens: Vec<&str> = probe.split_whitespace().collect();
+    let mut best: Option<(usize, usize, &'a str)> = None;
+    for (idx, fl) in file_lines.iter().enumerate() {
+        let overlap = tokens.iter().filter(|t| fl.contains(**t)).count();
+        if overlap > 0 && best.map(|(_, bo, _)| overlap > bo).unwrap_or(true) {
+            best = Some((idx + 1, overlap, fl));
+        }
+    }
+    best.map(|(n, _, line)| (n, line))
+}
+
 /// 提取变更点上下文预览(纯函数):替换点所在行前后各 3 行
 fn build_preview(new_text: &str, replaced_pos: usize) -> String {
     let lines: Vec<&str> = new_text.lines().collect();
@@ -223,32 +272,94 @@ impl FileEditTool {
         let old_norm = normalize_newlines(old_string, crlf_file);
         let new_norm = normalize_newlines(new_string, crlf_file);
 
-        // 唯一性闸
+        // 唯一性闸(exact 优先;0 hits → P1 容错两级,字节保真路径不变)
         let hits = text.matches(&old_norm).count();
-        if hits == 0 {
-            return Err(format!(
-                "old_string not found in '{}' (0 hits); read the file first \
-                 (file_read/grep_files) to copy an exact anchor",
-                path
-            ));
-        }
-        if hits > 1 && !replace_all {
-            return Err(format!(
-                "old_string matches {} times in '{}'; extend the anchor to make \
-                 it unique, or pass replace_all=true to replace every occurrence",
-                hits, path
-            ));
-        }
+        let mut fuzzy_match: Option<&'static str> = None;
+        let file_eol = if crlf_file { "\r\n" } else { "\n" };
 
-        // 替换
-        let first_pos = text.find(&old_norm);
-        let new_text = if replace_all {
-            text.replace(&old_norm, &new_norm)
+        let (new_text, first_pos, edits_applied) = if hits > 0 {
+            // 唯一性闸(exact 路径;重构期曾误删——既有 multi_hit 锁测试当场
+            // 执法,零逃逸进 main)
+            if hits > 1 && !replace_all {
+                return Err(format!(
+                    "old_string matches {} times in '{}'; extend the anchor to make \
+                     it unique, or pass replace_all=true to replace every occurrence",
+                    hits, path
+                ));
+            }
+            let first_pos = text.find(&old_norm);
+            let nt = if replace_all {
+                text.replace(&old_norm, &new_norm)
+            } else {
+                text.replacen(&old_norm, &new_norm, 1)
+            };
+            let ea = if replace_all { hits } else { 1 };
+            (nt, first_pos.unwrap_or(0), ea)
         } else {
-            text.replacen(&old_norm, &new_norm, 1)
+            // ── 容错一级:行 trim 归一模糊对齐(缩进漂移/行尾空白差异)──
+            // 行空间重构: untouched 行原文逐字保留;唯一性闸同款适用于归一
+            // 命中计数。锚全空行=处处可配,拒绝配对走诊断。
+            let file_lines: Vec<&str> = text.split('\n').collect();
+            let anchor_lines: Vec<&str> = old_norm.split('\n').collect();
+            let file_norm: Vec<&str> = file_lines.iter().map(|l| trimmed(l)).collect();
+            let anchor_trimmed: Vec<&str> = anchor_lines.iter().map(|l| trimmed(l)).collect();
+            let windows = fuzzy_windows(&file_norm, &anchor_trimmed);
+            if windows.is_empty() || anchor_trimmed.iter().all(|l| l.is_empty()) {
+                // ── 容错二级:最近区域诊断(o10 处置方向②——报错携带盘上
+                // 实际内容片段,消灭「只能盲试锚形态」)──
+                let diag = nearest_region(&file_lines, &anchor_lines)
+                    .map(|(n, line)| {
+                        format!(
+                            "; closest anchor-like region at line {n}: \"{}\"",
+                            line.trim()
+                        )
+                    })
+                    .unwrap_or_default();
+                return Err(format!(
+                    "old_string not found in '{}' (0 hits, incl. line-trim-normalized{diag}); \
+                     read the file first (file_read/grep_files) to copy an exact anchor",
+                    path
+                ));
+            }
+            if windows.len() > 1 && !replace_all {
+                return Err(format!(
+                    "old_string matches {} times in '{}' under line-trim-normalized \
+                     matching; extend the anchor to make it unique, or pass \
+                     replace_all=true",
+                    windows.len(),
+                    path
+                ));
+            }
+            fuzzy_match = Some("line-trim-normalized");
+            let new_lines: Vec<&str> = new_norm.split('\n').collect();
+            let had_trailing_newline = text.ends_with('\n');
+            let line_splice = |windows: &[(usize, usize)]| -> String {
+                let mut out: Vec<&str> = Vec::new();
+                let mut prev = 0usize;
+                for (s, e) in windows {
+                    out.extend_from_slice(&file_lines[prev..*s]);
+                    out.extend_from_slice(&new_lines);
+                    prev = *e;
+                }
+                out.extend_from_slice(&file_lines[prev..]);
+                let joined = out.join(file_eol);
+                if had_trailing_newline && !joined.ends_with(file_eol) {
+                    format!("{joined}{file_eol}")
+                } else {
+                    joined
+                }
+            };
+            // 模糊路径预览位=命中窗口首行的字节偏移(逐行 len+1 累计;
+            // CRLF 行的 \r 计入 len,值精确)
+            let approx_pos = file_lines[..windows[0].0]
+                .iter()
+                .map(|l| l.len() + 1)
+                .sum::<usize>();
+            let nt = line_splice(&windows);
+            let ea = windows.len();
+            (nt, approx_pos, ea)
         };
-        let edits_applied = if replace_all { hits } else { 1 };
-        let preview = build_preview(&new_text, first_pos.unwrap_or(0));
+        let preview = build_preview(&new_text, first_pos);
 
         // 原子写:同目录 tmp + rename(rename 在 Windows/Unix 均替换既有文件);
         // BOM 有则重挂(读时剥离仅为匹配,落盘保真)
@@ -310,6 +421,11 @@ impl FileEditTool {
             Value::from(out_bytes.len() as i64),
         );
         map.insert("preview".to_string(), Value::from(preview));
+        // P1 容错:模糊路径须显式标记(审计同权——放行决策落账原则的工具面
+        // 等价;exact 路径零该字段=与现行为逐字节一致)
+        if let Some(f) = fuzzy_match {
+            map.insert("fuzzy_match".to_string(), Value::from(f));
+        }
         if bom_present {
             map.insert("bom_preserved".to_string(), Value::Bool(true));
         }
@@ -334,6 +450,116 @@ mod tests {
         m.insert("old_string".to_string(), Value::from(old));
         m.insert("new_string".to_string(), Value::from(new));
         Value::Object(m)
+    }
+
+    // === P1 容错:行 trim 归一模糊对齐 + 最近区域诊断 ===
+
+    #[test]
+    fn test_fuzzy_match_applies_on_whitespace_drift() {
+        // 一级容错:锚行缩进漂移(文件行带缩进,锚行无)→trim 归一唯一命中→
+        // 行域外科替换+envelope 携 fuzzy 标记;窗外行原文逐字保留
+        let dir = temp_workdir_with_workspace();
+        write_ws_file(
+            &dir,
+            "cfg.txt",
+            b"fn main() {\n    let x = 1;\n    other();\n}\n",
+        );
+        let tool = FileEditTool::new(dir.path().to_path_buf());
+        let r = tool
+            .call_sync(&edit_args(
+                "workspace/cfg.txt",
+                "let x = 1;\nother();", // 锚行无缩进(漂移形态)
+                "let x = 2;\nother();",
+            ))
+            .unwrap();
+        assert_eq!(
+            r.get("fuzzy_match").and_then(|v| v.as_str()),
+            Some("line-trim-normalized"),
+            "模糊路径须带标记: {r}"
+        );
+        let content =
+            std::fs::read_to_string(dir.path().join("workspace").join("cfg.txt")).unwrap();
+        assert!(content.contains("let x = 2;"), "替换已生效: {content}");
+        assert!(content.contains("fn main() {"), "窗外行原文保留: {content}");
+        assert!(content.ends_with('\n'), "尾换行保真");
+    }
+
+    #[test]
+    fn test_fuzzy_ambiguous_rejected_with_normalized_count() {
+        // 归一窗口 2 处+未 replace_all → 唯一性闸同款拒(计数透出;锚带尾
+        // 空格漂移=exact 零命中,归一 2 命中——纯模糊场景)
+        let dir = temp_workdir_with_workspace();
+        write_ws_file(&dir, "dup.txt", b"x\ny\nx\ny\n");
+        let tool = FileEditTool::new(dir.path().to_path_buf());
+        let err = tool
+            .call_sync(&edit_args("workspace/dup.txt", "x \ny", "z"))
+            .unwrap_err();
+        assert!(
+            err.contains("2 times") && err.contains("line-trim-normalized"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fuzzy_replace_all_splices_all_windows() {
+        let dir = temp_workdir_with_workspace();
+        write_ws_file(&dir, "all.txt", b"x\ny\nmid\nx\ny\n");
+        let tool = FileEditTool::new(dir.path().to_path_buf());
+        let mut args = edit_args("workspace/all.txt", "x \ny", "z");
+        args.as_object_mut()
+            .unwrap()
+            .insert("replace_all".to_string(), Value::Bool(true));
+        let r = tool.call_sync(&args).unwrap();
+        assert_eq!(
+            r.get("fuzzy_match").and_then(|v| v.as_str()),
+            Some("line-trim-normalized")
+        );
+        let content =
+            std::fs::read_to_string(dir.path().join("workspace").join("all.txt")).unwrap();
+        assert_eq!(content.matches("z").count(), 2, "两窗口全替换: {content}");
+        assert!(content.contains("mid"), "中间行保留: {content}");
+    }
+
+    #[test]
+    fn test_anchor_not_found_reports_nearest_region() {
+        // 二级容错:全失配→报错携带盘上最近区域(行号+内容片段,消灭盲试)
+        let dir = temp_workdir_with_workspace();
+        write_ws_file(
+            &dir,
+            "code.txt",
+            b"fn main() {\n    let alpha = compute(y);\n}\n",
+        );
+        let tool = FileEditTool::new(dir.path().to_path_buf());
+        let err = tool
+            .call_sync(&edit_args(
+                "workspace/code.txt",
+                "let alpha = compute(x); // wrong tail",
+                "let alpha = computed;",
+            ))
+            .unwrap_err();
+        assert!(
+            err.contains("closest anchor-like region at line 2"),
+            "最近区域诊断: {err}"
+        );
+        assert!(
+            err.contains("let alpha = compute(y);"),
+            "诊断携带盘上原文: {err}"
+        );
+    }
+
+    #[test]
+    fn test_exact_match_takes_precedence_without_fuzzy_marker() {
+        // exact 命中→字节保真路径,零 fuzzy 字段(与现行为逐字节一致)
+        let dir = temp_workdir_with_workspace();
+        write_ws_file(&dir, "e.txt", b"alpha beta\n");
+        let tool = FileEditTool::new(dir.path().to_path_buf());
+        let r = tool
+            .call_sync(&edit_args("workspace/e.txt", "alpha beta", "alpha gamma"))
+            .unwrap();
+        assert!(
+            r.get("fuzzy_match").is_none(),
+            "exact 路径零 fuzzy 标记: {r}"
+        );
     }
 
     fn write_ws_file(dir: &tempfile::TempDir, name: &str, content: &[u8]) {
