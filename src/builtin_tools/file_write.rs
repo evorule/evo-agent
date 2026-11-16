@@ -153,8 +153,8 @@ impl FileWriteTool {
         // 写入
         std::fs::write(&target, content.as_bytes()).map_err(|e| format!("write failed: {}", e))?;
         // o107 传输校验:写后回读逐字节比对(防传输层吞字);不匹配重写一次,仍不匹配显式报错 fail-visible
-        let written_back = std::fs::read(&target)
-            .map_err(|e| format!("post-write verify read failed: {}", e))?;
+        let written_back =
+            std::fs::read(&target).map_err(|e| format!("post-write verify read failed: {}", e))?;
         if written_back.as_slice() != content.as_bytes() {
             std::fs::write(&target, content.as_bytes())
                 .map_err(|e| format!("rewrite after verify mismatch failed: {}", e))?;
@@ -280,7 +280,6 @@ mod tests {
         let on_disk = std::fs::read(dir.path().join("workspace/v.txt")).unwrap();
         assert_eq!(on_disk, b"payload");
     }
-
 
     #[test]
     fn test_reject_overwrite_without_flag() {
@@ -583,5 +582,3 @@ mod tests {
         let _ = std::fs::remove_file(&link_path);
     }
 }
-
-

@@ -5189,7 +5189,10 @@ async fn b16_mcp_g8_approval_timeout_auto_denies() {
         .unwrap();
     let text = result.to_string();
     assert!(text.contains("rejected"), "got: {text}");
-    assert!(text.contains("auto_rejected") || text.contains("auto-denied"), "timeout auto-deny must be distinguishable: {text}");
+    assert!(
+        text.contains("auto_rejected") || text.contains("auto-denied"),
+        "timeout auto-deny must be distinguishable: {text}"
+    );
     assert!(!text.contains("MCP_ECHO_SENTINEL"), "must not execute");
     let record = record.expect("approval record must be produced");
     assert_eq!(record["decision"], "auto_rejected");
@@ -8630,4 +8633,3 @@ mod g8_rejection_payload_tests {
         assert_eq!(v["message"], "User denied approval");
     }
 }
-
