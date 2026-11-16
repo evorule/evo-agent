@@ -277,8 +277,8 @@ impl FileEditTool {
 
         // o107 传输校验:rename 后回读逐字节比对(防传输层吞字);不匹配重写一次,
         // 仍不匹配显式报错 fail-visible
-        let on_disk = std::fs::read(&target)
-            .map_err(|e| format!("post-write verify read failed: {}", e))?;
+        let on_disk =
+            std::fs::read(&target).map_err(|e| format!("post-write verify read failed: {}", e))?;
         if on_disk.as_slice() != out_bytes.as_slice() {
             std::fs::write(&tmp_path, &out_bytes)
                 .map_err(|e| format!("rewrite tmp failed: {}", e))?;
@@ -597,4 +597,3 @@ mod tests {
         assert_eq!(std::fs::read(&outside_file).unwrap(), b"secret");
     }
 }
-

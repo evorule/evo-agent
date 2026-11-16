@@ -514,8 +514,11 @@ impl ToolExecutionPipeline {
                                     "tool '{}' candidate action rejected by approver",
                                     req.tool_name
                                 ),
-                                llm_payload: Some(crate::agent::runner::g8_rejection_payload(&decision_label, decision.auto_rejected, &decision.reason)),
-
+                                llm_payload: Some(crate::agent::runner::g8_rejection_payload(
+                                    &decision_label,
+                                    decision.auto_rejected,
+                                    &decision.reason,
+                                )),
                             })),
                             ledger,
                         };
@@ -2462,4 +2465,3 @@ mod tests {
         );
     }
 }
-

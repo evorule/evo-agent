@@ -473,14 +473,13 @@ impl ToolFunction for ReadBackTool {
         //    相对路径落在 writable_dir 下，read_back 必须感知同一约定。
         let (content, content_bytes, note) = match &self.deps.workdir {
             Some(workdir) => {
-                let resolve = |root: &Path| {
-                    crate::builtin_tools::fs_safety::resolve_existing(root, raw_path)
-                };
+                let resolve =
+                    |root: &Path| crate::builtin_tools::fs_safety::resolve_existing(root, raw_path);
                 let (resolved, resolve_err) = match resolve(workdir) {
                     Ok(r) => (Some(r), None),
                     Err(primary) => {
-                        let fallback_root = workdir
-                            .join(crate::builtin_tools::file_write::DEFAULT_WRITABLE_DIR);
+                        let fallback_root =
+                            workdir.join(crate::builtin_tools::file_write::DEFAULT_WRITABLE_DIR);
                         match resolve(&fallback_root) {
                             Ok(r) => (Some(r), None),
                             Err(fallback) => {
