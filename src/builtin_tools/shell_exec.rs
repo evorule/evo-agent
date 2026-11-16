@@ -1685,6 +1685,37 @@ impl ShellExecTool {
         }
     }
 
+    /// 后台执行(P0a 余量):spawn 脱管子进程入册,立即返回作业句柄。
+    ///
+    /// 与前台 execute 同一守卫序(调用方已完成 net_guard/metachar/分类/
+    /// 审批——后台旗标不改变任何条件评估,零旁路);输出重定向
+    /// `.evo/jobs/{id}.log`;轮询/读尾/族级终止经 job_control 工具面。
+    fn execute_background(&self, parts: &[&str], original_cmd: &str) -> IoResult {
+        let program = Self::program_name(parts[0]);
+        if Self::workdir_shadowed(self.workdir.as_deref(), program) {
+            return Err(format!(
+                "PATHEXT 双跳防护: 工作目录内存在与 '{program}' 同名的本地可执行文件 \
+                 — 可能执行植文件而非 PATH 二进制,白名单无法为其背书。请重命名该文件,\
+                 或用显式路径分步执行"
+            ));
+        }
+        let (job_id, log_path) = super::background_jobs::registry().spawn_job(
+            program,
+            &parts[1..],
+            original_cmd,
+            self.workdir.as_deref(),
+        )?;
+        Ok(serde_json::json!({
+            "background": true,
+            "job_id": job_id,
+            "command": original_cmd,
+            "program": program,
+            "status": "started",
+            "log_path": log_path.to_string_lossy(),
+            "note": "poll with job_control action=status/read; kill via action=kill",
+        }))
+    }
+
     /// 审计同权打标(G1 execution_profile + E-2 sandbox 档位章)
     ///
     /// - `sandbox`:E-2 期2 fail-visible 档位章——容器后端 = `container`(容器域
@@ -2009,6 +2040,14 @@ impl ShellExecTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required arg: command (string)".to_string())?;
 
+        // dev-feedback P0a 余量:后台执行旗标(审批回灌两形态兼容——主路径
+        // args.clone()+approved 注入原样保留;包裹形态从 original_args 回取)
+        let background = args
+            .get("background")
+            .or_else(|| args.get("original_args").and_then(|o| o.get("background")))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // 0. 网络负面域守卫(红线):local/docker-exec 两后端统一前置,
         //    命令串命中 benchmark 基础设施域即拒绝,无审批通道
         super::net_guard::check_denied_network_target(cmd_str)?;
@@ -2028,6 +2067,16 @@ impl ShellExecTool {
             ) {
                 return Err(reason);
             }
+        }
+
+        // 后台执行=v1 宿主本地后端限定(容器/低盒的脱管进程治理语义不同,
+        // fail-visible 不猜;net_guard 红线已统一前置,后台分支照过)
+        if background && !matches!(&self.backend, ExecBackend::Local) {
+            return Err(
+                "background=true requires the local host backend (docker-exec/appcontainer \
+                 backends do not support detached jobs in this version)"
+                    .to_string(),
+            );
         }
 
         // docker-exec 后端:容器域 = 任务沙箱,宿主 3 层分类与 metachar 拒绝
@@ -2090,7 +2139,12 @@ impl ShellExecTool {
                 if self.profile == ExecutionProfile::Workbench {
                     Self::active_arg_guard(program, &parts)?;
                 }
-                self.mark_audit(self.execute(&parts, cmd_str))
+                let result = if background {
+                    self.execute_background(&parts, cmd_str)
+                } else {
+                    self.execute(&parts, cmd_str)
+                };
+                self.mark_audit(result)
             }
 
             CommandCategory::Candidate(c) => {
@@ -2100,7 +2154,12 @@ impl ShellExecTool {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if approved {
-                    self.mark_audit(self.execute(&parts, cmd_str))
+                    let result = if background {
+                        self.execute_background(&parts, cmd_str)
+                    } else {
+                        self.execute(&parts, cmd_str)
+                    };
+                    self.mark_audit(result)
                 } else {
                     // 返回 proposal(让上层问用户)
                     Self::make_proposal(program, cmd_str, c)
@@ -2131,6 +2190,93 @@ mod tests {
 
     fn arg(command: &str) -> Value {
         arg_with(command, false)
+    }
+
+    // === 后台执行(P0a 余量):call_sync background=true → job_control 跨工具 ===
+
+    /// 端到端:Candidate+approved+background=true 经审批回灌形态启动入册 →
+    /// job_control(同进程全局注册表)status/read 跨工具可见。
+    /// cargo --version 秒级;10s 帽轮询至 completed。
+    #[tokio::test]
+    async fn test_background_execution_end_to_end_with_job_control() {
+        use crate::builtin_tools::job_control::JobControlTool;
+        let dir =
+            std::env::temp_dir().join(format!("evo-shell-bg-e2e-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = ShellExecTool::new().with_workdir(&dir);
+        let envelope = tool
+            .call_sync(&serde_json::json!({
+                "command": "git --version",
+                "approved": true,
+                "background": true
+            }))
+            .expect("background spawn should succeed");
+        assert_eq!(
+            envelope.get("background").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            envelope.get("status").and_then(|v| v.as_str()),
+            Some("started")
+        );
+        let job_id = envelope
+            .get("job_id")
+            .and_then(|v| v.as_str())
+            .expect("job_id in envelope")
+            .to_string();
+        assert!(job_id.starts_with("job-"), "id 形态: {job_id}");
+
+        // 跨工具轮询至完成(10s 帽)
+        let jc = JobControlTool::new();
+        let mut completed = false;
+        let mut last = serde_json::Value::Null;
+        for _ in 0..100 {
+            last = jc
+                .call(&serde_json::json!({"action": "status", "job_id": job_id}))
+                .await
+                .unwrap();
+            if last.get("status").and_then(|v| v.as_str()) == Some("completed") {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(completed, "10s 帽内应完成: {last}");
+        assert_eq!(
+            last.get("exit_code").and_then(|v| v.as_i64()),
+            Some(0),
+            "git --version 退出码 0: {last}"
+        );
+        // read:尾读含版本行
+        let read = jc
+            .call(&serde_json::json!({"action": "read", "job_id": job_id, "bytes": 4096}))
+            .await
+            .unwrap();
+        let tail = read.get("tail").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            tail.to_lowercase().contains("version"),
+            "尾读应含版本行: {tail}"
+        );
+        // 清理置尾:日志读毕才能删工作目录(读取依赖 {dir}/.evo/jobs 日志)
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 审批回灌兼容:Candidate 未批+background=true → 仍走 proposal(后台
+    /// 化不改变审批语义,零旁路);rm=Candidate 且未批零执行(测试安全)。
+    #[tokio::test]
+    async fn test_background_candidate_unapproved_still_proposes() {
+        let tool = ShellExecTool::new();
+        let r = tool
+            .call_sync(&serde_json::json!({
+                "command": "rm",
+                "background": true
+            }))
+            .expect("candidate proposal path");
+        assert_eq!(
+            r.get("status").and_then(|v| v.as_str()),
+            Some("needs_approval"),
+            "未批 candidate+background=仍需审批(后台化零旁路)"
+        );
     }
 
     // === 分类函数单元测试 ===

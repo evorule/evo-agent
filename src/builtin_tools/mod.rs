@@ -59,6 +59,7 @@ pub mod accounting;
 #[cfg(windows)]
 pub mod appcontainer;
 pub mod ask_user;
+pub mod background_jobs;
 pub mod build_check;
 pub mod code_search;
 pub mod codegraph;
@@ -78,6 +79,7 @@ pub mod grep_files;
 pub mod http_get;
 pub mod http_request;
 pub mod image_load;
+pub mod job_control;
 pub mod net_guard;
 pub mod plan_submit;
 pub mod python_exec;
@@ -325,6 +327,12 @@ fn default_safe_toolkit_core(
     handler.register_static(
         codegraph::CODEGRAPH_TOOL,
         Arc::new(codegraph::CodeGraphTool::wired(&workdir_buf)),
+    );
+    // dev-feedback P0a 余量:后台作业轮询面(与 shell_exec background=true
+    // 启动面配对;同一进程级注册表;零新命令执行面)
+    handler.register_static(
+        job_control::JOB_CONTROL_TOOL,
+        Arc::new(job_control::JobControlTool::new()),
     );
     handler.register_static("http_get", Arc::new(http_get::HttpGetTool::new()));
     // 批K 段2:网络面第二/三件——网页抓取取读(http_get 防线全量复用)与
@@ -872,6 +880,51 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     r#type: "string".to_string(),
                     description: "Command to execute, e.g. \"cargo test --release\" or \"ls -la\"".to_string(),
                     required: true,
+                },
+                ParameterSpec {
+                    name: "background".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Run detached as a background job (local backend only): \
+                                  returns {job_id, log_path} immediately; poll/kill via \
+                                  the job_control tool. Approval conditions evaluate the \
+                                  command exactly as in the foreground - backgrounding \
+                                  never bypasses approval."
+                        .to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "job_control".to_string(),
+            description: "Poll, read output from, or terminate a background job started \
+                          via shell_exec background=true. action=status returns running/\
+                          completed + exit code; action=read returns the output tail; \
+                          action=kill terminates the whole process family. Job ids are \
+                          process-local (a restart retires old ids)."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "action".to_string(),
+                    r#type: "string".to_string(),
+                    description: "One of: status, read, kill. Unknown values are \
+                                  rejected with the valid list."
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "job_id".to_string(),
+                    r#type: "string".to_string(),
+                    description: "The job id from the shell_exec background envelope."
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "bytes".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "action=read only: tail size cap in bytes (default \
+                                  4096)."
+                        .to_string(),
+                    required: false,
                 },
             ],
         },
