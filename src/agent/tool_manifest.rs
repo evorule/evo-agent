@@ -505,6 +505,11 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 可控命令面;但构建执行工作区 build script,审批档与命令族同档
         // ManualDefault=candidate,人工默认否决点在场;超时 Long=构建类)
         b("build_check", vec![Process]),
+        // dev-feedback P0b:代码知识图谱只读查询面(本机 codegraph-bridge
+        // HTTP 服务只读服务族;ensure_index 写索引面留服务端不入工具;纯读
+        // 故 ReadOnly 显式标定,见下方读写分级臂;AutoPolicy 免裁决同
+        // code_search 先例)
+        b("codegraph", vec![Network]),
         b("http_get", vec![Network]),
         // 批K 段2:网络面第二件——网页抓取取读(复用 http_get host 分类/
         // SSRF/重定向/负面域全部防线;candidate host 同 http_get 审批语义)
@@ -613,9 +618,10 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 审批模式——分级不影响其审批臂，只影响并行预执行分组。
         match m.name.as_str() {
             "file_read" | "image_load" | "file_list" | "search_files" | "grep_files"
-            | "code_search" | "git_status" | "git_diff" | "git_log" | "query_journal"
-            | "query_trace" | "read_back" | "diff_runs" | "read_skill" | "memory_recall"
-            | "audit_query" | "audit_summary" | "todo_read" | "handover_read" | "web_search" => {
+            | "code_search" | "codegraph" | "git_status" | "git_diff" | "git_log"
+            | "query_journal" | "query_trace" | "read_back" | "diff_runs" | "read_skill"
+            | "memory_recall" | "audit_query" | "audit_summary" | "todo_read" | "handover_read"
+            | "web_search" => {
                 m.side_effect = EffectClass::ReadOnly;
             }
             _ => {}
@@ -1118,9 +1124,11 @@ mod tests {
         //   （工作区构建反馈回路 build_check +1：内置 39→40，数量锁 105→106）
         //   （审计摘要卡 audit_summary +1：内置 40→41，数量锁 106→107，
         //     缺省关——开关显式开启才进 LLM 契约）
-        assert_eq!(builtin_manifests().len(), 41);
+        //   （代码知识图谱只读查询面 codegraph +1：内置 41→42，数量锁
+        //     107→108，桥不在场=fail-visible 不假装成功）
+        assert_eq!(builtin_manifests().len(), 42);
         assert_eq!(rule_manifests().len(), 60);
-        assert_eq!(all().len(), 108);
+        assert_eq!(all().len(), 109);
     }
 
     #[test]
@@ -1147,9 +1155,9 @@ mod tests {
         names.extend(rule_manifests().iter().map(|m| m.name.clone()));
         names.push(delegate_manifest().name);
         names.extend(memory_manifests().iter().map(|m| m.name.clone()));
-        // 数量锁(与模块头「内置 41 + 规则 60 + delegate 1 + memory 6 = 108」
+        // 数量锁(与模块头「内置 42 + 规则 60 + delegate 1 + memory 6 = 109」
         // 同源;计数漂移此处当场红)
-        assert_eq!(names.len(), 108, "static manifest count lock");
+        assert_eq!(names.len(), 109, "static manifest count lock");
         let mut sorted = names.clone();
         sorted.sort();
         let before = sorted.len();
@@ -1263,20 +1271,22 @@ mod tests {
 
     #[test]
     fn test_effect_class_calibration_locked() {
-        // 读写分级标定锁（并行调度分组判据）：只读族显式标定数=28
-        // （审计摘要卡 audit_summary 只读小视图 +1）；未标定一律 Mutating
-        // （保守串行，缺省不变式）。扩标须 diff 审改数。
+        // 读写分级标定锁（并行调度分组判据）：只读族显式标定数=29
+        // （审计摘要卡 audit_summary 只读小视图 +1；代码知识图谱只读查询
+        // codegraph +1）；未标定一律 Mutating（保守串行，缺省不变式）。
+        // 扩标须 diff 审改数。
         let all = static_manifests();
         let readonly: Vec<&str> = all
             .iter()
             .filter(|m| m.side_effect == EffectClass::ReadOnly)
             .map(|m| m.name.as_str())
             .collect();
-        assert_eq!(readonly.len(), 28, "ReadOnly 标定数锁: {:?}", readonly);
+        assert_eq!(readonly.len(), 29, "ReadOnly 标定数锁: {:?}", readonly);
         let look = |n: &str| lookup_static(n).unwrap().side_effect;
         // 内置只读族抽样
         assert_eq!(look("file_read"), EffectClass::ReadOnly);
         assert_eq!(look("grep_files"), EffectClass::ReadOnly);
+        assert_eq!(look("codegraph"), EffectClass::ReadOnly);
         assert_eq!(look("memory_recall"), EffectClass::ReadOnly);
         assert_eq!(look("audit_summary"), EffectClass::ReadOnly);
         assert_eq!(look("todo_read"), EffectClass::ReadOnly);

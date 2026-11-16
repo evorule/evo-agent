@@ -61,6 +61,7 @@ pub mod appcontainer;
 pub mod ask_user;
 pub mod build_check;
 pub mod code_search;
+pub mod codegraph;
 pub mod companion_observe;
 pub mod delegate_tool;
 pub mod edit_file;
@@ -318,6 +319,12 @@ fn default_safe_toolkit_core(
     handler.register_static(
         build_check::BUILD_CHECK_TOOL,
         Arc::new(build_check::BuildCheckTool::wired(&workdir_buf)),
+    );
+    // dev-feedback P0b:代码知识图谱只读查询面(本机 codegraph-bridge HTTP
+    // 服务只读服务族;ensure_index 写索引面留服务端;桥不在场=fail-visible)
+    handler.register_static(
+        codegraph::CODEGRAPH_TOOL,
+        Arc::new(codegraph::CodeGraphTool::wired(&workdir_buf)),
     );
     handler.register_static("http_get", Arc::new(http_get::HttpGetTool::new()));
     // 批K 段2:网络面第二/三件——网页抓取取读(http_get 防线全量复用)与
@@ -891,6 +898,49 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     .to_string(),
                 required: false,
             }],
+        },
+        ToolSpec {
+            name: "codegraph".to_string(),
+            description: "Query the local CodeGraph knowledge-graph bridge (read-only) \
+                          for an indexed repository: symbol search, task-oriented code \
+                          context, callers/callees, impact analysis, node details, \
+                          grouped source exploration, indexed file list, and index \
+                          status. Requires the codegraph-bridge service (default \
+                          http://127.0.0.1:9150, override via EVO_CODEGRAPH_URL) and a \
+                          repository that has been indexed (first-time indexing is a \
+                          server-side operation - if the repo is not indexed you get a \
+                          visible error). projectPath defaults to the workspace root."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "service".to_string(),
+                    r#type: "string".to_string(),
+                    description: "One of: search, context, callers, callees, impact, \
+                                  node, explore, files, status. Unknown values are \
+                                  rejected with the valid list."
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "projectPath".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Absolute path of the repository to query. Defaults \
+                                  to the workspace root."
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "params".to_string(),
+                    r#type: "object".to_string(),
+                    description: "Service-specific arguments merged into the query \
+                                  payload (e.g. {\"query\": \"loginUser\", \"limit\": \
+                                  5} for search; {\"task\": \"how does login flow \
+                                  work\"} for context; {\"symbol\": \"fnName\"} for \
+                                  callers/callees/impact/node)."
+                        .to_string(),
+                    required: false,
+                },
+            ],
         },
         ToolSpec {
             name: "http_get".to_string(),
