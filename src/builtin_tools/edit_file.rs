@@ -237,11 +237,17 @@ impl FileEditTool {
         let meta =
             std::fs::metadata(&target_canonical).map_err(|e| format!("stat failed: {}", e))?;
         if meta.len() > self.max_file_bytes {
-            return Err(format!(
-                "file too large: {} bytes (max {} bytes)",
-                meta.len(),
-                self.max_file_bytes
-            ));
+            // P1 余量:大文件分段编辑——流式行空间路径(内存 O(锚+行),不随
+            // 文件体积增长),与 in-cap 字节保真路径同守卫(锚帽/UTF-8 不猜/
+            // 唯一性闸);exact 优先 + trim 归一容错两层均在流面成立
+            return self.call_sync_segmented(
+                old_string,
+                new_string,
+                replace_all,
+                &target,
+                &target_canonical,
+                path,
+            );
         }
         let raw = std::fs::read(&target_canonical).map_err(|e| format!("read failed: {}", e))?;
         let bytes_before = raw.len();
@@ -431,6 +437,359 @@ impl FileEditTool {
         }
         Ok(Value::Object(map))
     }
+
+    /// 大文件分段编辑(P1 余量):流式行空间路径——内存 O(锚+行),不随文件
+    /// 体积增长。双 pass:分析流(逐行 UTF-8 校验 fail-visible;exact/trim
+    /// 双层窗口匹配;唯一性闸;上下文捕获)→ 写入流(窗外行原字节 verbatim,
+    /// 窗内写替换行序列)。o107 同款语义流式化:tmp 写入 → 写入账面对账
+    /// (总长+各窗口字节域逐一对账)→ mismatch 重写一次仍败显式报错 →
+    /// rename 落盘。
+    ///
+    /// 与 in-cap 路径的契约差(如实标注):①匹配在行空间(exact=行序列
+    /// 全等,trim=归一序列),不做全文子串匹配——跨行锚按行序列表达;
+    /// ②混合 EOL 不拒绝(窗外行原字节保留,比 in-cap 的混合拒裁更保真);
+    /// ③envelope 增 `segmented: true`,trim 层照带 fuzzy 标记;④窗口匹配
+    /// 非重叠贪心(连续窗口自窗口尾重启)。
+    fn call_sync_segmented(
+        &self,
+        old_string: &str,
+        new_string: &str,
+        replace_all: bool,
+        target: &Path,
+        target_canonical: &Path,
+        path: &str,
+    ) -> IoResult {
+        use std::io::{BufRead, Write};
+
+        // 锚行序列(LF 归一;行尾 \r 剥离)
+        let anchor_lines: Vec<String> = old_string
+            .replace("\r\n", "\n")
+            .split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
+            .collect();
+        let anchor_trim: Vec<String> = anchor_lines.iter().map(|l| l.trim().to_string()).collect();
+        if anchor_trim.iter().all(|l| l.is_empty()) {
+            return Err(
+                "old_string is whitespace-only (segmented path cannot align an empty \
+                 anchor); use file_write to create/replace whole files"
+                    .to_string(),
+            );
+        }
+        let new_lines: Vec<String> = new_string
+            .replace("\r\n", "\n")
+            .split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
+            .collect();
+
+        // ── PASS 1:分析流(唯一性闸 + 窗口表 + 上下文捕获)──
+        // 窗口=(start, end, had_eol):0-based 行区间 [start,end) + 末行是否
+        // 带 EOL(EOF 尾行可无;替换写入时据此补 EOL)。
+        let file =
+            std::fs::File::open(target_canonical).map_err(|e| format!("read failed: {e}"))?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut exact_windows: Vec<(usize, usize, bool)> = Vec::new();
+        let mut trim_windows: Vec<(usize, usize, bool)> = Vec::new();
+        let mut exact_run = 0usize;
+        let mut trim_run = 0usize;
+        let mut window_eol: Option<String> = None;
+        let mut preview_before: Vec<String> = Vec::new();
+        let mut bytes_before = 0u64;
+        let mut invalid_utf8: Option<String> = None;
+        let mut line_no = 0usize; // 1-based
+        loop {
+            buf.clear();
+            let n = reader
+                .read_until(b'\n', &mut buf)
+                .map_err(|e| format!("read failed: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            bytes_before += n as u64;
+            line_no += 1;
+            let (content, eol) = split_eol(&buf);
+            let text_line = match std::str::from_utf8(content) {
+                Ok(t) => t.to_string(),
+                Err(e) => {
+                    invalid_utf8 = Some(format!(
+                        "file is not valid UTF-8 (byte {}): {e}; segmented path never \
+                         guesses encodings — convert or edit via other means",
+                        e.valid_up_to()
+                    ));
+                    break;
+                }
+            };
+            // exact 匹配器(连续命中;完成后当前行若=锚首行则立即重启,覆盖
+            // 连续同形窗口;比较索引 clamp 防单行锚重启越界;completion 用
+            // `>=`——重启后 run 可超 len,等价成立;窗口 EOL 取窗口首行的
+            // EOL——0→1 转移点捕获,写入流的替换行按此 EOL 相接)
+            if content == anchor_lines[exact_run.min(anchor_lines.len() - 1)].as_bytes() {
+                if exact_run == 0 {
+                    window_eol = Some(eol.to_string());
+                }
+                exact_run += 1;
+                if exact_run >= anchor_lines.len() {
+                    exact_windows.push((line_no - exact_run, line_no, !eol.is_empty()));
+                    exact_run = usize::from(content == anchor_lines[0].as_bytes());
+                }
+            } else {
+                exact_run = usize::from(content == anchor_lines[0].as_bytes());
+            }
+            // trim 匹配器(同构)
+            let t = text_line.trim();
+            if t == anchor_trim[trim_run.min(anchor_trim.len() - 1)] {
+                if trim_run == 0 {
+                    window_eol = Some(eol.to_string());
+                }
+                trim_run += 1;
+                if trim_run >= anchor_trim.len() {
+                    trim_windows.push((line_no - trim_run, line_no, !eol.is_empty()));
+                    trim_run = usize::from(t == anchor_trim[0]);
+                }
+            } else {
+                trim_run = usize::from(t == anchor_trim[0]);
+            }
+            if exact_windows.is_empty() && trim_windows.is_empty() {
+                preview_before.push(text_line.trim().to_string());
+                if preview_before.len() > 3 {
+                    preview_before.remove(0);
+                }
+            }
+        }
+        if let Some(msg) = invalid_utf8 {
+            return Err(msg);
+        }
+
+        // 唯一性闸(exact 优先;双零 → 最近区域诊断)
+        let (tier, windows) = if !exact_windows.is_empty() {
+            ("exact", &exact_windows)
+        } else if !trim_windows.is_empty() {
+            ("trim", &trim_windows)
+        } else {
+            let diag = segmented_nearest_region(target_canonical, &anchor_lines);
+            let d = diag
+                .map(|(n, line)| {
+                    format!(
+                        "; closest anchor-like region at line {n}: \"{}\"",
+                        line.trim()
+                    )
+                })
+                .unwrap_or_default();
+            return Err(format!(
+                "old_string not found in '{path}' (0 hits, incl. segmented line \
+                 matching{d}); read the file first (file_read/grep_files) to copy an \
+                 exact anchor"
+            ));
+        };
+        if windows.len() > 1 && !replace_all {
+            return Err(format!(
+                "old_string matches {} times in '{path}' under segmented {tier} \
+                 matching; extend the anchor to make it unique, or pass replace_all=true",
+                windows.len()
+            ));
+        }
+        let eol = window_eol.clone().unwrap_or_else(|| "\n".to_string());
+        let edits_applied = if replace_all { windows.len() } else { 1 };
+
+        // ── PASS 2:写入流(tmp;窗外行原字节 verbatim,窗内写替换行序列)──
+        let tmp_path = target.parent().unwrap_or(Path::new(".")).join(format!(
+            "{}.evo-edit-tmp",
+            target
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| "invalid target file name".to_string())?
+        ));
+        std::fs::remove_file(&tmp_path).ok(); // 残件清场
+        let write_once = |spans_out: &mut Vec<(u64, u64, bool)>| -> Result<u64, String> {
+            let mut orig = std::io::BufReader::new(
+                std::fs::File::open(target_canonical).map_err(|e| format!("read failed: {e}"))?,
+            );
+            let mut orig_read = 0u64;
+            let mut out = std::io::BufWriter::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp_path)
+                    .map_err(|e| format!("tmp write failed: {e}"))?,
+            );
+            let mut buf: Vec<u8> = Vec::new();
+            let mut li = 0usize; // 0-based 行号
+            let mut wi = 0usize;
+            let mut written = 0u64;
+            loop {
+                buf.clear();
+                let n = orig
+                    .read_until(b'\n', &mut buf)
+                    .map_err(|e| format!("read failed: {e}"))?;
+                orig_read += n as u64;
+                if n == 0 {
+                    break;
+                }
+                let in_window = wi < windows.len() && li >= windows[wi].0 && li < windows[wi].1;
+                if wi < windows.len() && li == windows[wi].0 {
+                    // 窗口首行:写替换行序列(行间 EOL;末行按原窗口 had_eol 补)
+                    let span_start = written;
+                    for (i, nl) in new_lines.iter().enumerate() {
+                        out.write_all(nl.as_bytes())
+                            .map_err(|e| format!("tmp write failed: {e}"))?;
+                        written += nl.len() as u64;
+                        if i + 1 < new_lines.len() || windows[wi].2 {
+                            out.write_all(eol.as_bytes())
+                                .map_err(|e| format!("tmp write failed: {e}"))?;
+                            written += eol.len() as u64;
+                        }
+                    }
+                    spans_out.push((span_start, written, windows[wi].2));
+                    wi += 1;
+                } else if in_window {
+                    // 窗口内非首行:跳过(由替换行序列承载)
+                } else {
+                    // 窗外行:原字节 verbatim(UTF-8 已在 PASS 1 校验)
+                    out.write_all(&buf)
+                        .map_err(|e| format!("tmp write failed: {e}"))?;
+                    written += n as u64;
+                }
+                li += 1;
+            }
+            if orig_read != bytes_before {
+                return Err(format!(
+                    "segmented edit source mismatch: pass-2 read {orig_read} bytes vs                      pass-1 {bytes_before} (source moved during edit?)"
+                ));
+            }
+            Ok(written)
+        };
+        let mut spans: Vec<(u64, u64, bool)> = Vec::new();
+        let mut bytes_after = write_once(&mut spans).inspect_err(|_e| {
+            let _ = std::fs::remove_file(&tmp_path);
+        })?;
+
+        // ── PASS 3:o107 同款验证(写入账面 vs tmp 实盘:总长 + 各窗口字节域
+        // 逐一比对预期替换行)──
+        let verify = |spans: &[(u64, u64, bool)], written_expected: u64| -> Result<(), String> {
+            let actual_len = std::fs::metadata(&tmp_path)
+                .map(|m| m.len())
+                .map_err(|e| format!("verify read failed: {e}"))?;
+            if actual_len != written_expected {
+                return Err(format!(
+                    "segmented edit verification mismatch: tmp {actual_len} bytes vs \
+                     intended {written_expected} bytes (possible storage/transport fault)"
+                ));
+            }
+            let mut f =
+                std::fs::File::open(&tmp_path).map_err(|e| format!("verify read failed: {e}"))?;
+            for (s, e, had_eol) in spans {
+                use std::io::{Read, Seek, SeekFrom};
+                f.seek(SeekFrom::Start(*s))
+                    .map_err(|e| format!("verify seek failed: {e}"))?;
+                let mut got = vec![0u8; (*e - *s) as usize];
+                f.read_exact(&mut got)
+                    .map_err(|e| format!("verify window read failed: {e}"))?;
+                let mut want = Vec::new();
+                for (i, nl) in new_lines.iter().enumerate() {
+                    want.extend_from_slice(nl.as_bytes());
+                    if i + 1 < new_lines.len() || *had_eol {
+                        want.extend_from_slice(eol.as_bytes());
+                    }
+                }
+                if got != want {
+                    return Err("segmented edit verification mismatch: window bytes differ \
+                         from intended replacement (possible storage/transport fault)"
+                        .to_string());
+                }
+            }
+            Ok(())
+        };
+        if verify(&spans, bytes_after).is_err() {
+            // mismatch → 重写一次(o107 同款:mismatch 重写/显式报错;写入
+            // 确定性故窗口表复用)
+            spans.clear();
+            bytes_after = write_once(&mut spans).inspect_err(|_e| {
+                let _ = std::fs::remove_file(&tmp_path);
+            })?;
+            verify(&spans, bytes_after).inspect_err(|_e| {
+                let _ = std::fs::remove_file(&tmp_path);
+            })?;
+        }
+        std::fs::rename(&tmp_path, target).map_err(|e| format!("atomic rename failed: {e}"))?;
+
+        // 预览:首个窗口前 3 行上下文 + 替换行(超 8 行截尾)
+        let mut preview_parts = preview_before.clone();
+        preview_parts.extend(new_lines.iter().cloned());
+        if preview_parts.len() > 8 {
+            preview_parts = preview_parts[preview_parts.len() - 8..].to_vec();
+        }
+        let preview = preview_parts.join(&eol);
+
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "path".to_string(),
+            Value::from(target_canonical.display().to_string()),
+        );
+        map.insert("segmented".to_string(), Value::Bool(true));
+        map.insert("windows".to_string(), Value::from(windows.len() as i64));
+        map.insert(
+            "edits_applied".to_string(),
+            Value::from(edits_applied as i64),
+        );
+        map.insert("bytes_before".to_string(), Value::from(bytes_before as i64));
+        map.insert("bytes_after".to_string(), Value::from(bytes_after as i64));
+        map.insert("preview".to_string(), Value::from(preview));
+        if tier == "trim" {
+            map.insert(
+                "fuzzy_match".to_string(),
+                Value::from("line-trim-normalized (segmented)"),
+            );
+        }
+        Ok(Value::Object(map))
+    }
+}
+
+/// 行缓冲 EOL 切分(纯函数):返回 (内容字节, EOL 字符串)——EOL=`\r\n` 或
+/// `\n`,无 EOL(EOF 尾行)=空
+fn split_eol(raw: &[u8]) -> (&[u8], &str) {
+    if raw.ends_with(b"\r\n") {
+        (&raw[..raw.len() - 2], "\r\n")
+    } else if raw.ends_with(b"\n") {
+        (&raw[..raw.len() - 1], "\n")
+    } else {
+        (raw, "")
+    }
+}
+
+/// 分段面最近区域诊断(容错二级,流式):二次全扫按词元重叠取首个最大者
+fn segmented_nearest_region(target: &Path, anchor_lines: &[String]) -> Option<(usize, String)> {
+    use std::io::BufRead;
+    let probe = anchor_lines
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .max_by_key(|l| l.len())?;
+    let tokens: Vec<&str> = probe.split_whitespace().collect();
+    let file = std::fs::File::open(target).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut best: Option<(usize, usize, String)> = None;
+    let mut line_no = 0usize;
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        line_no += 1;
+        let line = String::from_utf8_lossy(&buf);
+        let overlap = tokens.iter().filter(|t| line.contains(**t)).count();
+        if overlap > 0
+            && best
+                .as_ref()
+                .map(|(_, bo, _)| overlap > *bo)
+                .unwrap_or(true)
+        {
+            best = Some((line_no, overlap, line.trim().to_string()));
+        }
+    }
+    best.map(|(n, _, line)| (n, line))
 }
 
 #[cfg(test)]
@@ -746,10 +1105,111 @@ mod tests {
             max_file_bytes: 10,
             ..tool
         };
-        write_ws_file(&dir, "big.txt", b"0123456789abcdef");
-        let r = tool.call_sync(&edit_args("workspace/big.txt", "0", "1"));
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("too large"));
+        write_ws_file(&dir, "big.txt", b"aaa\nbbb\nccc\n");
+        // 契约改写(P1 余量):超帽文件不再拒执,改分段路径锚编辑成功——
+        // envelope 带 segmented 标记,窗外行原字节 verbatim
+        let r = tool
+            .call_sync(&edit_args("workspace/big.txt", "bbb", "XYZ"))
+            .unwrap();
+        assert_eq!(
+            r.get("segmented").and_then(|v| v.as_bool()),
+            Some(true),
+            "超帽文件走分段路径: {r}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("workspace").join("big.txt")).unwrap(),
+            "aaa\nXYZ\nccc\n",
+            "锚替换生效,窗外行原字节 verbatim"
+        );
+    }
+
+    #[test]
+    fn test_segmented_uniqueness_gate_still_enforced() {
+        // 分段面唯一性闸:超大文件内多命中+未 replace_all → 拒(计数透出)
+        let dir = temp_workdir_with_workspace();
+        let tool = FileEditTool {
+            max_file_bytes: 10,
+            ..FileEditTool::new(dir.path().to_path_buf())
+        };
+        write_ws_file(&dir, "dup.txt", b"x\nx\nx\npad-pad-pad-pad\n");
+        let err = tool
+            .call_sync(&edit_args("workspace/dup.txt", "x", "y"))
+            .unwrap_err();
+        assert!(
+            err.contains("3 times") && err.contains("segmented exact"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_segmented_anchor_not_found_diagnostic() {
+        // 分段面二级容错:全失配 → 最近区域诊断(行号+盘上片段)
+        let dir = temp_workdir_with_workspace();
+        let tool = FileEditTool {
+            max_file_bytes: 10,
+            ..FileEditTool::new(dir.path().to_path_buf())
+        };
+        write_ws_file(
+            &dir,
+            "c.txt",
+            b"fn main() {\n    let alpha = real_compute(y);\n}\n",
+        );
+        let err = tool
+            .call_sync(&edit_args(
+                "workspace/c.txt",
+                "let alpha = compute(x);",
+                "let alpha = computed;",
+            ))
+            .unwrap_err();
+        assert!(
+            err.contains("closest anchor-like region at line 2"),
+            "got: {err}"
+        );
+        assert!(err.contains("let alpha = real_compute(y);"), "got: {err}");
+    }
+
+    #[test]
+    fn test_segmented_invalid_utf8_fail_visible() {
+        // 分段面编码契约:无效 UTF-8 如实拒(不猜编码)
+        let dir = temp_workdir_with_workspace();
+        let tool = FileEditTool {
+            max_file_bytes: 4,
+            ..FileEditTool::new(dir.path().to_path_buf())
+        };
+        std::fs::write(
+            dir.path().join("workspace").join("bin.dat"),
+            [b'a', b'b', 0xFF, 0xFE, b'c', b'd'],
+        )
+        .unwrap();
+        let err = tool
+            .call_sync(&edit_args("workspace/bin.dat", "ab", "cd"))
+            .unwrap_err();
+        assert!(err.contains("not valid UTF-8"), "got: {err}");
+    }
+
+    #[test]
+    fn test_segmented_crlf_preserved() {
+        // 分段面 CRLF 保真:窗外行 CRLF verbatim;窗内行按窗口 EOL 形态
+        let dir = temp_workdir_with_workspace();
+        let tool = FileEditTool {
+            max_file_bytes: 12,
+            ..FileEditTool::new(dir.path().to_path_buf())
+        };
+        write_ws_file(&dir, "crlf.txt", b"head\r\nMIDDLE\r\ntail\r\n");
+        let r = tool
+            .call_sync(&edit_args("workspace/crlf.txt", "MIDDLE", "REPLACED"))
+            .unwrap();
+        assert_eq!(r.get("segmented").and_then(|v| v.as_bool()), Some(true));
+        let content = std::fs::read(dir.path().join("workspace").join("crlf.txt")).unwrap();
+        assert_eq!(
+            String::from_utf8(content).unwrap(),
+            "head\r\nREPLACED\r\ntail\r\n",
+            "CRLF 全文件保真"
+        );
+        eprintln!(
+            "DEBUG actual bytes: {:x?}",
+            std::fs::read(dir.path().join("workspace").join("crlf.txt")).unwrap()
+        );
     }
 
     #[test]
