@@ -54,6 +54,8 @@ pub struct LspStatusResponse {
     pub rust: GateStatus,
     /// TypeScript 门(typescript-language-server,兼管 javascript)
     pub typescript: GateStatus,
+    /// Python 门(pyright-langserver)
+    pub python: GateStatus,
     /// 工作区根绝对路径(POSIX 风格;前端构造真实 file:// 文档 URI 与 rootUri 用;
     /// 与 /version 同口径,仅鉴权面内暴露)
     pub workdir: String,
@@ -62,7 +64,7 @@ pub struct LspStatusResponse {
 /// WS 连接 query 参数
 #[derive(Debug, Deserialize)]
 pub struct LspWsQuery {
-    /// 语言门(`rust` | `typescript`)
+    /// 语言门(`rust` | `typescript` | `python`)
     pub lang: Option<String>,
 }
 
@@ -124,16 +126,19 @@ async fn probe_version(program: &str, args: &[&str]) -> GateStatus {
 fn install_hint(program: &str) -> String {
     if program == "rust-analyzer" {
         "rust-analyzer 未安装:执行 `rustup component add rust-analyzer`".into()
+    } else if program == "pyright-langserver" {
+        "pyright-langserver 未安装:执行 `npm install -g pyright`".into()
     } else {
         "typescript-language-server 未安装:执行 `npm install -g typescript typescript-language-server`".into()
     }
 }
 
-/// `GET /api/lsp/status` — 两语言门检测(每次调用实时探测;轻量子进程,低频面)
+/// `GET /api/lsp/status` — 三语言门检测(每次调用实时探测;轻量子进程,低频面)
 pub async fn status(State(state): State<AgentApiState>) -> Json<LspStatusResponse> {
-    let (rust, typescript) = tokio::join!(
+    let (rust, typescript, python) = tokio::join!(
         probe_version("rust-analyzer", &["--version"]),
         probe_version("typescript-language-server", &["--version"]),
+        probe_version("pyright-langserver", &["--version"]),
     );
     // 绝对化:相对 workdir(如 ".")对前端 file:// URI 构造不可用;Windows
     // canonicalize 产生 `\\?\` verbatim 前缀,按 fs_watch 同款口径剥除
@@ -149,6 +154,7 @@ pub async fn status(State(state): State<AgentApiState>) -> Json<LspStatusRespons
     Json(LspStatusResponse {
         rust,
         typescript,
+        python,
         workdir,
     })
 }
@@ -165,7 +171,7 @@ pub async fn lsp_ws(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "missing or invalid ?lang= (rust | typescript)",
+                "missing or invalid ?lang= (rust | typescript | python)",
             )
                 .into_response()
         }

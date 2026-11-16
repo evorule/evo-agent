@@ -24,22 +24,25 @@ use std::time::{Duration, Instant};
 
 use crate::api::agent_api::AgentApiState;
 
-/// 语言门(v1 两语言;PATH 硬发现,缺失由上层灰置降级)。
+/// 语言门(v1 三语言;PATH 硬发现,缺失由上层灰置降级)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
     /// Rust 门:rust-analyzer
     Rust,
     /// TypeScript 门:typescript-language-server(兼管 javascript)
     TypeScript,
+    /// Python 门:pyright-langserver
+    Python,
 }
 
 impl Lang {
-    /// WS query 参数形态(`rust` | `typescript`;javascript 归入 typescript 门,
-    /// 同由 typescript-language-server 服务)。
+    /// WS query 参数形态(`rust` | `typescript` | `python`;javascript 归入
+    /// typescript 门,同由 typescript-language-server 服务)。
     pub fn from_query(value: &str) -> Option<Self> {
         match value {
             "rust" => Some(Self::Rust),
             "typescript" => Some(Self::TypeScript),
+            "python" => Some(Self::Python),
             _ => None,
         }
     }
@@ -49,6 +52,7 @@ impl Lang {
         match self {
             Self::Rust => "rust",
             Self::TypeScript => "typescript",
+            Self::Python => "python",
         }
     }
 
@@ -57,16 +61,18 @@ impl Lang {
         match self {
             Self::Rust => process::RUST_ANALYZER,
             Self::TypeScript => process::TYPESCRIPT_SERVER,
+            Self::Python => process::PYRIGHT_SERVER,
         }
     }
 
     /// 诊断 owner 命名空间(诊断单源契约:接入方自报,全局唯一)。
-    /// 诊断 owner 命名空间(诊断单源契约:接入方自报,全局唯一)。
     pub fn owner(&self) -> &'static str {
         match self {
-            // rust-analyzer 以内嵌点命名;typescript-language-server 以连字符
+            // rust-analyzer 以内嵌点命名;typescript-language-server/pyright
+            // 以连字符
             Self::Rust => "lsp.rust-analyzer",
             Self::TypeScript => "lsp.typescript-language-server",
+            Self::Python => "lsp.pyright-langserver",
         }
     }
 }
@@ -212,10 +218,15 @@ mod tests {
     fn lang_query_and_owner() {
         assert_eq!(Lang::from_query("rust"), Some(Lang::Rust));
         assert_eq!(Lang::from_query("typescript"), Some(Lang::TypeScript));
-        assert_eq!(Lang::from_query("python"), None);
+        assert_eq!(Lang::from_query("python"), Some(Lang::Python));
+        assert_eq!(Lang::from_query("julia"), None);
         assert_eq!(Lang::Rust.owner(), "lsp.rust-analyzer");
         assert_eq!(Lang::TypeScript.owner(), "lsp.typescript-language-server");
+        assert_eq!(Lang::Python.owner(), "lsp.pyright-langserver");
         assert_eq!(Lang::TypeScript.spec().args, ["--stdio"]);
+        assert_eq!(Lang::Python.spec().program, "pyright-langserver");
+        assert_eq!(Lang::Python.spec().args, ["--stdio"]);
+        assert_eq!(Lang::Python.as_str(), "python");
     }
 
     #[test]

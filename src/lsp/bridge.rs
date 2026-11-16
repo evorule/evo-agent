@@ -243,7 +243,7 @@ pub async fn run_bridge(
             Ok(p) => p,
             Err(e) => {
                 let hint = format!(
-                    "{} 启动失败({e})。安装指引:Rust 门 `rustup component add rust-analyzer`;TypeScript 门 `npm install -g typescript typescript-language-server`",
+                    "{} 启动失败({e})。安装指引:Rust 门 `rustup component add rust-analyzer`;TypeScript 门 `npm install -g typescript typescript-language-server`;Python 门 `npm install -g pyright`",
                     spec.program
                 );
                 let _ = outgoing.send(BridgeEvent::Unavailable { hint }).await;
