@@ -8605,3 +8605,28 @@ fn g4_reference_block_carries_truncation_consequence() {
     assert!(block.contains("tool_result_fetch"), "取回入口在场");
     assert!(block.contains("chars:"), "分页单位(chars)元数据在场");
 }
+
+#[cfg(test)]
+mod g8_rejection_payload_tests {
+    use super::super::g8_rejection_payload;
+
+    #[test]
+    fn auto_rejected_carries_distinguishable_decision() {
+        let v = g8_rejection_payload("auto_rejected", true, "timeout");
+        assert_eq!(v["status"], "rejected");
+        assert_eq!(v["decision"], "auto_rejected");
+        assert_eq!(v["auto_rejected"], serde_json::Value::Bool(true));
+        assert!(v["message"].as_str().unwrap().contains("auto-denied"));
+        assert_eq!(v["reason"], "timeout");
+    }
+
+    #[test]
+    fn user_denial_keeps_legacy_shape_and_adds_decision() {
+        let v = g8_rejection_payload("rejected", false, "user denied");
+        assert_eq!(v["status"], "rejected");
+        assert_eq!(v["decision"], "rejected");
+        assert_eq!(v["auto_rejected"], serde_json::Value::Bool(false));
+        assert_eq!(v["message"], "User denied approval");
+    }
+}
+

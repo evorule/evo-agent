@@ -275,6 +275,26 @@ impl FileEditTool {
             return Err(e);
         }
 
+        // o107 传输校验:rename 后回读逐字节比对(防传输层吞字);不匹配重写一次,
+        // 仍不匹配显式报错 fail-visible
+        let on_disk = std::fs::read(&target)
+            .map_err(|e| format!("post-write verify read failed: {}", e))?;
+        if on_disk.as_slice() != out_bytes.as_slice() {
+            std::fs::write(&tmp_path, &out_bytes)
+                .map_err(|e| format!("rewrite tmp failed: {}", e))?;
+            std::fs::rename(&tmp_path, &target)
+                .map_err(|e| format!("rewrite rename failed: {}", e))?;
+            let reread = std::fs::read(&target)
+                .map_err(|e| format!("post-rewrite verify read failed: {}", e))?;
+            if reread.as_slice() != out_bytes.as_slice() {
+                return Err(format!(
+                    "edit verification failed after rewrite: disk {} bytes != intended {} bytes (possible storage/transport fault)",
+                    reread.len(),
+                    out_bytes.len()
+                ));
+            }
+        }
+
         let mut map = serde_json::Map::new();
         map.insert(
             "path".to_string(),
@@ -577,3 +597,4 @@ mod tests {
         assert_eq!(std::fs::read(&outside_file).unwrap(), b"secret");
     }
 }
+

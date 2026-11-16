@@ -468,11 +468,29 @@ impl ToolFunction for ReadBackTool {
         let is_stale = !writes_after.is_empty();
 
         // 2. 现势内容：从盘上重读（workdir 沙箱校验，与 file_read 同口径；
-        //    10MB 上限同 file_read）
+        //    10MB 上限同 file_read）。o108 修复：workdir 相对解析失败时回退
+        //    按 writable_dir（默认 workspace/）相对再解析一次——写面工具把
+        //    相对路径落在 writable_dir 下，read_back 必须感知同一约定。
         let (content, content_bytes, note) = match &self.deps.workdir {
             Some(workdir) => {
-                match crate::builtin_tools::fs_safety::resolve_existing(workdir, raw_path) {
-                    Ok(resolved) => {
+                let resolve = |root: &Path| {
+                    crate::builtin_tools::fs_safety::resolve_existing(root, raw_path)
+                };
+                let (resolved, resolve_err) = match resolve(workdir) {
+                    Ok(r) => (Some(r), None),
+                    Err(primary) => {
+                        let fallback_root = workdir
+                            .join(crate::builtin_tools::file_write::DEFAULT_WRITABLE_DIR);
+                        match resolve(&fallback_root) {
+                            Ok(r) => (Some(r), None),
+                            Err(fallback) => {
+                                (None, Some(format!("{primary}; fallback: {fallback}")))
+                            }
+                        }
+                    }
+                };
+                match resolved {
+                    Some(resolved) => {
                         let meta = std::fs::metadata(&resolved)
                             .map_err(|e| format!("read_back metadata failed: {e}"))?;
                         if meta.len() > 10 * 1024 * 1024 {
@@ -497,13 +515,14 @@ impl ToolFunction for ReadBackTool {
                             }
                         }
                     }
-                    // 盘上不存在（可能被删/改名）——staleness 结论照常返回
-                    Err(_) => (
+                    // 双根均未命中（可能被删/改名）——staleness 结论照常返回
+                    None => (
                         Value::Null,
                         0,
-                        Some(
-                            "file not found on disk (deleted, moved, or path rejected)".to_string(),
-                        ),
+                        Some(format!(
+                            "file not found on disk (deleted, moved, or path rejected): {}",
+                            resolve_err.unwrap_or_default()
+                        )),
                     ),
                 }
             }
