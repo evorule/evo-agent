@@ -795,15 +795,6 @@ pub struct AgentDefinition {
     /// - 校验:仅接受裸域名形态(拒 scheme/路径/端口/IP 字面量/空白)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_get_allowed_hosts: Option<Vec<String>>,
-    /// 治理包配置节(governance preset,可选;B-389/P3)
-    ///
-    /// 启用后激活以下治理机制（None(缺省)=全部关闭,既有行为零变化）:
-    /// - handover_gate: 长会话退出时检查 handover 文件是否已写
-    /// - pit_injection: 开工时按触及面注入相关坑账本条目(预算帽内)
-    /// - antidote_check: 稳定事实裁剪前校验解毒剂覆盖
-    /// 设定文件路径由 pit_ledger_path 指定(缺省 skills/PITS.md)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub governance: Option<GovernancePackConfig>,
     /// http_get 配置节(可选;G7 配置化。None(缺省)=工具内置现值,既有定义
     /// 零影响;显式声明才生效——超时/大小/重定向/明文 http/内网段放宽,
     /// GET-only 不放宽,SSRF 云元数据红线永不放宽。fail-fast 门卫见
@@ -894,55 +885,6 @@ fn is_max_parallel_tools_default(v: &usize) -> bool {
 /// ——运行期到达该事件的定义必为过审定义(违反在加载期 fail-fast,会话
 /// 不会建立)。
 pub const CONSTITUTION_RULESET_VERSION: &str = "2";
-
-/// 治理包配置节（governance preset，B-389/P3）
-///
-/// 启用后激活以下治理机制（None(缺省)=全部关闭，既有行为零变化）：
-/// - handover_gate: 长会话退出时检查 handover 文件是否已写
-/// - pit_injection: 开工时按触及面注入相关坑账本条目（预算帽内）
-/// - antidote_check: 稳定事实裁剪前校验解毒剂覆盖
-///
-/// 激活形态（D6 裁定 A）：`governance` 命名预设——AgentDefinition JSON 中
-/// 显式声明 `"governance": {}` 即全默认开启；本机装机在 agent JSON 中
-/// 加 `"governance": {}` 一行即可，公开缺省 off。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GovernancePackConfig {
-    /// 收尾拦截：会话退出时检查 handover 文件是否已写（缺省启用）
-    #[serde(default = "default_gov_true")]
-    pub handover_gate: bool,
-    /// 坑账本注入：开工时按触及面过滤注入（缺省启用）
-    #[serde(default = "default_gov_true")]
-    pub pit_injection: bool,
-    /// 解毒剂覆盖校验：稳定事实裁剪前校验解毒剂覆盖（缺省启用）
-    #[serde(default = "default_gov_true")]
-    pub antidote_check: bool,
-    /// 坑账本文件路径（缺省 None = 由装配层按工作区解析）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pit_ledger_path: Option<String>,
-    /// 注入预算帽（最大注入行数；PD-9 参数包）
-    #[serde(default = "default_pit_budget")]
-    pub pit_budget_lines: usize,
-}
-
-fn default_gov_true() -> bool {
-    true
-}
-
-fn default_pit_budget() -> usize {
-    50
-}
-
-impl Default for GovernancePackConfig {
-    fn default() -> Self {
-        Self {
-            handover_gate: true,
-            pit_injection: true,
-            antidote_check: true,
-            pit_ledger_path: None,
-            pit_budget_lines: 50,
-        }
-    }
-}
 
 impl AgentDefinition {
     /// 审查结论账面值(过审凭据;"pass@" + 规则集版本)

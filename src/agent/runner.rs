@@ -1533,6 +1533,16 @@ pub struct AgentRunner {
     /// ——CLI/子代理路径零改动)。run_streaming_inner 创建会话时在此目录建
     /// `{session_id}.jsonl` 事件流(会话唯一真相源,见 crate::agent::journal)
     journal_dir: Option<std::path::PathBuf>,
+    /// 会话治理包(独立运行时插件,不走 definition 字段管道)。装载点=
+    /// [`Self::with_journal_dir`]:journal 约定形 `<workspace>/data/sessions`
+    /// 反推工作区根,从 `<workspace>/governance.json` 读配置——缺文件=None=
+    /// 治理面整体关闭=现状行为(缺省不变式)
+    governance: Option<crate::agent::governance::GovernancePack>,
+    /// 治理包工作区根(装载时与包一同记录;handover 收尾检查的锚定目录)
+    governance_workspace: Option<std::path::PathBuf>,
+    /// 坑账本注入段(装载期按触及面关键词过滤+预算帽渲染一次;None=不注入,
+    /// 治理段槽位与现行为逐字节一致)
+    governance_pit_segment: Option<String>,
     /// 会话执行环境 profile 标记(serve 请求级>定义级、CLI 定义级
     /// 显式声明才注入)。随 tool_result 落账进 journal——trusted 环境下工具
     /// 结果在审计事件中明文可追溯。None=既有行为零变化(旧账无标记语义)
@@ -1745,6 +1755,9 @@ impl AgentRunner {
                 crate::agent::tool_trace::ToolTraceCollector::default(),
             )),
             journal_dir: None,
+            governance: None,
+            governance_workspace: None,
+            governance_pit_segment: None,
             execution_profile: None,
             compaction_policy: None,
             acceptance_command: None,
@@ -2173,6 +2186,32 @@ impl AgentRunner {
         self.llm_handler.config_max_tokens_for_test()
     }
 
+    /// 测试观测口:会话治理包装载态(None=工作区无 governance.json=整体关闭)
+    #[cfg(test)]
+    pub(crate) fn governance_pack_for_test(
+        &self,
+    ) -> Option<&crate::agent::governance::GovernancePack> {
+        self.governance.as_ref()
+    }
+
+    /// 测试观测口:坑账本注入段渲染产物
+    #[cfg(test)]
+    pub(crate) fn governance_pit_segment_for_test(&self) -> Option<&str> {
+        self.governance_pit_segment.as_deref()
+    }
+
+    /// 测试观测口:治理包工作区根
+    #[cfg(test)]
+    pub(crate) fn governance_workspace_for_test(&self) -> Option<&std::path::Path> {
+        self.governance_workspace.as_deref()
+    }
+
+    /// 测试观测口:治理槽位合并产物(serve 构造期治理段+注入段)
+    #[cfg(test)]
+    pub(crate) fn governance_slot_for_test(&self) -> Option<String> {
+        self.governance_segment_with_pit()
+    }
+
     /// TODO: doc
     pub fn with_tool_handler(mut self, tool_handler: ToolHandler) -> Self {
         self.tool_handler = tool_handler;
@@ -2531,8 +2570,28 @@ impl AgentRunner {
     /// B21 PR-1:注入 journal 目录(serve 模式;启用会话事件流落盘)。
     /// 注入后 run_streaming_inner 每会话创建 `data/sessions/{sid}.jsonl`
     /// 唯一真相源;不注入(默认)行为零变化。
+    ///
+    /// 会话治理包装载点：journal 约定形 `<workspace>/data/sessions` 反推
+    /// 工作区根，从 `<workspace>/governance.json` 读治理配置（CLI/serve
+    /// 全路径共用本单点；缺文件=None=治理面整体关闭=现状行为。独立运行时
+    /// 插件，不走 definition 字段管道）。坑账本注入段在此一并渲染一次
+    /// （触及面=本会话工具面+agent 类型；预算帽内截断）。
     pub fn with_journal_dir(mut self, dir: std::path::PathBuf) -> Self {
-        self.journal_dir = Some(dir);
+        self.journal_dir = Some(dir.clone());
+        if self.governance.is_none() {
+            if let Some(ws) = dir.parent().and_then(std::path::Path::parent) {
+                if let Some(pack) = crate::agent::governance::GovernancePack::from_workspace(ws) {
+                    let mut keywords: Vec<&str> =
+                        self.config.tool_names.iter().map(String::as_str).collect();
+                    keywords.push(self.config.agent_type.as_str());
+                    let lines = pack.pit_inject(ws, &keywords);
+                    self.governance_pit_segment =
+                        crate::agent::governance::GovernancePack::render_pit_segment(&lines);
+                    self.governance_workspace = Some(ws.to_path_buf());
+                    self.governance = Some(pack);
+                }
+            }
+        }
         self
     }
 
@@ -3088,6 +3147,20 @@ impl AgentRunner {
     pub fn with_governance_segment(mut self, segment: Option<String>) -> Self {
         self.config.governance_segment = segment;
         self
+    }
+
+    /// 会话治理槽位合并：serve 构造期治理段 + 坑账本注入段（装载期渲染）。
+    /// 两者皆 None=返回 None=槽位缺席=与现行为逐字节一致。
+    fn governance_segment_with_pit(&self) -> Option<String> {
+        match (
+            self.config.governance_segment.as_deref(),
+            self.governance_pit_segment.as_deref(),
+        ) {
+            (Some(base), Some(pit)) => Some(format!("{base}\n\n{pit}")),
+            (Some(base), None) => Some(base.to_string()),
+            (None, Some(pit)) => Some(pit.to_string()),
+            (None, None) => None,
+        }
     }
 
     /// G18:追加一个事件回调
@@ -3735,6 +3808,13 @@ impl AgentRunner {
                 }
                 ledger.record_session_end(self.session_turns).await;
             }
+            // 会话治理包收尾闸：会话收尾检查 handover 是否已写（未接线=零行为；
+            // warn 通道提醒，不阻断收尾流程）
+            if let (Some(pack), Some(ws)) = (&self.governance, &self.governance_workspace) {
+                if let Some(warning) = pack.handover_check(ws, self.session_turns) {
+                    warn!(session_id = %session_id, "{}", warning);
+                }
+            }
             if let Some(j) = journal {
                 if let Err(e) = j.sediment_performed(
                     result.summary_written,
@@ -3952,6 +4032,10 @@ impl AgentRunner {
         }
 
         // C2: 召回顺序修复 —— recall 在组装之前
+        // 会话治理包接线同步：antidote 校验随记忆预算裁剪生效（幂等；未装载=零操作）
+        if let (Some(mem), Some(pack)) = (self.memory.as_mut(), self.governance.clone()) {
+            mem.set_governance_if_absent(pack);
+        }
         let recall = match self.memory.as_ref() {
             Some(mem) => {
                 mem.recall_context(
@@ -3982,6 +4066,9 @@ impl AgentRunner {
         };
         // S2d 服务目录段(service_tools 注册面渲染;None=零注册静默跳过)
         let service_catalog_segment = crate::service_tools::render_service_catalog();
+        // 会话治理包坑账注入段与 serve 构造期治理段合并入同一槽位
+        // (两者皆 None=槽位 None=与现行为逐字节一致)
+        let governance_slot = self.governance_segment_with_pit();
         // γ 批 B-268:动态区外移分叉(配方 mechanism_messages 开启时,记忆分区/
         // Handoff Base/todo 渲染进独立机制消息,静态区跨轮字节级稳定;关闭态
         // 机制消息 None,system_prompt 与现行为逐字节一致)
@@ -3998,7 +4085,7 @@ impl AgentRunner {
                 skills: self.config.skills.as_deref(),
                 skills_notice: self.config.skills_notice.as_deref(),
                 handoff: self.config.handoff.as_ref(),
-                governance_segment: self.config.governance_segment.as_deref(),
+                governance_segment: governance_slot.as_deref(),
                 knowledge_segment: knowledge_segment.as_deref(),
                 // 项目记忆段(AGENTS.md 层级)入静态区槽位(知识契约之后、
                 // 记忆召回之前)——内容仅随文件编辑变化,跨轮字节级稳定,
@@ -5318,6 +5405,12 @@ impl AgentRunner {
                     crate::agent::tool_trace::ToolTraceCollector::default(),
                 )),
                 journal_dir: journal_dir.clone(),
+                // 会话治理包:子代理不继承(handover 收尾闸/pit 注入属会话级
+                // 治理面,锚定主会话工作区;缺省不变式——与快照/verify 同款
+                // 子代理不接线口径)
+                governance: None,
+                governance_workspace: None,
+                governance_pit_segment: None,
                 acceptance_command: acceptance_command.clone(),
                 // G4:子代理不继承判据生成开关(生成判据=父任务开工时的内存锁态,
                 // 跨 runner 实例不继承;子任务门禁走静态判据穿线,本字段恒 false
@@ -8238,6 +8331,13 @@ impl AgentRunner {
                            }
 
                            // C2: 召回顺序修复 —— recall 在组装之前
+                           // 会话治理包接线同步：antidote 校验随记忆预算裁剪生效
+                           // （幂等；未装载=零操作）
+                           if let (Some(mem), Some(pack)) =
+                               (runner.memory.as_mut(), runner.governance.clone())
+                           {
+                               mem.set_governance_if_absent(pack);
+                           }
                            let mut recall = match runner.memory.as_ref() {
                                Some(mem) => mem.recall_context(
                                    &goal,
@@ -8287,6 +8387,9 @@ impl AgentRunner {
                            // S2d 服务目录段(同 run() 组装点口径)
                            let service_catalog_segment =
                                crate::service_tools::render_service_catalog();
+                           // 会话治理包坑账注入段与 serve 构造期治理段合并同一槽位
+                           // (两者皆 None=槽位 None=与现行为逐字节一致)
+                           let governance_slot = runner.governance_segment_with_pit();
                            // γ 批 B-268:动态区外移分叉(同 run() 组装点口径——
                            // 配方 mechanism_messages 开启时动态区渲染进独立机制
                            // 消息;关闭态机制消息 None,system_prompt 逐字节现行为)
@@ -8302,7 +8405,7 @@ impl AgentRunner {
                                    skills: runner.config.skills.as_deref(),
                                    skills_notice: runner.config.skills_notice.as_deref(),
                                    handoff: runner.config.handoff.as_ref(),
-                                   governance_segment: runner.config.governance_segment.as_deref(),
+                                   governance_segment: governance_slot.as_deref(),
                                    knowledge_segment: knowledge_segment.as_deref(),
                                    // 项目记忆段(AGENTS.md 层级)入静态区槽位——
                                    // 与 run() 路径同口径,跨轮前缀稳定

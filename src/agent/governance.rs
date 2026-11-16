@@ -8,11 +8,14 @@
 //!
 //! ## 机制
 //!
-//! - [`GovernancePack::handover_check`]: 长会话退出时检查 handover 文件是否已写
-//! - [`GovernancePack::pit_inject`]: 按触及面过滤注入坑账本条目（预算帽内）
-//! - [`GovernancePack::antidote_check`]: 稳定事实裁剪前校验解毒剂覆盖
+//! - 会话收尾检查 [`GovernancePack::handover_check`]：长会话退出时检查 handover
+//!   文件是否已写
+//! - 坑账本注入 [`GovernancePack::pit_inject`]：按触及面过滤注入坑账本条目
+//!   （预算帽内）
+//! - 解毒剂校验 [`GovernancePack::antidote_check`]：稳定事实裁剪前校验解毒剂
+//!   覆盖
 //!
-//! ## 激活形态（D6 裁定 A）
+//! ## 激活形态
 //!
 //! 工作区内放 `governance.json` 即激活（缺省不存在=关闭=现状行为）。
 //! 本机装机在 workspace 下放一份即可，公开仓零影响。
@@ -22,7 +25,7 @@
 //! 本模块为运行时独立插件，不走 definition/config struct 管道——
 //! 零级联初始化器改动、零公开面触发。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// 治理包配置（从工作区 `governance.json` 读取）
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -39,7 +42,7 @@ pub struct GovernancePack {
     /// 坑账本文件路径（相对工作区）
     #[serde(default = "default_pit_path")]
     pub pit_ledger_path: String,
-    /// 注入预算帽（最大注入行数；PD-9 参数包）
+    /// 注入预算帽（最大注入行数）
     #[serde(default = "default_budget")]
     pub pit_budget_lines: usize,
 }
@@ -80,7 +83,7 @@ impl GovernancePack {
     ///
     /// 返回 Some(warning) = 需要 agent 注意（未写 handover）
     /// 返回 None = 通过（handover 已写或 gate 关闭）
-    pub fn handover_check(&self, workdir: &Path, turns: usize) -> Option<String> {
+    pub fn handover_check(&self, workdir: &Path, turns: u64) -> Option<String> {
         if !self.handover_gate || turns == 0 {
             return None;
         }
@@ -133,12 +136,32 @@ impl GovernancePack {
         if !self.antidote_check {
             return Vec::new();
         }
-        // 有解毒剂标记 = 行内含 "antidote" 或 "解毒"
-        // 无标记 = 需要补充覆盖
-        facts
-            .iter()
-            .filter(|f| !f.contains("antidote") && !f.contains("解毒"))
-            .collect()
+        facts.iter().filter(|f| self.lacks_antidote(f)).collect()
+    }
+
+    /// 单条事实的解毒剂覆盖判定（[`Self::antidote_check`] 的单源判定核心）
+    ///
+    /// 有解毒剂标记 = 行内含 "antidote" 或 "解毒"；无标记 = 缺乏覆盖
+    pub fn lacks_antidote(&self, fact: &str) -> bool {
+        !fact.contains("antidote") && !fact.contains("解毒")
+    }
+
+    /// 坑账本注入段渲染（[`Self::pit_inject`] 产物 → 系统提示槽位段）
+    ///
+    /// 空列表 = None（槽位静默跳过，与未注入形态逐字节一致）
+    pub fn render_pit_segment(lines: &[String]) -> Option<String> {
+        if lines.is_empty() {
+            return None;
+        }
+        let mut seg = String::from(
+            "## Governance Pits\n\n以下为工作区坑账本中与本会话触及面相关的条目（触及面过滤+预算帽内截断）：\n",
+        );
+        for line in lines {
+            seg.push_str("- ");
+            seg.push_str(line);
+            seg.push('\n');
+        }
+        Some(seg)
     }
 }
 
@@ -157,7 +180,11 @@ mod tests {
     fn test_from_workspace_valid_config() {
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("governance.json");
-        fs::write(&cfg_path, r#"{"handover_gate": true, "pit_budget_lines": 20}"#).unwrap();
+        fs::write(
+            &cfg_path,
+            r#"{"handover_gate": true, "pit_budget_lines": 20}"#,
+        )
+        .unwrap();
         let pack = GovernancePack::from_workspace(dir.path()).unwrap();
         assert!(pack.handover_gate);
         assert_eq!(pack.pit_budget_lines, 20);
@@ -203,9 +230,7 @@ mod tests {
     fn test_pit_inject_respects_budget() {
         let dir = tempfile::tempdir().unwrap();
         let pit = dir.path().join("PITS.md");
-        let content: String = (0..100)
-            .map(|i| format!("- git 坑 {}\n", i))
-            .collect();
+        let content: String = (0..100).map(|i| format!("- git 坑 {}\n", i)).collect();
         fs::write(&pit, &content).unwrap();
         let pack = GovernancePack {
             pit_ledger_path: pit.to_string_lossy().to_string(),
@@ -226,5 +251,37 @@ mod tests {
         ];
         let uncovered = pack.antidote_check(&facts);
         assert_eq!(uncovered.len(), 2);
+    }
+
+    #[test]
+    fn test_antidote_check_disabled_returns_empty() {
+        let pack = GovernancePack {
+            antidote_check: false,
+            ..Default::default()
+        };
+        let facts = vec!["bare fact without marker".to_string()];
+        assert!(pack.antidote_check(&facts).is_empty());
+    }
+
+    #[test]
+    fn test_lacks_antidote_single_source() {
+        let pack = GovernancePack::default();
+        assert!(!pack.lacks_antidote("fact with antidote marker"));
+        assert!(!pack.lacks_antidote("含解毒标记的事实"));
+        assert!(pack.lacks_antidote("bare fact"));
+    }
+
+    #[test]
+    fn test_render_pit_segment_empty_is_none() {
+        assert!(GovernancePack::render_pit_segment(&[]).is_none());
+    }
+
+    #[test]
+    fn test_render_pit_segment_lists_lines() {
+        let lines = vec!["坑一条目".to_string(), "坑二条目".to_string()];
+        let seg = GovernancePack::render_pit_segment(&lines).unwrap();
+        assert!(seg.starts_with("## Governance Pits"));
+        assert!(seg.contains("- 坑一条目"));
+        assert!(seg.contains("- 坑二条目"));
     }
 }

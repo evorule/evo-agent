@@ -100,6 +100,95 @@ fn workspace_checkpoint_writable_dir_variant() {
     assert_eq!(store.writable_dir(), std::path::Path::new("."));
 }
 
+/// 会话治理包装载契约:journal 约定形反推工作区根,从 `<ws>/governance.json`
+/// 读配置;缺文件=整体关闭(None)=现状行为(缺省不变式)
+#[test]
+fn governance_pack_loaded_from_workspace_via_journal_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("data").join("sessions")).unwrap();
+    std::fs::write(ws.join("governance.json"), r#"{"pit_budget_lines": 7}"#).unwrap();
+    std::fs::create_dir_all(ws.join("skills")).unwrap();
+    std::fs::write(
+        ws.join("skills").join("PITS.md"),
+        "- shell_exec 超时勿重试同一失败动作\n- 与触及面无关的条目\n",
+    )
+    .unwrap();
+
+    let config = AgentConfig {
+        tool_names: vec!["shell_exec".to_string()],
+        ..AgentConfig::default()
+    };
+    let runner = AgentRunner::new(config, make_test_client())
+        .with_journal_dir(ws.join("data").join("sessions"));
+
+    let pack = runner
+        .governance_pack_for_test()
+        .expect("governance loaded");
+    assert_eq!(pack.pit_budget_lines, 7, "governance.json 字段生效");
+    assert_eq!(
+        runner.governance_workspace_for_test(),
+        Some(ws),
+        "工作区根随包一同记录"
+    );
+    let pit = runner
+        .governance_pit_segment_for_test()
+        .expect("pit segment rendered");
+    assert!(pit.contains("## Governance Pits"));
+    assert!(pit.contains("shell_exec"), "触及面关键词命中条目入段");
+    assert!(!pit.contains("与触及面无关"), "未命中条目不入段");
+
+    // 治理槽位合并:仅注入段在场时,槽位=注入段
+    let slot = runner.governance_slot_for_test().expect("slot merged");
+    assert!(slot.contains("## Governance Pits"));
+}
+
+/// 治理段合并槽位契约:serve 构造期治理段与注入段双在场时拼接序=治理段→注入段
+#[test]
+fn governance_slot_merges_base_segment_and_pit_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("data").join("sessions")).unwrap();
+    std::fs::write(ws.join("governance.json"), r#"{}"#).unwrap();
+    std::fs::create_dir_all(ws.join("skills")).unwrap();
+    std::fs::write(ws.join("skills").join("PITS.md"), "- shell_exec 坑\n").unwrap();
+
+    let config = AgentConfig {
+        tool_names: vec!["shell_exec".to_string()],
+        governance_segment: Some("BASE".to_string()),
+        ..AgentConfig::default()
+    };
+    let runner = AgentRunner::new(config, make_test_client())
+        .with_journal_dir(ws.join("data").join("sessions"));
+    let slot = runner.governance_slot_for_test().expect("slot merged");
+    let base_pos = slot.find("BASE").expect("base preserved");
+    let pit_pos = slot.find("## Governance Pits").expect("pit appended");
+    assert!(base_pos < pit_pos, "拼接序=治理段→注入段");
+}
+
+/// 缺省不变式:工作区无 governance.json=治理面整体关闭,槽位原样
+#[test]
+fn governance_absent_leaves_runner_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("data").join("sessions")).unwrap();
+
+    let config = AgentConfig {
+        governance_segment: Some("BASE".to_string()),
+        ..AgentConfig::default()
+    };
+    let runner = AgentRunner::new(config, make_test_client())
+        .with_journal_dir(ws.join("data").join("sessions"));
+    assert!(runner.governance_pack_for_test().is_none());
+    assert!(runner.governance_workspace_for_test().is_none());
+    assert!(runner.governance_pit_segment_for_test().is_none());
+    assert_eq!(
+        runner.governance_slot_for_test().as_deref(),
+        Some("BASE"),
+        "无治理包=槽位=serve 构造期治理段原样"
+    );
+}
+
 #[test]
 fn test_agent_config_default() {
     let config = AgentConfig::default();

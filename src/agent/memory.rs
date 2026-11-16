@@ -1014,6 +1014,9 @@ pub struct ContextBudget {
     pub total_window: usize,
     /// 记忆区占比（默认 0.25，clamp 0.1-0.5）
     pub memory_budget_ratio: f32,
+    /// 会话治理包（可选接线；None=未装载=antidote 校验整体跳过=裁剪行为
+    /// 与通知面逐字节现状）。校验产物只进降级通知通道，零改写记忆内容
+    governance: Option<crate::agent::governance::GovernancePack>,
 }
 
 impl Default for ContextBudget {
@@ -1021,6 +1024,7 @@ impl Default for ContextBudget {
         Self {
             total_window: 0,
             memory_budget_ratio: 0.25,
+            governance: None,
         }
     }
 }
@@ -1031,6 +1035,15 @@ impl ContextBudget {
         Self {
             total_window,
             memory_budget_ratio: memory_budget_ratio.clamp(0.1, 0.5),
+            governance: None,
+        }
+    }
+
+    /// 注入会话治理包（幂等：已有装载不覆盖）。antidote 校验在 fit_recall
+    /// 的稳定层裁剪前消费（由 MemoryManager 渲染路径接线传递）
+    pub fn set_governance_if_absent(&mut self, pack: crate::agent::governance::GovernancePack) {
+        if self.governance.is_none() {
+            self.governance = Some(pack);
         }
     }
 
@@ -1101,6 +1114,15 @@ impl ContextBudget {
                 used > budget
             })
             .unwrap_or(recall.stable.len());
+        // 治理包 antidote 校验：被裁稳定事实快照（裁剪前取；未接线=空=零开销）
+        let trimmed_stable: Vec<(String, String)> = if self.governance.is_some() {
+            recall.stable[cut_stable..]
+                .iter()
+                .map(|r| (r.key.clone(), r.value.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         recall.stable.truncate(cut_stable);
         if cut_stable < stable_total {
             recall.degradation_notices.push(format!(
@@ -1110,6 +1132,7 @@ impl ContextBudget {
                 budget
             ));
         }
+        self.push_antidote_notice(recall, &trimmed_stable);
         if used > budget {
             if !recall.summaries.is_empty() || !recall.events.is_empty() {
                 recall.degradation_notices.push(format!(
@@ -1202,6 +1225,16 @@ impl ContextBudget {
                     used > budget
                 })
                 .unwrap_or(total);
+            // 治理包 antidote 校验：被裁稳定事实快照（裁剪前取；未接线=空=零开销）
+            let trimmed_stable: Vec<(String, String)> =
+                if *layer == "stable" && self.governance.is_some() {
+                    list[cut..]
+                        .iter()
+                        .map(|r| (r.key.clone(), r.value.clone()))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             list.truncate(cut);
             if cut < total {
                 recall.degradation_notices.push(format!(
@@ -1212,6 +1245,7 @@ impl ContextBudget {
                     budget
                 ));
             }
+            self.push_antidote_notice(recall, &trimmed_stable);
             if used > budget {
                 // 该层已耗尽预算：按给定序，当前层之后的层整体清空（fail-visible）
                 let cur = order.iter().position(|l| *l == name).unwrap_or(0);
@@ -1250,6 +1284,41 @@ impl ContextBudget {
                 return;
             }
         }
+    }
+
+    /// 治理包 antidote 校验通知：被裁稳定事实中无解毒剂覆盖的标红
+    /// （fail-visible：R11 同款"裁剪不得静默"口径；未接线/空快照=零通知，
+    /// 与现行为逐字节一致）。输入=裁剪前的 (key, value) 快照对。
+    fn push_antidote_notice(&self, recall: &mut RecallContext, trimmed: &[(String, String)]) {
+        let Some(pack) = &self.governance else {
+            return;
+        };
+        if trimmed.is_empty() {
+            return;
+        }
+        let flagged: Vec<&str> = trimmed
+            .iter()
+            .filter(|(_, v)| pack.lacks_antidote(v))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        if flagged.is_empty() {
+            return;
+        }
+        // 键清单展示帽：前 8 个键+溢出计数（通知体量有界，确定性选取）
+        const SHOW_LIMIT: usize = 8;
+        let shown = if flagged.len() <= SHOW_LIMIT {
+            flagged.join(", ")
+        } else {
+            format!(
+                "{} …(+{} more)",
+                flagged[..SHOW_LIMIT].join(", "),
+                flagged.len() - SHOW_LIMIT
+            )
+        };
+        recall.degradation_notices.push(format!(
+            "governance: antidote 校验标红 {} 条无解毒剂覆盖的被裁稳定事实: {shown}",
+            flagged.len(),
+        ));
     }
 
     /// C3: 弹性预算 —— 记忆区未用满时，剩余还给 messages
@@ -1470,6 +1539,9 @@ pub struct MemoryManager {
     /// 服务端共享账压实调度档（缺省 off=零动作；清扫轮尾部调度 marker，
     /// 共享事实物理释放经服务端压实路径——agent 本地覆写不产生磁盘回收）。
     shared_server: crate::agent::storage_retention::SharedServerCompaction,
+    /// 会话治理包（可选接线；None=未装载=antidote 校验整体跳过=现状行为）。
+    /// runner 在会话启动路径幂等注入；渲染路径接线传递给 ContextBudget
+    governance: Option<crate::agent::governance::GovernancePack>,
 }
 
 /// 投影读取的三种结果（改进1：读路径"投影优先 + cache 离线兜底"）
@@ -1512,6 +1584,7 @@ impl MemoryManager {
             decay: crate::agent::memory_decay::DecayPolicy::default(),
             retention: crate::agent::storage_retention::StorageRetentionPolicy::default(),
             shared_server: crate::agent::storage_retention::SharedServerCompaction::default(),
+            governance: None,
         }
     }
 
@@ -1525,6 +1598,14 @@ impl MemoryManager {
     ) -> Self {
         self.safety_auditor = std::sync::Arc::new(auditor);
         self
+    }
+
+    /// 注入会话治理包（幂等：已有装载不覆盖）。runner 在会话启动路径调用；
+    /// antidote 校验在渲染路径接线传递给 ContextBudget（fit_recall 裁剪前消费）
+    pub fn set_governance_if_absent(&mut self, pack: crate::agent::governance::GovernancePack) {
+        if self.governance.is_none() {
+            self.governance = Some(pack);
+        }
     }
 
     /// 设置 session_id（builder 风格）
@@ -4316,6 +4397,12 @@ impl MemoryManager {
         // 预算截断（降级序：Recipe 声明优先——非默认合法序按声明执行；
         // 缺省/默认序/非法序回退历史原实现，Q9 冻结语义逐字节保真）
         let mut recall = recall.clone();
+        // 治理包 antidote 校验接线传递（MemoryManager→ContextBudget）：
+        // 未装载=零字段=裁剪行为与通知面逐字节现状
+        let mut budget = budget.clone();
+        if let Some(pack) = &self.governance {
+            budget.set_governance_if_absent(pack.clone());
+        }
         if let Some(order) = self.degradation_order_override() {
             let refs: Vec<&str> = order.iter().map(String::as_str).collect();
             budget.fit_recall_ordered(&mut recall, &refs);
@@ -7715,6 +7802,91 @@ mod tests {
         assert!(
             recall_ok.degradation_notices.is_empty(),
             "无裁剪时不得伪造降级通知"
+        );
+    }
+
+    #[test]
+    fn test_fit_recall_antidote_notice_flags_uncovered_trimmed() {
+        // 治理包 antidote 校验：被裁稳定事实中无解毒剂覆盖的标红(fail-visible)；
+        // 有解毒剂标记的被裁条目不标红
+        let mut budget = ContextBudget::new(40, 0.25); // cap=10 token
+        budget.set_governance_if_absent(crate::agent::governance::GovernancePack::default());
+        let mut recall = RecallContext::default();
+        recall.stable.push(MemoryRecord::new(
+            "has_antidote",
+            &format!("{} antidote", "x".repeat(60)),
+            1000,
+        ));
+        recall
+            .stable
+            .push(MemoryRecord::new("bare_fact", &"y".repeat(60), 2000));
+
+        budget.fit_recall(&mut recall);
+        assert!(recall.stable.is_empty(), "预算帽内两条全裁");
+        let joined = recall.degradation_notices.join("\n");
+        assert!(
+            joined.contains("antidote 校验标红"),
+            "无解毒剂覆盖的被裁事实须标红: {joined}"
+        );
+        assert!(
+            joined.ends_with("被裁稳定事实: bare_fact"),
+            "标红须点名条目键(有标记者不得入列): {joined}"
+        );
+    }
+
+    #[test]
+    fn test_fit_recall_no_antidote_notice_without_governance() {
+        // 缺省不变式：未接线=零 antidote 通知，通知面与现行为逐字节一致
+        let budget = ContextBudget::new(40, 0.25);
+        let mut recall = RecallContext::default();
+        recall
+            .stable
+            .push(MemoryRecord::new("bare_fact", &"y".repeat(60), 2000));
+        budget.fit_recall(&mut recall);
+        assert!(recall.stable.is_empty());
+        let joined = recall.degradation_notices.join("\n");
+        assert!(
+            joined.contains("memory budget"),
+            "标准预算通知在场: {joined}"
+        );
+        assert!(
+            !joined.contains("antidote"),
+            "未接线不得有 antidote 通知: {joined}"
+        );
+    }
+
+    #[test]
+    fn test_fit_recall_ordered_antidote_notice() {
+        // 序驱动路径(Recipe 声明序)同口径：stable 层被裁事实 antidote 标红
+        let mut budget = ContextBudget::new(40, 0.25);
+        budget.set_governance_if_absent(crate::agent::governance::GovernancePack::default());
+        let mut recall = RecallContext::default();
+        recall
+            .stable
+            .push(MemoryRecord::new("bare_fact", &"z".repeat(60), 3000));
+        budget.fit_recall_ordered(&mut recall, &["stable", "summaries", "events"]);
+        let joined = recall.degradation_notices.join("\n");
+        assert!(
+            joined.ends_with("被裁稳定事实: bare_fact"),
+            "序驱动路径同口径标红: {joined}"
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_with_recall_passes_governance_to_budget() {
+        // 接线传递契约：MemoryManager 装载治理包后，渲染路径的预算裁剪
+        // 携带 antidote 校验（通知随 prompt 全文可见）
+        let mut mem = MemoryManager::new("test", make_test_client());
+        mem.set_governance_if_absent(crate::agent::governance::GovernancePack::default());
+        let mut recall = RecallContext::default();
+        recall
+            .stable
+            .push(MemoryRecord::new("bare_fact", &"z".repeat(60), 3000));
+        let budget = ContextBudget::new(40, 0.25);
+        let prompt = mem.build_system_prompt_with_recall("base", &recall, &budget);
+        assert!(
+            prompt.contains("antidote 校验标红"),
+            "接线传递生效: {prompt}"
         );
     }
 
