@@ -19,6 +19,7 @@ pub mod constitution;
 pub mod context_inspector;
 pub mod context_window;
 pub mod definition;
+pub mod governance;
 pub mod delegate;
 pub mod driver;
 pub mod event_ledger;
