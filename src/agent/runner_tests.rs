@@ -4355,11 +4355,14 @@ fn p2_adjudication_table_matches_design() {
     // stash/bisect 工具族批一(2026-11-17):git_stash 落地 Sensitive
     // (git 写族同通道——改工作树状态意图必报),集合演进 32→33(新增
     // 条目已 diff 审)。
+    // stash/bisect 工具族批二(2026-11-17):git_bisect 落地 Sensitive
+    // (detached HEAD 走动=最强状态改变器,意图必报),集合演进 33→34
+    // (新增条目已 diff 审)。
     let p2_count = crate::agent::tool_manifest::static_manifests()
         .iter()
         .filter(|m| m.is_p2_adjudicated())
         .count();
-    assert_eq!(p2_count, 33);
+    assert_eq!(p2_count, 34);
     for t in [
         "file_create",
         "file_move",

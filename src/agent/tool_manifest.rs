@@ -552,6 +552,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // stash/bisect 工具族批一:工作树暂存自动化——写族通道
         // (改工作树状态,误判代价高于 stage);单工具 action 面,同 worktree 先例
         b("git_stash", vec![GitWrite]),
+        // stash/bisect 工具族批二:回归定位二分自动化——detached HEAD 走动+
+        // BISECT_* 状态文件=git 面最强状态改变器,同写族通道
+        b("git_bisect", vec![GitWrite]),
         // 查账工具族（工具面统一架构 PR-11a）：会话账面只读查询——journal
         // 事件流/工具轨迹/文件现势+staleness/两段文本比对。全部 Standard
         // （免裁决但落账：查账自身入账）+ AutoPolicy（查账是减错动作本身，
@@ -666,7 +669,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             // git 写族：P2 裁决在通道；D1 建议上 enforce（PR-5 规则正本入库时
             // 追加，升级 Sentineled），manifest 先如实标 Sensitive；
             // 同为 candidate 审批模式
-            "git_stage" | "git_commit" | "git_stash" => {
+            "git_stage" | "git_commit" | "git_stash" | "git_bisect" => {
                 m.adjudication_class = AdjudicationClass::Sensitive;
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }
@@ -733,7 +736,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             // 批K 段3:符号图谱检索,默认开(纯读面,同 grep 先例)
             "code_search" => sw(SWITCH_CODE_SEARCH, true),
             "git_status" | "git_diff" | "git_log" => sw(SWITCH_GIT_READ, true),
-            "git_stage" | "git_commit" | "git_stash" => sw(SWITCH_GIT_WRITE, false),
+            "git_stage" | "git_commit" | "git_stash" | "git_bisect" => sw(SWITCH_GIT_WRITE, false),
             // 自主交接族：单键同绑同开同关（自主交接设计 §四；PR-H3 起
             // session_spawn 第三行同键接入）
             "handover_write" | "handover_read" | "session_spawn" => sw(SWITCH_HANDOVER, true),
@@ -1171,9 +1174,11 @@ mod tests {
         //     数量锁 111→112；Sensitive 同 delegate 风险面）
         //   （stash/bisect 工具族批一 git_stash +1：数量锁
         //     113→114；Sensitive 同 git 写族面）
-        assert_eq!(builtin_manifests().len(), 46);
+        //   （stash/bisect 工具族批二 git_bisect +1：数量锁
+        //     114→115；Sensitive 同 git 写族面）
+        assert_eq!(builtin_manifests().len(), 47);
         assert_eq!(rule_manifests().len(), 60);
-        assert_eq!(all().len(), 114);
+        assert_eq!(all().len(), 115);
     }
 
     #[test]
@@ -1201,9 +1206,9 @@ mod tests {
         names.push(delegate_manifest().name);
         names.push(delegate_many_manifest().name);
         names.extend(memory_manifests().iter().map(|m| m.name.clone()));
-        // 数量锁(与模块头「内置 44 + 规则 60 + delegate 2 + memory 6 = 112」
-        // 演进同源;计数漂移此处当场红)
-        assert_eq!(names.len(), 114, "static manifest count lock");
+        // 数量锁(与模块头「内置+规则+delegate+memory」演进同源;计数漂移
+        // 此处当场红)
+        assert_eq!(names.len(), 115, "static manifest count lock");
         let mut sorted = names.clone();
         sorted.sort();
         let before = sorted.len();
@@ -1389,6 +1394,7 @@ mod tests {
         "git_stage",
         "git_commit",
         "git_stash",
+        "git_bisect",
         "rule_create",
         "rule_update",
         "rule_submit",
@@ -1511,6 +1517,7 @@ mod tests {
         ("git_stage", "agentTools.gitWrite", false),
         ("git_commit", "agentTools.gitWrite", false),
         ("git_stash", "agentTools.gitWrite", false),
+        ("git_bisect", "agentTools.gitWrite", false),
         ("rule_create", "agentTools.governanceWrite", true),
         ("rule_update", "agentTools.governanceWrite", true),
         ("rule_submit", "agentTools.governanceWrite", true),
