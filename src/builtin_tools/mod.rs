@@ -343,7 +343,7 @@ fn default_safe_toolkit_core(
         worktree::WORKTREE_TOOL,
         Arc::new(worktree::WorktreeTool::wired(&workdir_buf)),
     );
-    // stash/bisect 工具族批一(design-107):工作树暂存自动化
+    // stash/bisect 工具族批一:工作树暂存自动化
     handler.register_static(
         git_stash::GIT_STASH_TOOL,
         Arc::new(git_stash::GitStashTool::wired(&workdir_buf)),
@@ -992,7 +992,7 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "git_stash".to_string(),
-            description: "Stash automation for the working tree (design-107): push uncommitted \
+            description: "Stash automation for the working tree: push uncommitted \
                           changes onto the stash stack with an optional message, list entries, \
                           show a stat summary, pop (restore + drop entry), apply (restore + keep \
                           entry) or drop one. Refs must be stash@{n} form; push requires a dirty \

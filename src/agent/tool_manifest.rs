@@ -549,7 +549,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         b("git_log", vec![GitRead]),
         b("git_stage", vec![GitWrite]),
         b("git_commit", vec![GitWrite]),
-        // stash/bisect 工具族批一(design-107):工作树暂存自动化——写族通道
+        // stash/bisect 工具族批一:工作树暂存自动化——写族通道
         // (改工作树状态,误判代价高于 stage);单工具 action 面,同 worktree 先例
         b("git_stash", vec![GitWrite]),
         // 查账工具族（工具面统一架构 PR-11a）：会话账面只读查询——journal
@@ -1169,7 +1169,7 @@ mod tests {
         //     GitWrite 域+基线审批档；主检出/保护分支拒删内建）
         //   （批量并行委托 delegate_many +1：delegate 系 Delegate 源 +1，
         //     数量锁 111→112；Sensitive 同 delegate 风险面）
-        //   （stash/bisect 工具族批一 git_stash +1：design-107，数量锁
+        //   （stash/bisect 工具族批一 git_stash +1：数量锁
         //     113→114；Sensitive 同 git 写族面）
         assert_eq!(builtin_manifests().len(), 46);
         assert_eq!(rule_manifests().len(), 60);
