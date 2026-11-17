@@ -92,6 +92,7 @@ pub mod tool_result_fetch;
 pub mod web_fetch;
 pub mod web_search;
 pub mod workspace_undo;
+pub mod worktree;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -333,6 +334,11 @@ fn default_safe_toolkit_core(
     handler.register_static(
         job_control::JOB_CONTROL_TOOL,
         Arc::new(job_control::JobControlTool::new()),
+    );
+    // dev-feedback P2: 多 worktree 自动化
+    handler.register_static(
+        worktree::WORKTREE_TOOL,
+        Arc::new(worktree::WorktreeTool::wired(&workdir_buf)),
     );
     handler.register_static("http_get", Arc::new(http_get::HttpGetTool::new()));
     // 批K 段2:网络面第二/三件——网页抓取取读(http_get 防线全量复用)与
@@ -924,6 +930,49 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     description: "action=read only: tail size cap in bytes (default \
                                   4096)."
                         .to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "worktree".to_string(),
+            description: "Automate git worktrees for parallel task isolation: list existing worktrees, add a detached checkout on a new branch, remove one when done (dirty worktrees require explicit force), prune stale admin metadata. Paths are workspace-sandboxed; the main worktree and protected branches (main/master) are never removed."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "action".to_string(),
+                    r#type: "string".to_string(),
+                    description: "One of: list, add, remove, prune.".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "path".to_string(),
+                    r#type: "string".to_string(),
+                    description: "add/remove: worktree path relative to the workspace root (e.g. .worktrees/feature-x).".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "branch".to_string(),
+                    r#type: "string".to_string(),
+                    description: "add: branch name to create (A-Za-z0-9._/-).".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "start_point".to_string(),
+                    r#type: "string".to_string(),
+                    description: "add optional: commit-ish to branch from (defaults to HEAD).".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "force".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "remove: discard uncommitted changes (default false).".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "delete_branch".to_string(),
+                    r#type: "string".to_string(),
+                    description: "remove optional: branch to delete after removal (main/master refused).".to_string(),
                     required: false,
                 },
             ],

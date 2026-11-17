@@ -510,6 +510,10 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 故 ReadOnly 显式标定,见下方读写分级臂;AutoPolicy 免裁决同
         // code_search 先例)
         b("codegraph", vec![Network]),
+        // dev-feedback P2: 多 worktree 自动化(并行任务隔离的机制化承载;
+        // 建仓检出保护/脏树 fail-visible/分支名白名单;GitWrite 域,
+        // 审批走基线档)
+        b("worktree", vec![GitWrite]),
         // dev-feedback P0a 余量:后台作业轮询面(与 shell_exec background=true
         // 启动面配对;只操作本 serve 自己收容的作业句柄,零新命令执行面;
         // kill 族级终止=写面语义,Mutating 保守缺省)
@@ -1132,9 +1136,9 @@ mod tests {
         //     107→108，桥不在场=fail-visible 不假装成功）
         //   （后台作业轮询面 job_control +1：内置 42→43，数量锁 108→109，
         //     只操作本 serve 收容的作业句柄，零新命令执行面）
-        assert_eq!(builtin_manifests().len(), 43);
+        assert_eq!(builtin_manifests().len(), 44);
         assert_eq!(rule_manifests().len(), 60);
-        assert_eq!(all().len(), 110);
+        assert_eq!(all().len(), 111);
     }
 
     #[test]
@@ -1163,7 +1167,7 @@ mod tests {
         names.extend(memory_manifests().iter().map(|m| m.name.clone()));
         // 数量锁(与模块头「内置 43 + 规则 60 + delegate 1 + memory 6 = 110」
         // 同源;计数漂移此处当场红)
-        assert_eq!(names.len(), 110, "static manifest count lock");
+        assert_eq!(names.len(), 111, "static manifest count lock");
         let mut sorted = names.clone();
         sorted.sort();
         let before = sorted.len();
