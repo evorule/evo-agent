@@ -76,6 +76,7 @@ pub mod file_move;
 pub mod file_read;
 pub mod file_write;
 pub mod fs_safety;
+pub mod git_stash;
 pub mod git_tools;
 pub mod grep_files;
 pub mod http_get;
@@ -341,6 +342,11 @@ fn default_safe_toolkit_core(
     handler.register_static(
         worktree::WORKTREE_TOOL,
         Arc::new(worktree::WorktreeTool::wired(&workdir_buf)),
+    );
+    // stash/bisect 工具族批一(design-107):工作树暂存自动化
+    handler.register_static(
+        git_stash::GIT_STASH_TOOL,
+        Arc::new(git_stash::GitStashTool::wired(&workdir_buf)),
     );
     handler.register_static("http_get", Arc::new(http_get::HttpGetTool::new()));
     // 批K 段2:网络面第二/三件——网页抓取取读(http_get 防线全量复用)与
@@ -980,6 +986,44 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     name: "delete_branch".to_string(),
                     r#type: "string".to_string(),
                     description: "remove optional: branch to delete after removal (main/master refused).".to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "git_stash".to_string(),
+            description: "Stash automation for the working tree (design-107): push uncommitted \
+                          changes onto the stash stack with an optional message, list entries, \
+                          show a stat summary, pop (restore + drop entry), apply (restore + keep \
+                          entry) or drop one. Refs must be stash@{n} form; push requires a dirty \
+                          tree and only captures tracked changes unless include_untracked=true; \
+                          pop/apply conflicts fail visibly with the entry preserved."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "action".to_string(),
+                    r#type: "string".to_string(),
+                    description: "One of: push, list, show, pop, apply, drop.".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "message".to_string(),
+                    r#type: "string".to_string(),
+                    description: "push optional: stash message.".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "include_untracked".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "push optional: also stash untracked files (default false - \
+                                  tracked changes only).".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "ref".to_string(),
+                    r#type: "string".to_string(),
+                    description: "show/pop/apply/drop optional: stash@{n} entry (default = latest)."
+                        .to_string(),
                     required: false,
                 },
             ],

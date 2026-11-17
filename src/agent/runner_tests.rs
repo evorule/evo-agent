@@ -4352,11 +4352,14 @@ fn p2_adjudication_table_matches_design() {
     // 批K 段5(2026-10-21):http_request 落地 Sensitive(写动词双闸——意图
     // 必报,Active host 亦审批),集合演进 30→31(数量锁 101,新增条目已
     // diff 审)。
+    // stash/bisect 工具族批一(2026-11-17):git_stash 落地 Sensitive
+    // (git 写族同通道——改工作树状态意图必报),集合演进 32→33(新增
+    // 条目已 diff 审)。
     let p2_count = crate::agent::tool_manifest::static_manifests()
         .iter()
         .filter(|m| m.is_p2_adjudicated())
         .count();
-    assert_eq!(p2_count, 32);
+    assert_eq!(p2_count, 33);
     for t in [
         "file_create",
         "file_move",
