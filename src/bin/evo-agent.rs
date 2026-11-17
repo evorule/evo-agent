@@ -1411,8 +1411,17 @@ fn cmd_run(
                 // 字段文档口径);serve 三面才存在治理段下放。
                 .with_journal_dir(workdir.join("data").join("sessions"))
                 .with_workspace_checkpoint(workdir)
-                .with_delegate_context(
-                    evo_agent::agent::delegate::DelegateContext::new(
+                .with_delegate_context({
+                    // delegate.maxConcurrent 设置面消费(与 serve 三面同口径:
+                    // 0/缺省=不限制=现行为零变化;>0=并行派发共享信号量帽;
+                    // 设置面读取失败回落 0,不阻塞会话构造)
+                    let cap = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+                        .map(|store| {
+                            let (merged, _) = store.merged();
+                            evo_agent::api::settings::delegate_max_concurrent(&merged)
+                        })
+                        .unwrap_or(0);
+                    let ctx = evo_agent::agent::delegate::DelegateContext::new(
                         agent_name,
                         mgr.clone(),
                         client.clone(),
@@ -1425,8 +1434,13 @@ fn cmd_run(
                     // 纯文本执行器,与 serve 面 B25 缺陷同源)
                     .with_toolkit(delegate_toolkit, workdir)
                     // 委托窗口 token 归账(差值随 SpawnRecord 落 journal)
-                    .with_token_counter(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
-                )
+                    .with_token_counter(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+                    if cap > 0 {
+                        ctx.with_max_concurrent_delegates(cap)
+                    } else {
+                        ctx
+                    }
+                })
                 .wire_accounting(workdir);
             // 启动期事实入链:注册降级等事件随本会话 journal 落账
             for ev in startup_service_events.iter() {
