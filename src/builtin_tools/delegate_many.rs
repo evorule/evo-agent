@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! `delegate_many` —— 批量并行子代理委托(P2 并行面;design-104 方案 A)。
+//! `delegate_many` —— 批量并行子代理委托(P2 并行面;批量委托设计批准稿)。
 //!
 //! 把 [`DelegateContext::delegate_parallel_with_context`](crate::agent::delegate::DelegateContext::delegate_parallel_with_context)
 //! (既有并发原语:信号量并发帽+递归死锁防线+join_all)暴露为 LLM 工具面——
 //! 单回合发一批子任务,并发执行,逐项结果回喂。
 //!
-//! ## 语义(design-104 批准稿)
+//! ## 语义(批量委托设计批准稿)
 //!
 //! - **EffectClass=Mutating 保持**:调度器视角=单调用串行(外层互斥);并发
 //!   在工具内部 join_all 展开——不重分类,不进 ReadOnly 臂;
 //! - **逐项 Result**:批内部分失败不整体失败——成功项回 `content`,失败项
-//!   回 `error`,LLM 逐项消费(design-104 D2 批准语义);
+//!   回 `error`,LLM 逐项消费(批量委托批准的逐项语义);
 //! - **并发帽**:ctx 既有 `max_concurrent` 信号量(缺省 None=批大小即并发数;
-//!   设置面=后续批,design-104 D3);
+//!   设置面=后续批(批量委托批准稿遗留项);
 //! - **注册面**:与 `delegate` 同——`with_delegate_context` 接线时注册;
-//!   LLM 可见性由 agent.json `tools` 列表决定(design-104 D1 批准=缺省面,
+//!   LLM 可见性由 agent.json `tools` 列表决定(批量委托批准=缺省面,
 //!   与 delegate 同暴露)。
 
 use serde_json::Value;
