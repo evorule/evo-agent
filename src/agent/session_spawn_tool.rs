@@ -121,7 +121,7 @@ pub struct ChainRuntimeState {
     budget_tokens: u64,
     max_chain_depth: u32,
     spawn_repeats: Mutex<SpawnRepeatGuard>,
-    /// 在册子会话清单（design-105 A1 观测闭环；spawn 成功时记录）
+    /// 在册子会话清单（观测闭环；spawn 成功时记录）
     children: Mutex<Vec<ChildRecord>>,
 }
 
@@ -136,7 +136,7 @@ pub struct ChildRecord {
     pub spawned_at_epoch_ms: u64,
 }
 
-/// 链宽度帽（同父在册子会话数上限；design-105 A2，v1=3 与链深硬顶对齐）
+/// 链宽度帽（同父在册子会话数上限；v1=3 与链深硬顶对齐）
 pub const MAX_CHAIN_BREADTH: usize = 3;
 
 /// 宽度帽检查（纯函数）：在册未收割子会话数达上限即拒
@@ -169,7 +169,7 @@ impl ChainRuntimeState {
         }
     }
 
-    /// 在册子会话记录（spawn 成功后调用；design-105 A1 观测闭环数据源）
+    /// 在册子会话记录（spawn 成功后调用；观测闭环数据源）
     pub fn record_child(&self, child_session_id: &str, first_goal: &str) {
         self.children
             .lock()
@@ -415,7 +415,7 @@ impl ToolFunction for SessionSpawnTool {
         // 护栏 2：链累计 token 预算
         let used = w.chain.tokens_used();
         check_budget(used, w.chain.budget_tokens())?;
-        // 护栏 2.5：链宽度帽（design-105 A2——同父在册子会话数上限；超帽
+        // 护栏 2.5：链宽度帽（同父在册子会话数上限；超帽
         // fail-visible，观测(chain_status list)或回收后重试）
         check_breadth(w.chain.children_count(), MAX_CHAIN_BREADTH)?;
 
@@ -432,7 +432,7 @@ impl ToolFunction for SessionSpawnTool {
         // runner，run_continuation 注入首条 goal（读交接档自检），后台排水
         // 事件流（G16 续跑语义，ws_handler 同构）。
         let first_goal = compose_first_goal(&w.session_id, child_depth);
-        // design-105 A1：子会话入册（chain_status 观测闭环数据源）
+        // 子会话入册（chain_status 观测闭环数据源）
         w.chain.record_child(&child_id, &first_goal);
         let child_runner = (w.factory)(&child_id);
         let mut stream =
