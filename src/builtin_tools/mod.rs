@@ -1038,17 +1038,20 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
             name: "git_bisect".to_string(),
             description: "Regression bisection automation: start a session with bad and good \
                           anchor refs, judge the checked-out commit with bad/good (or skip), \
-                          inspect status/log at any step, and reset to abandon and restore the \
-                          original checkout. Requires a clean tree to start; status reports \
-                          session state (head, anchors, steps); avoid parallel write operations \
-                          while a session is active. The session auto-closes when the first bad \
-                          commit is identified."
+                          inspect status/log at any step, run an automated walk as a background \
+                          job (command argv, no shell; poll via job_control), and reset to \
+                          abandon and restore the original checkout. Requires a clean tree to \
+                          start; status reports session state (head, anchors, steps); avoid \
+                          parallel write operations while a session is active. When the first \
+                          bad commit is identified the session stays open - reset closes it \
+                          and restores the original checkout."
                 .to_string(),
             parameters: vec![
                 ParameterSpec {
                     name: "action".to_string(),
                     r#type: "string".to_string(),
-                    description: "One of: start, bad, good, skip, status, log, reset.".to_string(),
+                    description: "One of: start, bad, good, skip, status, log, reset, run."
+                        .to_string(),
                     required: true,
                 },
                 ParameterSpec {
@@ -1070,6 +1073,14 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     r#type: "string".to_string(),
                     description: "bad/good optional: judge a specific commit-ish instead of the \
                                   current HEAD."
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "command".to_string(),
+                    r#type: "array".to_string(),
+                    description: "run required: judge command argv (1..=32 non-empty strings, no \
+                                  shell). Exit 0 = good, non-zero = bad, 125 = skip."
                         .to_string(),
                     required: false,
                 },

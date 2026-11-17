@@ -164,7 +164,8 @@ impl GitBisectTool {
     /// 同步实现(供 spawn_blocking 调用)
     fn call_sync(&self, args: &Value) -> IoResult {
         let action = args.get("action").and_then(|v| v.as_str()).ok_or_else(|| {
-            "missing required arg: action (start | bad | good | skip | status | log | reset)"
+            "missing required arg: action (start | bad | good | skip | status | log | \
+             reset | run)"
                 .to_string()
         })?;
         match action {
@@ -172,12 +173,13 @@ impl GitBisectTool {
             "bad" => self.action_judge(args, "bad"),
             "good" => self.action_judge(args, "good"),
             "skip" => self.action_skip(),
+            "run" => self.action_run(args),
             "status" => self.action_status(),
             "log" => self.action_log(),
             "reset" => self.action_reset(),
             other => Err(format!(
                 "unknown action \"{other}\" (valid actions: start, bad, good, skip, \
-                 status, log, reset)"
+                 status, log, reset, run)"
             )),
         }
     }
@@ -340,6 +342,72 @@ impl GitBisectTool {
         Ok(serde_json::json!({
             "action": "log",
             "log": out.trim(),
+        }))
+    }
+
+    /// run 自动化(工具族设计档 D1 二期):`git bisect run <命令 argv>` 经
+    /// 后台作业注册表收容——走步可能长时,阻塞式调用不可取;
+    /// 返回 job_id 由 job_control 轮询读尾。审批语义由 git_bisect 既有
+    /// Sensitive/ManualDefault 链先行(本批命令面=argv 数组,无 shell 解释,
+    /// 不放大 shell_exec 风险面)。**实测闭环语义**:run 完成后会话保持
+    /// 开放(BISECT_LOG 在位,culprit 在 log),复位归 reset——返回体如实
+    /// 注明,不谎报会话已闭合。
+    fn action_run(&self, args: &Value) -> IoResult {
+        if !self.in_bisect() {
+            return Err(
+                "not in a bisect session: start one first (start requires bad+good refs)"
+                    .to_string(),
+            );
+        }
+        let cmd = args
+            .get("command")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                "missing required arg: command (non-empty array of strings - the \
+                 judge command argv, run without a shell; exit 0 = good, non-zero = \
+                 bad, 125 = skip, 126/127 = abort)"
+                    .to_string()
+            })?;
+        if cmd.is_empty() || cmd.len() > 32 {
+            return Err(format!(
+                "command array must contain 1..=32 entries (got {})",
+                cmd.len()
+            ));
+        }
+        let mut parts: Vec<String> = Vec::with_capacity(cmd.len());
+        for (i, v) in cmd.iter().enumerate() {
+            let s = v
+                .as_str()
+                .ok_or_else(|| format!("command[{i}] must be a string (argv array, no shell)"))?;
+            let s = s.trim();
+            if s.is_empty() {
+                return Err(format!("command[{i}] must be non-empty"));
+            }
+            if s.len() > 4096 {
+                return Err(format!("command[{i}] too long (cap 4096 chars)"));
+            }
+            parts.push(s.to_string());
+        }
+        let mut git_args: Vec<&str> = vec!["bisect", "run"];
+        git_args.extend(parts.iter().map(|s| s.as_str()));
+        let display = format!("git bisect run {}", parts.join(" "));
+        let (job_id, log_path) = crate::builtin_tools::background_jobs::registry().spawn_job(
+            "git",
+            &git_args,
+            &display,
+            Some(&self.workdir),
+        )?;
+        Ok(serde_json::json!({
+            "action": "run",
+            "status": "spawned",
+            "job_id": job_id,
+            "log_path": log_path.to_string_lossy(),
+            "command": display,
+            "note": "bisect run is executing as a background job - poll via \
+                     job_control (action=status, then action=read for the tail). \
+                     On completion the culprit announcement is in the log and the \
+                     session stays open (no auto-reset): inspect with status/log, \
+                     then call reset to restore the original checkout and close.",
         }))
     }
 
@@ -516,6 +584,95 @@ mod tests {
             Some(false)
         );
         assert_eq!(status.get("branch").and_then(|v| v.as_str()), Some("main"));
+    }
+
+    #[tokio::test]
+    async fn run_spawns_background_job_and_completes() {
+        // run action=后台作业通道 spawn/poll 契约(全 good 判定走步,
+        // git --version 每步秒级;实测完成后会话保持开放=不谎报已闭合)
+        let (_d, tool, c1) = repo_linear_history();
+        tool.call(&bs_args(
+            "start",
+            serde_json::json!({"bad": "main", "good": c1}),
+        ))
+        .await
+        .unwrap();
+        let r = tool
+            .call(&bs_args(
+                "run",
+                serde_json::json!({"command": ["git", "--version"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.get("status").and_then(|v| v.as_str()), Some("spawned"));
+        let job_id = r
+            .get("job_id")
+            .and_then(|v| v.as_str())
+            .expect("job_id 在回传")
+            .to_string();
+        assert!(job_id.starts_with("job-"), "id 形态: {job_id}");
+        let reg = crate::builtin_tools::background_jobs::registry();
+        let mut completed = false;
+        for _ in 0..300 {
+            let v = reg.status(&job_id).expect("status ok");
+            if v.status == "completed" {
+                completed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(completed, "全 good 判定的 run 应完成(30s 帽)");
+        let (_, tail) = reg.read_tail(&job_id, 8192).unwrap();
+        assert!(
+            tail.contains("is the first"),
+            "culprit 宣告在日志尾: {tail}"
+        );
+        // 实测语义:完成≠闭合,reset 收尾
+        let status = tool.call(&bs_args("status", Value::Null)).await.unwrap();
+        assert_eq!(
+            status.get("in_bisect").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        let r = tool.call(&bs_args("reset", Value::Null)).await.unwrap();
+        assert_eq!(r.get("status").and_then(|v| v.as_str()), Some("restored"));
+    }
+
+    #[tokio::test]
+    async fn run_requires_session_and_valid_command() {
+        let (_d, tool, _c1) = repo_linear_history();
+        let err = tool
+            .call(&bs_args(
+                "run",
+                serde_json::json!({"command": ["git", "--version"]}),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not in a bisect session"),
+            "会话外 run 拒: {err}"
+        );
+        tool.call(&bs_args(
+            "start",
+            serde_json::json!({"bad": "main", "good": "HEAD~4"}),
+        ))
+        .await
+        .unwrap();
+        let err = tool
+            .call(&bs_args("run", serde_json::json!({"command": []})))
+            .await
+            .unwrap_err();
+        assert!(err.contains("1..=32"), "空命令拒: {err}");
+        let err = tool
+            .call(&bs_args("run", serde_json::json!({"command": ["git", 42]})))
+            .await
+            .unwrap_err();
+        assert!(err.contains("must be a string"), "非字符串段拒: {err}");
+        let err = tool.call(&bs_args("run", Value::Null)).await.unwrap_err();
+        assert!(
+            err.contains("missing required arg: command"),
+            "缺 command 拒: {err}"
+        );
+        tool.call(&bs_args("reset", Value::Null)).await.unwrap();
     }
 
     #[tokio::test]
