@@ -1255,7 +1255,9 @@ async fn construct_runner(
         .with_governance_segment(governance_segment.clone())
         // serve 面 delegate 执行能力接线(B25 批顺手修,CLI run 主路径同款镜像;
         // 与 agent_api run/stream 端点同口径——此前 WS 会话 LLM 不可见 delegate)
-        .with_delegate_context(
+        // delegate.maxConcurrent 设置面消费(并发帽;0/缺省=不限制=现行为)
+        .with_delegate_context(crate::api::agent_api::apply_delegate_concurrency_cap(
+            state,
             crate::agent::delegate::DelegateContext::new(
                 def.agent_type.as_str(),
                 state.definitions().clone(),
@@ -1277,7 +1279,7 @@ async fn construct_runner(
             .with_governance_segment(governance_segment)
             // 委托窗口 token 归账(差值随 SpawnRecord 落 journal)
             .with_token_counter(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
-        );
+        ));
     // PR-H4 验收修复:WS 流式路径此前从未消费 def.context_window_tokens——
     // max_context_tokens 停在 AgentRunner::new 字段默认 8192,context_window
     // 亦为 None(裁剪管路整体缺席;实测 session_spawn 链预算误判 32768=4×8192,

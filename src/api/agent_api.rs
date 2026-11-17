@@ -1627,6 +1627,23 @@ async fn consume_to_done(
     )
 }
 
+/// delegate.maxConcurrent 设置面消费端（serve 三路径共用）：读合并设置的
+/// 委托并发帽（delegate/delegate_many 并行派发共享信号量上限），>0 时给
+/// delegate 上下文装帽；0/缺省=不限制=现行为零变化（缺省不变式）。会话
+/// 创建期读取一次，重启会话生效。WS 面与 CLI 主路径同口径消费。
+pub(crate) fn apply_delegate_concurrency_cap(
+    state: &AgentApiState,
+    ctx: crate::agent::delegate::DelegateContext,
+) -> crate::agent::delegate::DelegateContext {
+    let (merged, _) = state.workbench_settings().merged();
+    let cap = crate::api::settings::delegate_max_concurrent(&merged);
+    if cap > 0 {
+        ctx.with_max_concurrent_delegates(cap)
+    } else {
+        ctx
+    }
+}
+
 async fn run_agent(
     State(state): State<AgentApiState>,
     axum::extract::Path(agent_type): axum::extract::Path<String>,
@@ -1801,7 +1818,9 @@ async fn run_agent(
     // from_definition 对 "delegate" 仅预放行校验,此前 serve 三路径(run/stream/ws)
     // 均无人调用 with_delegate_context → 声明了 delegate 的定义(general 等)
     // LLM 不可见、tool_call 无处解析。子代理 journal 同目录落账,谱系面可见。
-    .with_delegate_context(
+    // delegate.maxConcurrent 设置面消费(并发帽;0/缺省=不限制=现行为)
+    .with_delegate_context(apply_delegate_concurrency_cap(
+        &state,
         crate::agent::delegate::DelegateContext::new(
             &agent_type,
             state.definitions().clone(),
@@ -1812,7 +1831,7 @@ async fn run_agent(
             &state.llm_config(),
         ))
         .with_journal_dir(state.workdir.join("data").join("sessions")),
-    )
+    ))
     // 查账工具族接线（PR-11a）：以本会话态重绑 handler 内查账工具实例
     .wire_accounting(&state.workdir)
     // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位)
@@ -1883,7 +1902,9 @@ async fn run_agent(
         // 注入 delegate 上下文——serve 模式多代理委托通路接线
         // 治理门禁段随上下文下放(子代理 S2 槽位与主 runner 同源,治理
         // 纪律无豁免面);journal 目录同源传入=子代理事件流落同目录
-        .with_delegate_context(
+        // delegate.maxConcurrent 设置面消费(并发帽;0/缺省=不限制=现行为)
+        .with_delegate_context(apply_delegate_concurrency_cap(
+            &state,
             crate::agent::delegate::DelegateContext::new(
                 &agent_type,
                 state.definitions.clone(),
@@ -1900,7 +1921,7 @@ async fn run_agent(
             .with_toolkit((*state.toolkit()).clone(), &state.workdir)
             // 委托窗口 token 归账(差值随 SpawnRecord 落 journal)
             .with_token_counter(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
-        );
+        ));
 
     // 改消费流式 ReAct 回路(delegate 同款修法,bb172b2 先例)——
     // 非流式 run() 是单发桥接(LLM 返 tool_calls 即返、工具不执行=能力面假象,
@@ -2289,7 +2310,9 @@ async fn run_agent_stream(
     // 执行环境 profile 标记随 tool_result 落账(同 run_agent 口径)
     .with_execution_profile_marker(execution_profile.as_ref().map(|p| p.as_str()))
     // serve 面 delegate 执行能力接线(同 run_agent 端点;SSE 流式面)
-    .with_delegate_context(
+    // delegate.maxConcurrent 设置面消费(并发帽;0/缺省=不限制=现行为)
+    .with_delegate_context(apply_delegate_concurrency_cap(
+        &state,
         crate::agent::delegate::DelegateContext::new(
             &agent_type,
             state.definitions().clone(),
@@ -2308,7 +2331,7 @@ async fn run_agent_stream(
         .with_governance_segment(governance_segment.clone())
         // 委托窗口 token 归账(差值随 SpawnRecord 落 journal)
         .with_token_counter(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
-    )
+    ))
     // 查账工具族接线（PR-11a）：以本会话态重绑 handler 内查账工具实例
     .wire_accounting(&state.workdir)
     // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位)

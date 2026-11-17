@@ -509,6 +509,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "delegate.maxConcurrent",
+            kind: SettingType::Number,
+            default: json!(0),
+            enum_values: None,
+            range: Some([0, 64]),
+            category: "Agent 工具",
+            description: "委托并发帽（delegate/delegate_many 并行派发的子代理共享的信号量上限：0=不限制=现行为零变化；>0=同时运行的子代理至多 N 个，超出的任务排队等待许可。仅 delegate 工具在场的会话生效；重启会话生效）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "approval.mode.fileEdit",
             kind: SettingType::Enum,
             default: json!(""),
@@ -912,6 +922,17 @@ fn accept_workspace_value(entry: &SettingEntry, v: &Value) -> bool {
     entry.scope != "application" && validate_put(entry.key, Some(v)).is_ok()
 }
 
+/// `delegate.maxConcurrent` 读取口径（serve 三路径/WS 面/CLI 主路径共用消费端）：
+/// 缺省、非数、负值一律回落 0（不限制=现行为零变化）；>0 为 delegate 并行
+/// 派发共享信号量上限。
+pub fn delegate_max_concurrent(merged: &serde_json::Map<String, Value>) -> usize {
+    merged
+        .get("delegate.maxConcurrent")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(0)
+}
+
 // =============================================================================
 // 存储路径白名单（防目录穿越）
 // =============================================================================
@@ -1136,12 +1157,32 @@ mod tests {
     }
 
     #[test]
+    fn delegate_max_concurrent_reader_contract() {
+        let (dir, store) = temp_store("delegate_cap");
+        // 缺省 0=不限制(现行为零变化)
+        let (merged, _) = store.merged();
+        assert_eq!(super::delegate_max_concurrent(&merged), 0);
+        // 用户层显式设 N → N
+        write_file(&user_file(&dir), r#"{"delegate.maxConcurrent": 5}"#);
+        let (merged, _) = store.merged();
+        assert_eq!(super::delegate_max_concurrent(&merged), 5);
+        // 非数/负值回落 0(坏值不伪造帽,与缺省口径一致)
+        write_file(&user_file(&dir), r#"{"delegate.maxConcurrent": "many"}"#);
+        let (merged, _) = store.merged();
+        assert_eq!(super::delegate_max_concurrent(&merged), 0);
+        write_file(&user_file(&dir), r#"{"delegate.maxConcurrent": -3}"#);
+        let (merged, _) = store.merged();
+        assert_eq!(super::delegate_max_concurrent(&merged), 0);
+    }
+
+    #[test]
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
         // 计数锁=单源纪律执法面：新增 SettingEntry 时同步此数（当前含
         // storage.retention.sharedServer）
-        assert_eq!(settings.len(), 72); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键;审计摘要卡 audit_summary 开关键;存储保留期与硬配额三键:封闭枚举+缺省=现行为(永久/压缩/不限,零回归)+服务端共享账压实调度档;工具条低频芯片三键 workbench.toolbar.modeSegment/approvalPicker/mcpEntry:缺省=隐藏=现行为零回归)
+        assert_eq!(settings.len(), 73); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键;审计摘要卡 audit_summary 开关键;存储保留期与硬配额三键:封闭枚举+缺省=现行为(永久/压缩/不限,零回归)+服务端共享账压实调度档;工具条低频芯片三键 workbench.toolbar.modeSegment/approvalPicker/mcpEntry:缺省=隐藏=现行为零回归;委托并发帽 delegate.maxConcurrent 缺省 0=不限制=现行为零回归)
+        assert_eq!(settings["delegate.maxConcurrent"], json!(0)); // 缺省 0=不限制=现行为
         assert_eq!(settings["storage.retention.period"], json!("forever"));
         assert_eq!(settings["storage.retention.action"], json!("compact"));
         assert_eq!(settings["storage.quota.maxBytes"], json!("unlimited"));
