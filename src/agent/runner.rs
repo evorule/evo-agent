@@ -5226,7 +5226,7 @@ impl AgentRunner {
                 ));
             self.tool_handler
                 .register_static(crate::agent::session_spawn_tool::SESSION_SPAWN_TOOL, exec);
-            // design-105 A1:链观测面同点重绑(共享同一链运行态与会话身份;
+            // 链观测闭环:链观测面同点重绑(共享同一链运行态与会话身份;
             // 与 session_spawn 同生命周期——spawn 后父面即可轮询子会话)
             let chain_status_exec: std::sync::Arc<dyn ToolFunction> =
                 std::sync::Arc::new(crate::builtin_tools::chain_status::ChainStatusTool::wired(

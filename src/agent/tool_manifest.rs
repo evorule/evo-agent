@@ -520,7 +520,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 建仓检出保护/脏树 fail-visible/分支名白名单;GitWrite 域,
         // 审批走基线档)
         b("worktree", vec![GitWrite]),
-        // 自主会话链观测面(design-105 A1):纯查询零写面,ReadOnly 显式
+        // 自主会话链观测面(链观测闭环):纯查询零写面,ReadOnly 显式
         // 标定(并行调度分组判据);Delegate 域(会话链治理面同源)
         b("chain_status", vec![CapDomain::Delegate]),
         // dev-feedback P0a 余量:后台作业轮询面(与 shell_exec background=true
@@ -896,7 +896,7 @@ fn rule_manifests() -> Vec<ToolManifest> {
 ///
 /// delegate 统一装配批起 adjudication_class=Sensitive（接 P2 通道，设计档
 /// §3.2 终态；PR-1 行为等价期的 Standard 暂标已随快照重录一并演进）。
-/// 批量并行委托（design 批准方案 A）：同 delegate 风险面（Sensitive+子代理执行）。
+/// 批量并行委托（已批准方案 A）：同 delegate 风险面（Sensitive+子代理执行）。
 fn delegate_many_manifest() -> ToolManifest {
     let mut m = base(
         "delegate_many",
