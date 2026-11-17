@@ -4356,7 +4356,7 @@ fn p2_adjudication_table_matches_design() {
         .iter()
         .filter(|m| m.is_p2_adjudicated())
         .count();
-    assert_eq!(p2_count, 31);
+    assert_eq!(p2_count, 32);
     for t in [
         "file_create",
         "file_move",

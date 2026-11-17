@@ -64,6 +64,7 @@ pub mod build_check;
 pub mod code_search;
 pub mod codegraph;
 pub mod companion_observe;
+pub mod delegate_many;
 pub mod delegate_tool;
 pub mod edit_file;
 pub mod exfil_scan;

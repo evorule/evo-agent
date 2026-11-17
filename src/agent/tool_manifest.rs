@@ -47,7 +47,7 @@
 //! 注册不改变治理分级），静态未命中按 runtime manifest（MCP/ServiceProxy
 //! 默认 Sensitive 意图必报，人工分级降档走 settings 键
 //! `agentTools.mcpAdjudication` / `agentTools.serviceProxyAdjudication`，
-//! D7-A 方案一来源级）。`GOVERNANCE_SNAPSHOT` 31 条快照锁静态面不变；
+//! D7-A 方案一来源级）。`GOVERNANCE_SNAPSHOT` 32 条快照锁静态面不变；
 //! 本扩展零静态表变更（数量锁现 74）。
 
 use serde::{Deserialize, Serialize};
@@ -244,8 +244,14 @@ impl SpecSource {
                 .find(|s| s.name == name)
                 .map(|s| (s.description, params_to_openai(&s.parameters))),
             SpecSource::Delegate => {
-                let s = crate::builtin_tools::delegate_tool::delegate_tool_spec();
-                Some((s.description, params_to_openai(&s.parameters)))
+                // design-104:delegate_many 同源分派(按名)
+                if name == "delegate_many" {
+                    let s = crate::builtin_tools::delegate_many::delegate_many_tool_spec();
+                    Some((s.description, params_to_openai(&s.parameters)))
+                } else {
+                    let s = crate::builtin_tools::delegate_tool::delegate_tool_spec();
+                    Some((s.description, params_to_openai(&s.parameters)))
+                }
             }
             SpecSource::Inline {
                 description,
@@ -887,6 +893,22 @@ fn rule_manifests() -> Vec<ToolManifest> {
 ///
 /// delegate 统一装配批起 adjudication_class=Sensitive（接 P2 通道，设计档
 /// §3.2 终态；PR-1 行为等价期的 Standard 暂标已随快照重录一并演进）。
+/// 批量并行委托（design-104 方案 A）：同 delegate 风险面（Sensitive+子代理执行）。
+fn delegate_many_manifest() -> ToolManifest {
+    let mut m = base(
+        "delegate_many",
+        ToolSource::Delegate,
+        SpecSource::Delegate,
+        vec![CapDomain::Delegate],
+    );
+    m.adjudication_class = AdjudicationClass::Sensitive;
+    m
+}
+
+/// delegate manifest（1 条）
+///
+/// delegate 统一装配批起 adjudication_class=Sensitive（接 P2 通道，设计档
+/// §3.2 终态；PR-1 行为等价期的 Standard 暂标已随快照重录一并演进）。
 fn delegate_manifest() -> ToolManifest {
     // delegate 统一装配批：级别演进 Standard→Sensitive（模块文档承诺兑现）——
     // delegate 自身调用接 P2 事前意图裁决通道（意图必报）。条目数不变
@@ -979,6 +1001,7 @@ fn static_manifest_table() -> &'static std::collections::BTreeMap<String, ToolMa
         let mut all = builtin_manifests();
         all.extend(rule_manifests());
         all.push(delegate_manifest());
+        all.push(delegate_many_manifest());
         all.extend(memory_manifests());
         all.into_iter().map(|m| (m.name.clone(), m)).collect()
     })
@@ -1136,9 +1159,13 @@ mod tests {
         //     107→108，桥不在场=fail-visible 不假装成功）
         //   （后台作业轮询面 job_control +1：内置 42→43，数量锁 108→109，
         //     只操作本 serve 收容的作业句柄，零新命令执行面）
+        //   （多 worktree 自动化 worktree +1：内置 43→44，数量锁 109→110，
+        //     GitWrite 域+基线审批档；主检出/保护分支拒删内建）
+        //   （批量并行委托 delegate_many +1：delegate 系 Delegate 源 +1，
+        //     数量锁 111→112；Sensitive 同 delegate 风险面）
         assert_eq!(builtin_manifests().len(), 44);
         assert_eq!(rule_manifests().len(), 60);
-        assert_eq!(all().len(), 111);
+        assert_eq!(all().len(), 112);
     }
 
     #[test]
@@ -1164,10 +1191,11 @@ mod tests {
         names.extend(builtin_manifests().iter().map(|m| m.name.clone()));
         names.extend(rule_manifests().iter().map(|m| m.name.clone()));
         names.push(delegate_manifest().name);
+        names.push(delegate_many_manifest().name);
         names.extend(memory_manifests().iter().map(|m| m.name.clone()));
         // 数量锁(与模块头「内置 43 + 规则 60 + delegate 1 + memory 6 = 110」
         // 同源;计数漂移此处当场红)
-        assert_eq!(names.len(), 111, "static manifest count lock");
+        assert_eq!(names.len(), 112, "static manifest count lock");
         let mut sorted = names.clone();
         sorted.sort();
         let before = sorted.len();
@@ -1203,6 +1231,7 @@ mod tests {
                 .map(|s| s.name),
         );
         spec_names.insert(crate::builtin_tools::delegate_tool::delegate_tool_spec().name);
+        spec_names.insert(crate::builtin_tools::delegate_many::delegate_many_tool_spec().name);
 
         let missing_in_manifest: Vec<&String> = spec_names.difference(&manifest_names).collect();
         assert!(
@@ -1372,6 +1401,7 @@ mod tests {
         "bundle_import_dry_run",
         "bundle_import",
         "delegate",
+        "delegate_many",
         "session_spawn",
         "memory_tombstone",
         // 批K 段5:HTTP 写动词（双闸 Sensitive+ManualDefault——写动词意图必报）
