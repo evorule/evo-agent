@@ -434,6 +434,11 @@ pub(crate) fn dedupe_recall_variants(records: &mut Vec<MemoryRecord>, ns: &str) 
 ///   沉底且保持原有相对顺序），修 S5 的"path 字典序裁决"。
 ///
 /// 返回 `(条目, 解析出的记录或 None)`；record 的 `fact_id` 已绑定条目的 `fact_id`（I3）。
+///
+/// **状态忠实口径**：本函数保留 Tombstoned/Superseded 生命态条目——状态复检面
+/// （如 `flush_usage` 服务端墓碑防御，须「看见」墓碑态本身才能跳过回写）依赖
+/// 此语义。召回/目录等**视图面**一律走 [`latest_view_entries_by_path`] 薄封装
+/// （B-411 P1 生命态视图过滤单源点），渲染面 `audit_recall_section` 另有末闸纵深。
 pub(crate) fn latest_entries_by_path(
     facts: Vec<crate::api::evorule_client::SharedFactEntry>,
 ) -> Vec<(
@@ -454,7 +459,7 @@ pub(crate) fn latest_entries_by_path(
         }
     }
 
-    // 墓碑抑制 + 解析 + 排序键预计算
+    // 墓碑抑制（null latest-wins）+ 解析 + 排序键预计算
     let mut entries: Vec<(
         crate::api::evorule_client::SharedFactEntry,
         Option<MemoryRecord>,
@@ -478,6 +483,31 @@ pub(crate) fn latest_entries_by_path(
     entries
         .into_iter()
         .map(|(f, record, _)| (f, record))
+        .collect()
+}
+
+/// 视图面薄封装（B-411 P1 生命态视图过滤单源点）：在 [`latest_entries_by_path`]
+/// 状态原语之上按生命态过滤——最新版本 `Tombstoned`/`Superseded` 不入视图
+/// （append-only 原值永在账；裁决败者落账后次轮召回即消失，recipe 关裁决也不
+/// 复活）。召回/目录/索引面一律走此封装；状态复检面（`flush_usage` 服务端
+/// 墓碑防御）走原语以「看见」墓碑态本身；渲染面 `audit_recall_section` 另有
+/// 末闸纵深。解析失败的原始条目（record=None）透传保留。
+pub(crate) fn latest_view_entries_by_path(
+    facts: Vec<crate::api::evorule_client::SharedFactEntry>,
+) -> Vec<(
+    crate::api::evorule_client::SharedFactEntry,
+    Option<MemoryRecord>,
+)> {
+    latest_entries_by_path(facts)
+        .into_iter()
+        .filter(|(_, record)| {
+            record.as_ref().is_none_or(|r| {
+                !matches!(
+                    r.lifecycle_state.as_deref(),
+                    Some("Tombstoned") | Some("Superseded")
+                )
+            })
+        })
         .collect()
 }
 
@@ -2267,7 +2297,7 @@ impl MemoryManager {
             let Ok(facts) = self.evorule_client.get_shared_facts(Some(&ns_base)).await else {
                 return Ok(Vec::new()); // fail-open（D-B1-5）
             };
-            let mut entries = latest_entries_by_path(facts);
+            let mut entries = latest_view_entries_by_path(facts);
             if rebuild {
                 // 从扫描结果重建索引（修复面；整册键集，与查询前缀无关）
                 self.rebuild_shared_prefix_index(&session_id, &entries)
@@ -3003,7 +3033,7 @@ impl MemoryManager {
             // R01（S5/S6/E19）：按 path 去重取最新版本（墓碑抑制）+ 时间倒序（I5）。
             // 修复前：全版本逐条 push（同 key 多版本同时进 prompt）且无排序
             // （存活裁决 = 服务端 path 字典序 + 下游 fit_recall 前缀截断）。
-            for (_, record) in latest_entries_by_path(facts) {
+            for (_, record) in latest_view_entries_by_path(facts) {
                 if let Some(record) = record {
                     ctx.stable.push(record);
                 }
@@ -3070,7 +3100,7 @@ impl MemoryManager {
             .fetch_shared_facts_visible(&sessions_prefix, "summaries", &mut ctx.degradation_notices)
             .await
         {
-            let mut summaries: Vec<MemoryRecord> = latest_entries_by_path(facts)
+            let mut summaries: Vec<MemoryRecord> = latest_view_entries_by_path(facts)
                 .into_iter()
                 .filter(|(f, _)| !f.path.contains(".rollup."))
                 .filter_map(|(f, record)| {
@@ -3106,7 +3136,7 @@ impl MemoryManager {
             // 抑制——旧版本不再重复进评分/名额/usage 计数；Tombstoned 记录
             // （值非 null 的状态墓碑）渲染层必被过滤，直接跳过（防占名额+
             // 防镜像 Reinforced 化）。
-            let deduped = latest_entries_by_path(facts);
+            let deduped = latest_view_entries_by_path(facts);
             for (f, record) in &deduped {
                 if let Some(r) = record {
                     if r.lifecycle_state.as_deref() == Some("Tombstoned") {
@@ -3278,18 +3308,17 @@ impl MemoryManager {
                     "notes recall degraded: ledger unreachable for '{prefix}' ({e})——本轮笔记回喂缺失"
                 )
             })?;
-        // 版本裁决单源化：同 path 取最新版本 + null 墓碑抑制 + Tombstoned
-        // 状态墓碑过滤——目录=最新版且未被遗忘的条目（修复前全版本直收，
-        // 旧版本重复进选取、已遗忘条目占 NOTES_RECALL_LIMIT 名额）。
+        // 版本裁决单源化：同 path 取最新版本 + null 墓碑抑制 + 生命态抑制
+        // （Tombstoned/Superseded 在 latest_view_entries_by_path 单源过滤,
+        // B-411 P1 起 notes 族同享）——目录=最新版且未被遗忘/未被取代的
+        // 条目（修复前全版本直收，旧版本重复进选取、已遗忘条目占
+        // NOTES_RECALL_LIMIT 名额）。
         let mut out = Vec::with_capacity(facts.len());
-        for (f, record) in latest_entries_by_path(facts) {
+        for (f, record) in latest_view_entries_by_path(facts) {
             // 解析失败=保留为原始条目(键取 path 尾段,值取原文)——催写与
             // 相关性匹配不丢数据
             let record = match record {
                 Some(mut r) => {
-                    if r.lifecycle_state.as_deref() == Some("Tombstoned") {
-                        continue;
-                    }
                     if r.key.is_empty() {
                         r.key = f.path.rsplit('.').next().unwrap_or(&f.path).to_string();
                     }
@@ -3582,13 +3611,15 @@ impl MemoryManager {
 
     /// 阶段 3(F-612):召回期矛盾裁决(记忆设计档 §5.2)。
     ///
-    /// 检测(确定性)=词面相似≥阈值 且 极性相反(否定词表);裁决=维度序
-    /// (authority>confidence>freshness,Recipe 声明),胜者为 wire 视图
-    /// 呈现项;败者=同 path 新版本标 Superseded(append-only 不删除,
-    /// RL-A1)+裁决记录落链(确定性 pair-hash 路径,已存在即跳过=幂等)。
-    /// 裁决权在规则——LLM 侧仅可经 sidecar 提议疑似矛盾(独立面)。
-    /// 落链 best-effort:无会话/账本不可达=仅 wire 裁剪生效(降级通知
-    /// fail-visible),落账留待下次召回(候选对仍在,路径幂等不空转)。
+    /// 检测(确定性)双规=①词面相似≥阈值 且 极性相反(否定词表);②同主题
+    /// 异值(B-411 P2:Recipe 独占槽位 key 词形命中 + 值词形集不相交)——
+    /// 两规对并按 (i,j) 去重;裁决=维度序(authority>confidence>freshness,
+    /// Recipe 声明),胜者为 wire 视图呈现项;败者=同 path 新版本标
+    /// Superseded(append-only 不删除,RL-A1)+裁决记录落链(确定性 pair-hash
+    /// 路径,已存在即跳过=幂等)。裁决权在规则——LLM 侧仅可经 sidecar 提议
+    /// 疑似矛盾(独立面)。落链 best-effort:无会话/账本不可达=仅 wire 裁剪
+    /// 生效(降级通知 fail-visible),落账留待下次召回(候选对仍在,路径幂等
+    /// 不空转;P1 投影抑制后落账成功者次轮即消失)。
     async fn adjudicate_stable(&self, ctx: &mut RecallContext) {
         let Some(recipe) = &self.recipe else {
             return;
@@ -3596,19 +3627,38 @@ impl MemoryManager {
         if !recipe.adjudication.enabled {
             return;
         }
-        let pairs = crate::agent::adjudication::scan_and_adjudicate(
-            &ctx.stable,
-            &recipe.adjudication.negation_markers,
-            recipe.adjudication.similarity_threshold,
-            &recipe.adjudication.order,
-        );
+        // 双规检测+对并去重(极性规则优先占位,值冲突规则补位)
+        let mut pairs: Vec<(usize, usize, usize, String)> =
+            crate::agent::adjudication::scan_and_adjudicate(
+                &ctx.stable,
+                &recipe.adjudication.negation_markers,
+                recipe.adjudication.similarity_threshold,
+                &recipe.adjudication.order,
+            )
+            .into_iter()
+            .map(|(i, j, w)| (i, j, w, "polarity".to_string()))
+            .collect();
+        {
+            let vpairs = crate::agent::adjudication::scan_value_conflicts(
+                &ctx.stable,
+                &recipe.adjudication.value_slots,
+                &recipe.adjudication.order,
+            );
+            let mut seen: std::collections::BTreeSet<(usize, usize)> =
+                pairs.iter().map(|(i, j, _, _)| (*i, *j)).collect();
+            for (i, j, w, slot) in vpairs {
+                if seen.insert((i, j)) {
+                    pairs.push((i, j, w, format!("slot:{slot}")));
+                }
+            }
+        }
         if pairs.is_empty() {
             return;
         }
         let session = self.session_id.clone();
         let mut losers: Vec<usize> = Vec::new();
         let mut marks: Vec<(String, MemoryRecord, String, MemoryRecord)> = Vec::new();
-        for (i, j, winner) in &pairs {
+        for (i, j, winner, tag) in &pairs {
             let (w, l) = if *winner == 0 { (i, j) } else { (j, i) };
             let winner_path = format!("shared.{}.{}", self.namespace, ctx.stable[*w].key);
             let loser_path = format!("shared.{}.{}", self.namespace, ctx.stable[*l].key);
@@ -3634,7 +3684,7 @@ impl MemoryManager {
             let mut adj = MemoryRecord::new(
                 adj_path.rsplit('.').next().unwrap_or("pair"),
                 &format!(
-                    "矛盾裁决: 败者={loser_path} 胜者={winner_path} (维度序裁决,败者已标 Superseded)"
+                    "矛盾裁决[{tag}]: 败者={loser_path} 胜者={winner_path} (维度序裁决,败者已标 Superseded)"
                 ),
                 now_secs(),
             );
@@ -4511,9 +4561,14 @@ impl MemoryManager {
     fn audit_recall_section(&self, section: &str, records: &[MemoryRecord]) -> Vec<String> {
         let mut lines = Vec::with_capacity(records.len());
         for record in records {
-            // 墓碑过滤(F-614/I9):Tombstoned=视图不可见化,不进 prompt
-            // (账面仍可查询——append-only 原始数据永在)
-            if record.lifecycle_state.as_deref() == Some("Tombstoned") {
+            // 墓碑过滤(F-614/I9;B-411 P1 补 Superseded):Tombstoned/Superseded
+            // =视图不可见化,不进 prompt(账面仍可查询——append-only 原始数据
+            // 永在;投影层已单源抑制,此处为渲染末闸纵深防线——recipe 关裁决
+            // 后败者也不复活)
+            if matches!(
+                record.lifecycle_state.as_deref(),
+                Some("Tombstoned") | Some("Superseded")
+            ) {
                 continue;
             }
             // B5：stable 节按来源域标注（D1 标注注入 / D2 unclassified），
@@ -4534,6 +4589,13 @@ impl MemoryManager {
             if record.fact_id.is_none() || record.fact_id == Some(0) {
                 display_key = format!("[unanchored] {display_key}");
             }
+            // 时效标注（o12 L3③/B-411 P3）：带锚条目注入 as_of epoch——模型侧
+            // 可分辨环境快照与永真事实（token 成本每条 ~6）；无锚（ts=0）省略
+            let as_of = if record.timestamp > 0 {
+                format!(" (as_of:{})", record.timestamp)
+            } else {
+                String::new()
+            };
             let result = self.safety_auditor.audit(&record.value);
             for f in &result.findings {
                 tracing::warn!(
@@ -4550,16 +4612,16 @@ impl MemoryManager {
                 Some(clean) if !clean.trim().is_empty() => {
                     // G11(B-316):条目行过标题中和(key/value 含 '#' 行不再冒充分区)
                     lines.push(Self::neutralize_partition_headings(&format!(
-                        "- {}: {}\n",
-                        display_key, clean
+                        "- {}{}: {}\n",
+                        display_key, as_of, clean
                     )));
                 }
                 Some(_) => {} // 全部内容被剥离 → 该条目整体丢弃
                 None => {
                     // Reject 模式下放弃整段
                     lines.push(Self::neutralize_partition_headings(&format!(
-                        "- {}: [safety audit rejected this record]\n",
-                        display_key
+                        "- {}{}: [safety audit rejected this record]\n",
+                        display_key, as_of
                     )));
                 }
             }
@@ -6352,8 +6414,8 @@ mod tests {
             "llm 域必须带标注: {prompt}"
         );
         assert!(
-            prompt.contains("- stable.user.prefs: prefer concise answers"),
-            "user 域无需标注: {prompt}"
+            prompt.contains("- stable.user.prefs (as_of:2): prefer concise answers"),
+            "user 域无需域标注但带 as_of 时效标注(B-411 P3): {prompt}"
         );
         assert!(
             prompt.contains("[unclassified] stable.legacy"),
@@ -7497,6 +7559,120 @@ mod tests {
             .unwrap();
         assert_eq!(stable.source.as_deref(), Some("system:promote-gated"));
         mock.assert_async().await;
+    }
+
+    #[test]
+    fn test_latest_entries_superseded_projection_filter() {
+        // B-411 P1:最新版本 Superseded → 视图封装整条 path 抑制(append-only
+        // 原值永在账;recipe 关裁决也不复活);状态原语保持忠实(状态复检面如
+        // flush_usage 墓碑防御须看见墓碑态);未标记生命态 → 视图正常存活
+        let mk = |path: &str, ver: u64, val: serde_json::Value| {
+            crate::api::evorule_client::SharedFactEntry {
+                fact_id: ver,
+                path: path.to_string(),
+                value: val,
+                source_session_id: 1,
+                version: ver,
+                origin_fact_id: None,
+            }
+        };
+        let mut sup_v2 = MemoryRecord::new("stable.user.k", "新版本", 200);
+        sup_v2.lifecycle_state = Some("Superseded".to_string());
+        let facts = vec![
+            mk(
+                "shared.ns.stable.user.k",
+                1,
+                serde_json::to_value(MemoryRecord::new("stable.user.k", "旧版本", 100)).unwrap(),
+            ),
+            mk(
+                "shared.ns.stable.user.k",
+                2,
+                serde_json::to_value(sup_v2).unwrap(),
+            ),
+        ];
+        assert!(
+            latest_view_entries_by_path(facts.clone()).is_empty(),
+            "Superseded 最新版本=视图整条 path 抑制"
+        );
+        // 状态忠实面:原语保留 Superseded 态记录(flush_usage 防御依赖)
+        let state = latest_entries_by_path(facts);
+        assert_eq!(state.len(), 1, "状态原语保留墓碑态(防御面依赖)");
+        assert_eq!(
+            state[0].1.as_ref().unwrap().lifecycle_state.as_deref(),
+            Some("Superseded")
+        );
+        let facts2 = vec![
+            mk(
+                "shared.ns.stable.user.k",
+                1,
+                serde_json::to_value(MemoryRecord::new("stable.user.k", "旧版本", 100)).unwrap(),
+            ),
+            mk(
+                "shared.ns.stable.user.k",
+                2,
+                serde_json::to_value(MemoryRecord::new("stable.user.k", "新版本", 200)).unwrap(),
+            ),
+        ];
+        let entries = latest_view_entries_by_path(facts2);
+        assert_eq!(entries.len(), 1, "未标记生命态=视图正常存活");
+        assert_eq!(entries[0].1.as_ref().unwrap().value, "新版本");
+    }
+
+    #[test]
+    fn test_audit_recall_section_superseded_and_as_of() {
+        // B-411 P1/P3:渲染末闸 Superseded 滤网 + as_of 时效标注(无锚 ts=0 省略)
+        let mgr = MemoryManager::new("ns", make_test_client());
+        let mut alive = MemoryRecord::new("stable.user.k", "正常事实", 1_700_000_000);
+        alive.fact_id = Some(7);
+        let mut sup = MemoryRecord::new("stable.user.old", "被取代事实", 1_700_000_001);
+        sup.lifecycle_state = Some("Superseded".to_string());
+        sup.fact_id = Some(8);
+        let lines = mgr.audit_recall_section("stable", &[alive, sup]);
+        assert_eq!(lines.len(), 1, "Superseded 渲染末闸过滤");
+        assert!(
+            lines[0].contains("(as_of:1700000000)"),
+            "带锚条目注入 as_of"
+        );
+        assert!(lines[0].contains("正常事实"));
+        let legacy = MemoryRecord::new("stable.user.z", "历史条目", 0);
+        let lines2 = mgr.audit_recall_section("stable", &[legacy]);
+        assert_eq!(lines2.len(), 1);
+        assert!(!lines2[0].contains("as_of"), "无锚条目省略时效标注");
+    }
+
+    #[tokio::test]
+    async fn test_adjudication_dual_rule_single_adjudication() {
+        // B-411 P2:同对既极性又槽位值冲突 → 对并去重单裁决(不去重则同下标
+        // 双重 remove 会 panic=本测试的隐式回归面)
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        recipe.adjudication.enabled = true;
+        mgr.set_recipe(recipe);
+        let mut ctx = RecallContext::default();
+        let mut a = MemoryRecord::new(
+            "stable.user.当前工作区绑定",
+            "工作区开关默认开启 D:\\a",
+            1000,
+        );
+        a.source = Some("user".to_string());
+        let mut b = MemoryRecord::new(
+            "stable.user.当前工作区绑定2",
+            "工作区开关默认不开启 D:\\b",
+            2000,
+        );
+        b.source = Some("llm".to_string());
+        b.confidence = Some(0.4);
+        ctx.stable.push(a);
+        ctx.stable.push(b);
+        mgr.adjudicate_stable(&mut ctx).await;
+        assert_eq!(ctx.stable.len(), 1, "双规同对=单裁决(user 权威胜)");
+        assert_eq!(ctx.stable[0].source.as_deref(), Some("user"));
+        let n = ctx
+            .degradation_notices
+            .iter()
+            .filter(|x| x.contains("[adjudication]"))
+            .count();
+        assert_eq!(n, 1, "双规同对去重=单通知");
     }
 
     #[tokio::test]

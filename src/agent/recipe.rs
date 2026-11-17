@@ -211,6 +211,25 @@ pub struct AdjudicationConfig {
     /// 词面相似阈值（分词集 Jaccard；缺省 0.6）
     #[serde(default = "default_similarity_threshold")]
     pub similarity_threshold: f32,
+    /// 独占值槽位（B-411 P2 同主题异值检测数据面；缺省=嵌入保守表，
+    /// 解析失败回退空表=仅极性规则，保守取向同否定词表）
+    #[serde(default = "default_value_slots")]
+    pub value_slots: Vec<ValueSlot>,
+}
+
+/// 独占值槽位（B-411 P2）：声明「单值语义」的主题——同槽位两条稳定事实
+/// 断言不同具体值即矛盾候选。`key_tokens` 子串命中记录的 **key 字段**（非
+/// value 体：正文提及≠断言，防「工作区列表：D:\a、D:\b」类并列误报）。
+///
+/// 扩充纪律（同否定词表保守取向）：只收「良性碰撞率低 + 单值语义无歧义」
+/// 的复合词形；并列语义主题（端口/路径列表/多成员类）不入表。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValueSlot {
+    /// 槽位名（裁决记录可读标注，如 workspace_root）
+    pub name: String,
+    /// key 词形（子串包含匹配，小写化；英文复合词与 CJK 词均可）
+    #[serde(default)]
+    pub key_tokens: Vec<String>,
 }
 
 fn default_adjudication_order() -> Vec<String> {
@@ -259,6 +278,20 @@ fn fallback_negation_markers() -> Vec<String> {
     ]
 }
 
+/// 独占值槽位缺省值：数据文件外置（`data/value_conflict_slots.json`，
+/// include_str! 编译期嵌入；解析失败回退空表=仅极性规则零回归）——
+/// 治理批扩槽位改数据文件即可，不动代码。
+fn default_value_slots() -> Vec<ValueSlot> {
+    const EMBEDDED: &str = include_str!("data/value_conflict_slots.json");
+    match serde_json::from_str::<serde_json::Value>(EMBEDDED) {
+        Ok(v) => v
+            .get("slots")
+            .and_then(|s| serde_json::from_value::<Vec<ValueSlot>>(s.clone()).ok())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
 fn default_similarity_threshold() -> f32 {
     0.6
 }
@@ -270,6 +303,7 @@ impl Default for AdjudicationConfig {
             order: default_adjudication_order(),
             negation_markers: default_negation_markers(),
             similarity_threshold: default_similarity_threshold(),
+            value_slots: default_value_slots(),
         }
     }
 }
@@ -652,6 +686,36 @@ mod tests {
         assert_eq!(
             r.budget.degradation_order,
             vec!["stable", "summaries", "events"]
+        );
+    }
+
+    #[test]
+    fn test_value_slots_embedded_file_loads() {
+        // B-411 P2:独占值槽位数据文件外置——嵌入文件可解析、正主槽位在位、
+        // 保守纪律(裸泛词形不入表:并列语义碰撞)、recipe 旧 JSON 零迁移
+        let slots = default_value_slots();
+        assert!(!slots.is_empty(), "嵌入槽位表应可解析");
+        let ws = slots
+            .iter()
+            .find(|s| s.name == "workspace_root")
+            .expect("workspace_root 正主槽位缺失");
+        for core in ["sandbox_root", "current_working_directory", "当前工作区"] {
+            assert!(
+                ws.key_tokens.iter().any(|t| t == core),
+                "核心词形缺失: {core}"
+            );
+        }
+        for banned in ["工作区", "workspace"] {
+            assert!(
+                !ws.key_tokens.iter().any(|t| t == banned),
+                "裸泛词形不得入表(并列语义碰撞): {banned}"
+            );
+        }
+        // 旧 recipe JSON(无 value_slots 字段)反序列化零迁移:serde default 接管
+        let r: MemoryRecipe = serde_json::from_str("{}").unwrap();
+        assert!(
+            !r.adjudication.value_slots.is_empty(),
+            "缺省反序列化应取嵌入槽位表"
         );
     }
 
