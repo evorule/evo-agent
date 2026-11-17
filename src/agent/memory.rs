@@ -3866,12 +3866,19 @@ impl MemoryManager {
         };
         let fact_ids: Vec<u64> = pending.iter().map(|(f, _)| *f).collect();
         let paths = store.paths_by_fact_ids(&fact_ids);
-        // 状态防御(记忆审计 2026-11-13):回写前服务端状态复检——forget 墓碑=同 path
-        // 新版本 Tombstoned 记录,旧镜像回写会覆盖墓碑使已遗忘记忆复活。一次批量
-        // 拉家族前缀,构建 path→最新版 lifecycle 映射;复检失败(fail-open)不阻断
-        // 既有回写语义(batch 自身失败有 pending 回滚兜底)。
+        // 状态防御(记忆审计 2026-11-13;登记册 o30 收紧):回写前服务端状态复检
+        // ——forget 墓碑=同 path 新版本 Tombstoned 记录,旧镜像回写会覆盖墓碑使
+        // 已遗忘记忆复活。一次批量拉家族前缀,构建 path→最新版 lifecycle 映射;
+        // 复检不可达=fail-closed(o30 收紧:原 fail-open 在墓碑覆盖复活风险不可
+        // 排除的窗口裸写——增量归还 pending 下轮重试,cache 镜像仍如实累加,
+        // 与 batch 失败路径同口径)。
         let mut server_states: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        // 复检不可达=fail-closed(o30 收紧):原 fail-open 在墓碑覆盖复活风险
+        // 不可排除的窗口裸写服务端——收紧为「本轮不落服务端」,但本地镜像
+        // 语义(usage/Reinforced/置信演化)与增量归还 pending 均保持,与
+        // batch 失败路径同口径(漂移归 B3 对账)。
+        let mut server_reachable = true;
         let family_prefix = format!("shared.{}.", self.namespace);
         match self
             .evorule_client
@@ -3879,6 +3886,17 @@ impl MemoryManager {
             .await
         {
             Ok(facts) => {
+                // null 墓碑补录(o30):latest_entries_by_path 滤 null 值形态,
+                // tombstone 工具写的 null 墓碑路径需单列入守卫——否则守卫对
+                // 该形态失明,回写复活 ghost(E20 同型)。判据复用
+                // latest_values_by_path 的 tombstoned 返回列(同 latest-wins)。
+                let tuples: Vec<(String, u64, serde_json::Value)> = facts
+                    .iter()
+                    .map(|f| (f.path.clone(), f.version, f.value.clone()))
+                    .collect();
+                for null_path in latest_values_by_path(tuples).1 {
+                    server_states.insert(null_path, "Tombstoned".to_string());
+                }
                 for (entry, _) in latest_entries_by_path(facts) {
                     if let Ok(r) = serde_json::from_value::<MemoryRecord>(entry.value) {
                         if let Some(st) = &r.lifecycle_state {
@@ -3887,11 +3905,14 @@ impl MemoryManager {
                     }
                 }
             }
-            Err(e) => tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                "usage flush: 服务端状态复检不可达,fail-open 继续回写(兜底=batch 失败回滚)"
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "usage flush: 服务端状态复检不可达,fail-closed——本轮不落服务端(增量归还 pending 下轮重试)"
+                );
+                server_reachable = false;
+            }
         }
         let mut batch: Vec<(String, serde_json::Value)> = Vec::new();
         let mut batched: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -3904,11 +3925,15 @@ impl MemoryManager {
             let Some(cache_key) = cache_key else {
                 continue;
             };
-            // 状态防御:服务端 latest 已是保护态(Tombstoned/Promoted/Archived)
+            // 状态防御:服务端 latest 已是保护态(Tombstoned/Promoted/Archived,
+            // o30 补 Superseded——裁决败者同样不可被 usage 回写覆盖)
             // → 跳过回写,增量弃置(墓碑后 usage 无意义;归还 pending 会无限重试)。
             // 判据与渲染层墓碑过滤(memory.rs audit_recall_section)同源。
             if let Some(st) = server_states.get(path) {
-                if matches!(st.as_str(), "Tombstoned" | "Promoted" | "Archived") {
+                if matches!(
+                    st.as_str(),
+                    "Tombstoned" | "Promoted" | "Archived" | "Superseded"
+                ) {
                     tracing::warn!(
                         fact_id,
                         path = %path,
@@ -3946,6 +3971,20 @@ impl MemoryManager {
         }
         if batch.is_empty() {
             tracing::warn!(session_id = %session_id, "usage flush: 无可回写条目");
+            return;
+        }
+        if !server_reachable {
+            // fail-closed(o30):无守卫窗口不落服务端——全量增量归还 pending
+            // (下轮复检通过后重试);cache 镜像已如实累加,漂移归 B3 对账
+            tracing::warn!(
+                session_id = %session_id,
+                count = %batch.len(),
+                "usage flush: 复检不可达 fail-closed,增量归还 pending 下轮重试"
+            );
+            let mut map = self.usage_pending.lock().unwrap_or_else(|p| p.into_inner());
+            for (fact_id, inc) in &pending {
+                *map.entry(*fact_id).or_insert(0) += *inc;
+            }
             return;
         }
         if let Err(e) = self
@@ -8619,6 +8658,70 @@ mod tests {
         assert!(
             pending_empty,
             "服务端墓碑保护:该条目必须跳过回写且增量弃置(修复前:回写 404 归还 pending)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flush_usage_skips_null_tombstoned_path() {
+        // o30:memory_tombstone 工具写 null 墓碑形态(latest 值=null,latest-wins
+        // 语义下整条 path 视图抑制)——latest_entries_by_path 滤 null 形态,
+        // 修复前守卫对该形态失明(回写复活 ghost);修复后经
+        // latest_values_by_path 的 tombstoned 列补录守卫。
+        let mut server = mockito::Server::new_async().await;
+        let mut mgr = MemoryManager::new("ns", EvoruleApiClient::new(&server.url()));
+        mgr.set_session_id("s1");
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::agent::lexstore::LexStore::open(&dir.path().join("lex.db")).unwrap();
+        store
+            .replace_partition(
+                "shared.ns.events.",
+                &[(1, "shared.ns.events.e1".to_string(), serde_json::json!({}))],
+            )
+            .unwrap();
+        mgr.set_lex_store(std::sync::Arc::new(store));
+        let mut rec = MemoryRecord::new("events.e1", "v", 1);
+        rec.fact_id = Some(1);
+        mgr.cache.insert("shared::events.e1".to_string(), rec);
+        mgr.usage_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(1, 1);
+        // 服务端 latest = null 墓碑(version 2)+更老原值(version 1)
+        let older = serde_json::json!({
+            "key": "events.e1", "value": "v", "timestamp": 1, "fact_id": 1
+        });
+        let g = server
+            .mock("GET", "/api/shared/facts")
+            .match_query("prefix=shared.ns.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!([
+                    {"fact_id": 2, "path": "shared.ns.events.e1", "version": 2,
+                     "source_session_id": 0, "value": null},
+                    {"fact_id": 1, "path": "shared.ns.events.e1", "version": 1,
+                     "source_session_id": 0, "value": older}
+                ])
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        mgr.flush_usage("s1").await;
+        g.assert_async().await;
+        let pending_empty = mgr
+            .usage_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&1)
+            .is_none();
+        assert!(
+            pending_empty,
+            "null 墓碑保护:该条目必须跳过回写且增量弃置(修复前:守卫失明回写复活 ghost)"
+        );
+        let after = mgr.cache.get("shared::events.e1").unwrap();
+        assert_eq!(
+            after.usage_count, 0,
+            "null 墓碑弃置语义=增量不进 cache 镜像"
         );
     }
 
