@@ -442,7 +442,7 @@ fn default_safe_toolkit_core(
         crate::agent::session_spawn_tool::SESSION_SPAWN_TOOL,
         Arc::new(crate::agent::session_spawn_tool::SessionSpawnTool::unwired()),
     );
-    // 自主会话链观测面(design-105 A1):占位/会话期重绑同 session_spawn
+    // 自主会话链观测面(链观测闭环):占位/会话期重绑同 session_spawn
     handler.register_static(
         crate::builtin_tools::chain_status::CHAIN_STATUS_TOOL,
         Arc::new(crate::builtin_tools::chain_status::ChainStatusTool::unwired()),
@@ -1448,7 +1448,7 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
             description: "Observability for autonomous session chains spawned via
                           session_spawn: list child sessions with their first goals
                           and live server status, or query a single child session
-                          (design-105 A1). Read-only; requires an active chain.
+                          (链观测闭环). Read-only; requires an active chain.
                           Server unreachable entries are marked degraded."
                 .to_string(),
             parameters: vec![

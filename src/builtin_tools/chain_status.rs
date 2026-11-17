@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! `chain_status` —— 自主会话链观测工具（P2 多链并行与观测闭环;design-105 A1/A3）。
+//! `chain_status` —— 自主会话链观测工具（P2 多链并行与观测闭环;链观测闭环/A3）。
 //!
 //! 与 `session_spawn` 启动面配对:spawn 脱管子会话后,父会话经本工具
 //! 轮询子会话状态(server 会话真相单源)与链上在册清单——观测闭环补齐
-//! 「spawn 后失联」缺口(design-105 缺口②③)。
+//! 「spawn 后失联」缺口(历史观测缺口)。
 //!
 //! ## 形态
 //!
