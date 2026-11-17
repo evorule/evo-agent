@@ -272,6 +272,7 @@ pub const SANDBOX_CAPABLE_TOOLS: &[&str] = &[
     "read_back",
     "file_write",
     "edit_file",
+    "apply_patch",
     "workspace_undo",
     "file_create",
     "file_move",

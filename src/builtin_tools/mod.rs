@@ -58,6 +58,7 @@ pub mod accounting;
 // (Win32 FFI 无 std 兑现形态);模块级哨兵由 forbid 降 deny,仅此模块内部 allow
 #[cfg(windows)]
 pub mod appcontainer;
+pub mod apply_patch;
 pub mod ask_user;
 pub mod background_jobs;
 pub mod build_check;
@@ -353,6 +354,11 @@ fn default_safe_toolkit_core(
     handler.register_static(
         git_bisect::GIT_BISECT_TOOL,
         Arc::new(git_bisect::GitBisectTool::wired(&workdir_buf)),
+    );
+    // 容错 patch 工具:unified diff 容错链落地(精确/三方归并/部分应用)
+    handler.register_static(
+        apply_patch::APPLY_PATCH_TOOL,
+        Arc::new(apply_patch::ApplyPatchTool::wired(&workdir_buf)),
     );
     handler.register_static("http_get", Arc::new(http_get::HttpGetTool::new()));
     // 批K 段2:网络面第二/三件——网页抓取取读(http_get 防线全量复用)与
@@ -1081,6 +1087,45 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     r#type: "array".to_string(),
                     description: "run required: judge command argv (1..=32 non-empty strings, no \
                                   shell). Exit 0 = good, non-zero = bad, 125 = skip."
+                        .to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "apply_patch".to_string(),
+            description: "Fault-tolerant patch application for unified diffs: exact apply first, \
+                          then three-way merge against the committed blobs on context drift, \
+                          then partial apply (--reject: applicable hunks land, rejected hunks \
+                          get .rej companion files listed in the response). check = dry run \
+                          reporting the reachable tier without writing. Patches travel via a \
+                          temp file (large diffs fine); all failures are fail-visible."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "action".to_string(),
+                    r#type: "string".to_string(),
+                    description: "One of: check, apply.".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "patch".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Unified diff text (non-empty).".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "three_way".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "apply optional: allow three-way merge tier (default true)."
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "reject_fallback".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "apply optional: allow partial application with .rej companions \
+                                  (default true)."
                         .to_string(),
                     required: false,
                 },
