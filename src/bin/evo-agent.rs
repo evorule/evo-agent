@@ -1414,11 +1414,20 @@ fn cmd_run(
                 .with_delegate_context({
                     // delegate.maxConcurrent 设置面消费(与 serve 三面同口径:
                     // 0/缺省=不限制=现行为零变化;>0=并行派发共享信号量帽;
-                    // 设置面读取失败回落 0,不阻塞会话构造)
+                    // 降级回落 0=缺省语义不阻塞会话构造,但降级必须曝光——
+                    // 显式配置的帽无声消失违反 fail-visible,CLI 一次性进程
+                    // 不改硬失败[serve 面 init 失败才 panic fail-fast])
                     let cap = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
                         .map(|store| {
                             let (merged, _) = store.merged();
                             evo_agent::api::settings::delegate_max_concurrent(&merged)
+                        })
+                        .map_err(|e| {
+                            eprintln!(
+                                "[delegate] settings store init failed ({e}); \
+                                 delegate.maxConcurrent falls back to 0 (unlimited)"
+                            );
+                            e
                         })
                         .unwrap_or(0);
                     let ctx = evo_agent::agent::delegate::DelegateContext::new(
