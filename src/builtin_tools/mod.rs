@@ -76,6 +76,7 @@ pub mod file_move;
 pub mod file_read;
 pub mod file_write;
 pub mod fs_safety;
+pub mod git_bisect;
 pub mod git_stash;
 pub mod git_tools;
 pub mod grep_files;
@@ -347,6 +348,11 @@ fn default_safe_toolkit_core(
     handler.register_static(
         git_stash::GIT_STASH_TOOL,
         Arc::new(git_stash::GitStashTool::wired(&workdir_buf)),
+    );
+    // stash/bisect 工具族批二:回归定位二分自动化(v1 交互步进)
+    handler.register_static(
+        git_bisect::GIT_BISECT_TOOL,
+        Arc::new(git_bisect::GitBisectTool::wired(&workdir_buf)),
     );
     handler.register_static("http_get", Arc::new(http_get::HttpGetTool::new()));
     // 批K 段2:网络面第二/三件——网页抓取取读(http_get 防线全量复用)与
@@ -1023,6 +1029,47 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     name: "ref".to_string(),
                     r#type: "string".to_string(),
                     description: "show/pop/apply/drop optional: stash@{n} entry (default = latest)."
+                        .to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "git_bisect".to_string(),
+            description: "Regression bisection automation: start a session with bad and good \
+                          anchor refs, judge the checked-out commit with bad/good (or skip), \
+                          inspect status/log at any step, and reset to abandon and restore the \
+                          original checkout. Requires a clean tree to start; status reports \
+                          session state (head, anchors, steps); avoid parallel write operations \
+                          while a session is active. The session auto-closes when the first bad \
+                          commit is identified."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "action".to_string(),
+                    r#type: "string".to_string(),
+                    description: "One of: start, bad, good, skip, status, log, reset.".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "bad".to_string(),
+                    r#type: "string".to_string(),
+                    description: "start required: anchor ref known to have the regression."
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "good".to_string(),
+                    r#type: "string".to_string(),
+                    description: "start required: anchor ref known to be free of the regression."
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "ref".to_string(),
+                    r#type: "string".to_string(),
+                    description: "bad/good optional: judge a specific commit-ish instead of the \
+                                  current HEAD."
                         .to_string(),
                     required: false,
                 },
