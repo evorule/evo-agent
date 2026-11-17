@@ -121,6 +121,34 @@ pub struct ChainRuntimeState {
     budget_tokens: u64,
     max_chain_depth: u32,
     spawn_repeats: Mutex<SpawnRepeatGuard>,
+    /// 在册子会话清单（design-105 A1 观测闭环；spawn 成功时记录）
+    children: Mutex<Vec<ChildRecord>>,
+}
+
+/// 在册子会话记录（spawn 成功时快照）
+#[derive(Debug, Clone)]
+pub struct ChildRecord {
+    /// 子会话 ID（server fork 产物）
+    pub child_session_id: String,
+    /// 自动驱动的首轮 goal（交接自检）
+    pub first_goal: String,
+    /// spawn 时刻（epoch ms）
+    pub spawned_at_epoch_ms: u64,
+}
+
+/// 链宽度帽（同父在册子会话数上限；design-105 A2，v1=3 与链深硬顶对齐）
+pub const MAX_CHAIN_BREADTH: usize = 3;
+
+/// 宽度帽检查（纯函数）：在册未收割子会话数达上限即拒
+pub fn check_breadth(current: usize, max_breadth: usize) -> Result<(), String> {
+    if current >= max_breadth {
+        Err(format!(
+            "session_spawn rejected: chain breadth cap reached ({current} in-flight children \
+             >= max {max_breadth}); harvest or remove a child with chain_status first"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 impl ChainRuntimeState {
@@ -137,7 +165,39 @@ impl ChainRuntimeState {
             budget_tokens,
             max_chain_depth,
             spawn_repeats: Mutex::new(SpawnRepeatGuard::default()),
+            children: Mutex::new(Vec::new()),
         }
+    }
+
+    /// 在册子会话记录（spawn 成功后调用；design-105 A1 观测闭环数据源）
+    pub fn record_child(&self, child_session_id: &str, first_goal: &str) {
+        self.children
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(ChildRecord {
+                child_session_id: child_session_id.to_string(),
+                first_goal: first_goal.to_string(),
+                spawned_at_epoch_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            });
+    }
+
+    /// 在册子会话清单快照（chain_status 工具 list 动作数据源）
+    pub fn children_list(&self) -> Vec<ChildRecord> {
+        self.children
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// 在册子会话数（宽度帽判定输入）
+    pub fn children_count(&self) -> usize {
+        self.children
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 
     /// 置停链标记（幂等：保留首个原因）
@@ -355,6 +415,9 @@ impl ToolFunction for SessionSpawnTool {
         // 护栏 2：链累计 token 预算
         let used = w.chain.tokens_used();
         check_budget(used, w.chain.budget_tokens())?;
+        // 护栏 2.5：链宽度帽（design-105 A2——同父在册子会话数上限；超帽
+        // fail-visible，观测(chain_status list)或回收后重试）
+        check_breadth(w.chain.children_count(), MAX_CHAIN_BREADTH)?;
 
         // fork：server 机制层白得 parent_session_id 因果链 + 声明继承 + 内容哈希
         let child_id = w
@@ -369,6 +432,8 @@ impl ToolFunction for SessionSpawnTool {
         // runner，run_continuation 注入首条 goal（读交接档自检），后台排水
         // 事件流（G16 续跑语义，ws_handler 同构）。
         let first_goal = compose_first_goal(&w.session_id, child_depth);
+        // design-105 A1：子会话入册（chain_status 观测闭环数据源）
+        w.chain.record_child(&child_id, &first_goal);
         let child_runner = (w.factory)(&child_id);
         let mut stream =
             child_runner.run_continuation(child_id.clone(), first_goal.clone(), Vec::new());
