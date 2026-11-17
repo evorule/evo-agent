@@ -244,7 +244,7 @@ impl SpecSource {
                 .find(|s| s.name == name)
                 .map(|s| (s.description, params_to_openai(&s.parameters))),
             SpecSource::Delegate => {
-                // design-104:delegate_many 同源分派(按名)
+                // delegate_many 同源分派(按名)
                 if name == "delegate_many" {
                     let s = crate::builtin_tools::delegate_many::delegate_many_tool_spec();
                     Some((s.description, params_to_openai(&s.parameters)))
@@ -893,7 +893,7 @@ fn rule_manifests() -> Vec<ToolManifest> {
 ///
 /// delegate 统一装配批起 adjudication_class=Sensitive（接 P2 通道，设计档
 /// §3.2 终态；PR-1 行为等价期的 Standard 暂标已随快照重录一并演进）。
-/// 批量并行委托（design-104 方案 A）：同 delegate 风险面（Sensitive+子代理执行）。
+/// 批量并行委托（design 批准方案 A）：同 delegate 风险面（Sensitive+子代理执行）。
 fn delegate_many_manifest() -> ToolManifest {
     let mut m = base(
         "delegate_many",
