@@ -519,6 +519,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // dev-feedback P2: 多 worktree 自动化(并行任务隔离的机制化承载;
         // 建仓检出保护/脏树 fail-visible/分支名白名单;GitWrite 域,
         // 审批走基线档)
+        // 开关豁免注记(登记册 o33 裁定=文档化豁免):不绑 agentTools.gitWrite
+        // ——worktree 只建/删隔离检出,不改动主工作树与仓内提交状态,语义
+        // 边界与 stash/bisect(stage/commit 级写族)不同层;豁免为有意选择
         b("worktree", vec![GitWrite]),
         // 自主会话链观测面(链观测闭环):纯查询零写面,ReadOnly 显式
         // 标定(并行调度分组判据);Delegate 域(会话链治理面同源)

@@ -74,7 +74,8 @@ pub struct SettingEntry {
     pub category: &'static str,
     /// 展示描述（设置页与 JSON 补全文档共用）
     pub description: &'static str,
-    /// `window` | `application`（application 禁工作区覆盖；v1 无此类键，机制预留）
+    /// `window` | `application`（application 禁工作区覆盖——approval.mode.*
+    /// 族与 delegate.maxConcurrent 等部署面键在册,拒收留痕见 merged()）
     pub scope: &'static str,
 }
 
@@ -994,7 +995,9 @@ impl WorkbenchSettingsStore {
 
     /// 合并读取：Default→User→Workspace（后层覆盖前层）。
     /// 返回 `(settings, sources)`；sources 每键标注 `default|user|workspace`。
-    /// workspace 层未知键忽略、非法值/application scope 键跳过（fail-soft）。
+    /// workspace 层未知键忽略、application scope 键拒收（stderr 留痕——手改
+    /// 该文件设 application 键曾致部署面误判「已激活」数小时，登记册 o31）、
+    /// 非法值跳过（fail-soft）。
     pub fn merged(&self) -> (Map<String, Value>, Map<String, Value>) {
         let user = load_layer(&self.user_path);
         let ws_raw = load_layer(&self.workspace_path);
@@ -1003,6 +1006,19 @@ impl WorkbenchSettingsStore {
             if let Some(e) = find_entry(&k) {
                 if accept_workspace_value(&e, &v) {
                     workspace.insert(k, v);
+                } else if e.scope == "application" {
+                    // o31:application scope 键禁工作区覆盖是守护行为,但静默
+                    // 拒收曾致部署面误判(手改文件者以为生效)——stderr 留痕
+                    eprintln!(
+                        "[settings] workspace-layer override for application-scoped \
+                         key '{k}' ignored (edit {}/data/workbench_settings.json or \
+                         use the settings page instead)",
+                        self.user_path
+                            .parent()
+                            .and_then(|p| p.parent())
+                            .map(|p| p.to_string_lossy())
+                            .unwrap_or_default()
+                    );
                 }
             }
         }

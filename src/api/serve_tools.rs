@@ -418,7 +418,7 @@ pub(crate) const REGULATION_INDEX_AWARENESS_SEGMENT: &str = "【规范入口索�
 五、规则判定一句话——违规机器可判→规则层;纯知识风格→上下文,永不规则化。\n\
 受限情形的答复必须以【三问留痕】段显式留痕,格式:【三问留痕】①缺陷/特性判定:<结论+依据>;②归属层:<层+方案>;③红线核验:<不需/已过程序>。\n\
 知识地图(规范原档在宿主侧知识库,你的沙箱内不可达;需要深读时如实说明并请宿主提供,不要猜测或编造):\n\
-能力缺口三问程序与案例→宪法档;规则落成/分层/治理→design-07/08/09;产品方向取舍→evo-agent 产品化指导;既有问题→OBSERVATIONS 登记册。";
+能力缺口三问程序与案例→宪法档;规则落成/分层/治理→规则分层设计档;产品方向取舍→evo-agent 产品化指导;既有问题→OBSERVATIONS 登记册。";
 
 /// 规范入口索引感知段注入（serve 三路径共用,静态文本,无网络调用）
 ///
@@ -2167,7 +2167,7 @@ service_tools = ["config_persist", "rule_sandbox"]
         // 权威源同步纪律的最低护栏:登记册/宪法/design 关键域在地图中可发现
         assert!(seg.contains("登记册"));
         assert!(seg.contains("宪法档"));
-        assert!(seg.contains("design-07/08/09"));
+        assert!(seg.contains("规则分层设计档"), "设计域锚点(中性化措辞)");
     }
 
     #[test]
