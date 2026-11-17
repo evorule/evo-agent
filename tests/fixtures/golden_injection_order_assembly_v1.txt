@@ -5,13 +5,13 @@
 【北极星】测试目标锚。
 
 ## Stable Facts
-- [unclassified] golden.stable: 固定稳定事实内容。
+- [unclassified] golden.stable (as_of:1700000000): 固定稳定事实内容。
 
 ## Previous Sessions
-- golden.session: 固定会话摘要。
+- golden.session (as_of:1700000100): 固定会话摘要。
 
 ## Relevant Events
-- golden.events.e1: 固定事件。
+- golden.events.e1 (as_of:1700000200): 固定事件。
 
 
 ## Handoff Base

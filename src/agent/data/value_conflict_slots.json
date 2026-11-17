@@ -1,0 +1,21 @@
+{
+  "slots": [
+    {
+      "name": "workspace_root",
+      "key_tokens": [
+        "workspace_root",
+        "working_directory",
+        "working_dir",
+        "current_working_directory",
+        "current_directory",
+        "cwd",
+        "sandbox_root",
+        "工作区绑定",
+        "工作区根",
+        "工作区路径",
+        "当前工作区",
+        "工作目录"
+      ]
+    }
+  ]
+}
