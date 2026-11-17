@@ -520,6 +520,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 建仓检出保护/脏树 fail-visible/分支名白名单;GitWrite 域,
         // 审批走基线档)
         b("worktree", vec![GitWrite]),
+        // 自主会话链观测面(design-105 A1):纯查询零写面,ReadOnly 显式
+        // 标定(并行调度分组判据);Delegate 域(会话链治理面同源)
+        b("chain_status", vec![CapDomain::Delegate]),
         // dev-feedback P0a 余量:后台作业轮询面(与 shell_exec background=true
         // 启动面配对;只操作本 serve 自己收容的作业句柄,零新命令执行面;
         // kill 族级终止=写面语义,Mutating 保守缺省)
@@ -632,10 +635,10 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 审批模式——分级不影响其审批臂，只影响并行预执行分组。
         match m.name.as_str() {
             "file_read" | "image_load" | "file_list" | "search_files" | "grep_files"
-            | "code_search" | "codegraph" | "git_status" | "git_diff" | "git_log"
-            | "query_journal" | "query_trace" | "read_back" | "diff_runs" | "read_skill"
-            | "memory_recall" | "audit_query" | "audit_summary" | "todo_read" | "handover_read"
-            | "web_search" => {
+            | "code_search" | "codegraph" | "chain_status" | "git_status" | "git_diff"
+            | "git_log" | "query_journal" | "query_trace" | "read_back" | "diff_runs"
+            | "read_skill" | "memory_recall" | "audit_query" | "audit_summary" | "todo_read"
+            | "handover_read" | "web_search" => {
                 m.side_effect = EffectClass::ReadOnly;
             }
             _ => {}
@@ -1163,9 +1166,9 @@ mod tests {
         //     GitWrite 域+基线审批档；主检出/保护分支拒删内建）
         //   （批量并行委托 delegate_many +1：delegate 系 Delegate 源 +1，
         //     数量锁 111→112；Sensitive 同 delegate 风险面）
-        assert_eq!(builtin_manifests().len(), 44);
+        assert_eq!(builtin_manifests().len(), 45);
         assert_eq!(rule_manifests().len(), 60);
-        assert_eq!(all().len(), 112);
+        assert_eq!(all().len(), 113);
     }
 
     #[test]
@@ -1195,7 +1198,7 @@ mod tests {
         names.extend(memory_manifests().iter().map(|m| m.name.clone()));
         // 数量锁(与模块头「内置 43 + 规则 60 + delegate 1 + memory 6 = 110」
         // 同源;计数漂移此处当场红)
-        assert_eq!(names.len(), 112, "static manifest count lock");
+        assert_eq!(names.len(), 113, "static manifest count lock");
         let mut sorted = names.clone();
         sorted.sort();
         let before = sorted.len();
@@ -1320,7 +1323,7 @@ mod tests {
             .filter(|m| m.side_effect == EffectClass::ReadOnly)
             .map(|m| m.name.as_str())
             .collect();
-        assert_eq!(readonly.len(), 29, "ReadOnly 标定数锁: {:?}", readonly);
+        assert_eq!(readonly.len(), 30, "ReadOnly 标定数锁: {:?}", readonly);
         let look = |n: &str| lookup_static(n).unwrap().side_effect;
         // 内置只读族抽样
         assert_eq!(look("file_read"), EffectClass::ReadOnly);

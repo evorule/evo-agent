@@ -61,6 +61,7 @@ pub mod appcontainer;
 pub mod ask_user;
 pub mod background_jobs;
 pub mod build_check;
+pub mod chain_status;
 pub mod code_search;
 pub mod codegraph;
 pub mod companion_observe;
@@ -440,6 +441,11 @@ fn default_safe_toolkit_core(
     handler.register_static(
         crate::agent::session_spawn_tool::SESSION_SPAWN_TOOL,
         Arc::new(crate::agent::session_spawn_tool::SessionSpawnTool::unwired()),
+    );
+    // 自主会话链观测面(design-105 A1):占位/会话期重绑同 session_spawn
+    handler.register_static(
+        crate::builtin_tools::chain_status::CHAIN_STATUS_TOOL,
+        Arc::new(crate::builtin_tools::chain_status::ChainStatusTool::unwired()),
     );
     // 记忆墓碑（沉淀污染环治理出口 O-487②）：同占位/会话期重绑形态；
     // 默认不进 LLM 契约（agentTools.memory_tombstone 默认关），显式启用后
@@ -1436,6 +1442,31 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                           both sessions working on the same task."
                 .to_string(),
             parameters: vec![],
+        },
+        ToolSpec {
+            name: "chain_status".to_string(),
+            description: "Observability for autonomous session chains spawned via
+                          session_spawn: list child sessions with their first goals
+                          and live server status, or query a single child session
+                          (design-105 A1). Read-only; requires an active chain.
+                          Server unreachable entries are marked degraded."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "action".to_string(),
+                    r#type: "string".to_string(),
+                    description: "One of: list, query.".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "child_id".to_string(),
+                    r#type: "string".to_string(),
+                    description: "query: the child session id (from a prior
+                                  session_spawn envelope)."
+                        .to_string(),
+                    required: false,
+                },
+            ],
         },
         ToolSpec {
             name: "audit_query".to_string(),
