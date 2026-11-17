@@ -490,6 +490,9 @@ pub(crate) fn execute_stream(
         }
 
         // SSE 增量解析(\n\n 切帧,残留缓冲收尾——与 relay 切帧语义对齐)
+        // o10 根因修复:字节块经流式 UTF-8 安全解码器入缓冲——多字节字符跨
+        // 网络块切分不再被 lossy 替换成 U+FFFD(坏字①型根因封死)
+        let mut decoder = crate::io_handlers::stream_text::StreamTextDecoder::new();
         let mut buffer = String::new();
         let mut acc_content = String::new();
         let mut acc_reasoning = String::new();
@@ -525,9 +528,13 @@ pub(crate) fn execute_stream(
                 }
             }
             match sse.next().await {
-                Some(Ok(chunk)) => {
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
-                }
+                Some(Ok(chunk)) => match decoder.feed(&chunk) {
+                    Ok(text) => buffer.push_str(&text),
+                    Err(e) => {
+                        yield Err(format!("LLM stream decode failed: {e}"));
+                        return;
+                    }
+                },
                 Some(Err(e)) => {
                     yield Err(format!("LLM stream read failed: {}", e));
                     return;

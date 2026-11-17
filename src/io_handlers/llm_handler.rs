@@ -33,6 +33,8 @@
 
 use std::time::Duration;
 
+use crate::io_handlers::stream_text::StreamTextDecoder;
+
 use async_stream::stream;
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -897,6 +899,11 @@ impl LlmHandler {
                         }
                         Ok(resp) => {
                             // === 真流式:bytes_stream 增量解析,逐帧下行(不经整包缓冲) ===
+                            // o10 根因修复:字节块经流式 UTF-8 安全解码器入缓冲——
+                            // 多字节字符跨网络块切分不再被 lossy 替换成 U+FFFD
+                            // (坏字①型根因封死);真损坏 fail-visible 走既有
+                            // fallback/报错链。
+                            let mut decoder = StreamTextDecoder::new();
                             let mut buffer = String::new();
                             let mut saw_reasoning = false;
                             let mut saw_done = false;
@@ -935,9 +942,19 @@ impl LlmHandler {
                                     }
                                 }
                                 match sse.next().await {
-                                    Some(Ok(chunk)) => {
-                                        buffer.push_str(&String::from_utf8_lossy(&chunk));
-                                    }
+                                    Some(Ok(chunk)) => match decoder.feed(&chunk) {
+                                        Ok(text) => buffer.push_str(&text),
+                                        Err(e) => {
+                                            let msg =
+                                                format!("LLM stream decode failed: {e}");
+                                            if !fallback_disabled && !streamed_content {
+                                                fallback_reason = Some(msg);
+                                                break 'stream_attempt;
+                                            }
+                                            yield Err(msg);
+                                            return;
+                                        }
+                                    },
                                     Some(Err(e)) => {
                                         let msg = format!("LLM stream read failed: {}", e);
                                         if !fallback_disabled && !streamed_content {

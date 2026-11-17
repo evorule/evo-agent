@@ -5,6 +5,7 @@
 //! I/O Handler 实现 —— LLM 调用和工具调用
 pub mod llm_direct;
 pub mod llm_handler;
+pub mod stream_text;
 pub mod tool_handler;
 
 pub use llm_handler::{LlmHandler, StreamChunk};
