@@ -555,6 +555,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // stash/bisect 工具族批二:回归定位二分自动化——detached HEAD 走动+
         // BISECT_* 状态文件=git 面最强状态改变器,同写族通道
         b("git_bisect", vec![GitWrite]),
+        // 容错 patch 工具:unified diff 容错链落地(精确/三方归并/部分应用)
+        // ——写面落盘,file_write/edit_file 同族(FsWrite 域 Sentineled)
+        b("apply_patch", vec![FsWrite]),
         // 查账工具族（工具面统一架构 PR-11a）：会话账面只读查询——journal
         // 事件流/工具轨迹/文件现势+staleness/两段文本比对。全部 Standard
         // （免裁决但落账：查账自身入账）+ AutoPolicy（查账是减错动作本身，
@@ -663,7 +666,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             // 工具维持既有审批策略，由 handler 内联沙箱检查 + 规则层
             // enforce 双层把守）。edit_file 同族：写面精准编辑（批K 段1），
             // 意图信号经 resolve_tool_intent 采集（path 字段快筛同族）
-            "file_write" | "edit_file" => {
+            "file_write" | "edit_file" | "apply_patch" => {
                 m.adjudication_class = AdjudicationClass::Sentineled;
             }
             // git 写族：P2 裁决在通道；D1 建议上 enforce（PR-5 规则正本入库时
@@ -723,7 +726,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         m.default_switch = match m.name.as_str() {
             "file_create" => sw(SWITCH_FILE_CREATE, true),
             // 批K 段1:写面精准编辑,默认开(低风险高频,同 fileCreate 先例)
-            "edit_file" => sw(SWITCH_EDIT_FILE, true),
+            "edit_file" | "apply_patch" => sw(SWITCH_EDIT_FILE, true),
             // 写面撤销批:弹栈回退安全网,默认开(不引入新内容只回退;
             // 关=agent 改坏后无自助退出面,回退到用户兜底)
             "workspace_undo" => sw(SWITCH_WORKSPACE_UNDO, true),
@@ -1176,9 +1179,11 @@ mod tests {
         //     113→114；Sensitive 同 git 写族面）
         //   （stash/bisect 工具族批二 git_bisect +1：数量锁
         //     114→115；Sensitive 同 git 写族面）
-        assert_eq!(builtin_manifests().len(), 47);
+        //   （容错 patch apply_patch +1：FsWrite 域 Sentineled，
+        //     数量锁 115→116）
+        assert_eq!(builtin_manifests().len(), 48);
         assert_eq!(rule_manifests().len(), 60);
-        assert_eq!(all().len(), 115);
+        assert_eq!(all().len(), 116);
     }
 
     #[test]
@@ -1208,7 +1213,7 @@ mod tests {
         names.extend(memory_manifests().iter().map(|m| m.name.clone()));
         // 数量锁(与模块头「内置+规则+delegate+memory」演进同源;计数漂移
         // 此处当场红)
-        assert_eq!(names.len(), 115, "static manifest count lock");
+        assert_eq!(names.len(), 116, "static manifest count lock");
         let mut sorted = names.clone();
         sorted.sort();
         let before = sorted.len();
@@ -1395,6 +1400,7 @@ mod tests {
         "git_commit",
         "git_stash",
         "git_bisect",
+        "apply_patch",
         "rule_create",
         "rule_update",
         "rule_submit",
@@ -1486,6 +1492,7 @@ mod tests {
         assert_eq!(
             sentineled,
             vec![
+                "apply_patch",
                 "edit_file",
                 "file_create",
                 "file_delete",
@@ -1505,6 +1512,7 @@ mod tests {
     const SWITCH_SNAPSHOT: &[(&str, &str, bool)] = &[
         ("file_create", "agentTools.fileCreate", true),
         ("edit_file", "agentTools.editFile", true),
+        ("apply_patch", "agentTools.editFile", true),
         ("web_fetch", "agentTools.webFetch", true),
         ("web_search", "agentTools.webSearch", true),
         ("code_search", "agentTools.codeSearch", true),
