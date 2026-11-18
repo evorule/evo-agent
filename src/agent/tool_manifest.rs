@@ -718,6 +718,11 @@ fn builtin_manifests() -> Vec<ToolManifest> {
                 m.approval_policy = ApprovalPolicy::ManualDefault;
                 m.timeout_class = TimeoutClass::Long;
             }
+            // shell_exec:超时改 Long(B-426 审计 P1-3:pytest/build 类命令
+            // 常超 60s,Default 60s 会 kill;600s 与 build_check 同层)
+            "shell_exec" => {
+                m.timeout_class = TimeoutClass::Long;
+            }
             "python_exec" => {
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }

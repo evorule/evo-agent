@@ -1286,6 +1286,10 @@ async fn construct_runner(
     // 而定义声明窗口 204800)。与 from_definition 同口径接线(单一实现
     // wire_definition_context_window),链预算基数与裁剪管路随之归真。
     runner.wire_definition_context_window(def.context_window_tokens);
+    // B-426 审计修复:WS 路径补 assembly/降级链穿线(from_definition 同口径)——
+    // AssemblyExecutor 沿 def.assembly 配方替换缺省执行器(tool_result_max_tokens
+    // /降级参数/预算比例全部归真,不再吃缺省硬编码);降级三件沿链穿线
+    runner.wire_assembly_and_demotion(&def);
     // 记忆启用时构建 MemoryManager(TTL / 持久化模式按定义透传)
     if def.memory.memory_type != "none" && !def.memory.memory_type.is_empty() {
         let mut mem = MemoryManager::new(&def.memory.namespace, state.evorule_client().clone());
