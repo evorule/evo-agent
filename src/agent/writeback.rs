@@ -112,8 +112,13 @@ fn now_iso() -> String {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
-        .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    time::OffsetDateTime::from_unix_timestamp(d.as_secs() as i64)
+        .map(|t| {
+            t.format(&time::macros::format_description!(
+                "[year]-[month]-[day]T[hour]:[minute]:[second]Z"
+            ))
+            .unwrap_or_default()
+        })
         .unwrap_or_default()
 }
 

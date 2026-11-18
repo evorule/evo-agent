@@ -518,9 +518,11 @@ fn raw_content_type(path: &Path) -> &'static str {
 
 /// IMF-fixdate(HTTP-date)格式化(Last-Modified / Date 语义)
 fn http_date(t: std::time::SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(t)
-        .format("%a, %d %b %Y %H:%M:%S GMT")
-        .to_string()
+    time::OffsetDateTime::from(t)
+        .format(&time::macros::format_description!(
+            "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
+        ))
+        .unwrap_or_default()
 }
 
 /// raw 端点的文件体流:seek 到起点 + take 定长 + ReaderStream 流式回。
@@ -710,10 +712,12 @@ pub async fn upload_file(
     Json(body): Json<UploadBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let clean = sanitize_upload_name(&body.name);
-    let rel = format!(
-        "{UPLOAD_DIR}/{}-{clean}",
-        chrono::Utc::now().format("%Y%m%d-%H%M%S%3f")
-    );
+    let ts = time::OffsetDateTime::now_utc()
+        .format(&time::macros::format_description!(
+            "[year][month][day]-[hour][minute][second][subsecond digits:3]"
+        ))
+        .unwrap_or_default();
+    let rel = format!("{UPLOAD_DIR}/{ts}-{clean}");
     let identity = gate_write(&state, "file_upload", &rel, class)?;
     // base64 长度预检(解码前粗检,防无谓大分配)+ 解码后精确校验
     if body.data_base64.len() > UPLOAD_MAX_BYTES / 3 * 4 + 4 {
