@@ -53,6 +53,59 @@ pub struct RetrievalConfig {
     /// 半衰期（天）：情景/语义分型
     #[serde(default = "default_half_life")]
     pub half_life_days: HalfLifeDays,
+    /// 召回分域限额（工具族设计档 A1）：召回帽内 user/llm/其余 分域 token 配额。
+    /// None=关态零变化（既有行为逐字节保持）。
+    #[serde(default)]
+    pub recall_domain_quotas: Option<RecallDomainQuotas>,
+    /// 时效键衰减（工具族设计档 A2）：key 命中 patterns 的条目按 age 半衰期降权
+    /// （score ×= 2^(-age_days/half_life)）。None=关态零变化。
+    #[serde(default)]
+    pub staleness_decay: Option<StalenessDecay>,
+    /// 族帽（工具族设计档 A3）：召回层同父路径键族最多 N 条（policy 序取前）。
+    /// None=关态零变化。
+    #[serde(default)]
+    pub family_cap: Option<u32>,
+}
+
+/// 召回分域限额配置（工具族设计档 A1）：召回帽内分域 token 配额百分比。
+/// System 域恒常驻不占召回帽，不在配额面。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecallDomainQuotas {
+    /// user 域配额百分比（召回帽内）
+    #[serde(default = "default_quota_user")]
+    pub user_pct: f32,
+    /// llm 域配额百分比
+    #[serde(default = "default_quota_llm")]
+    pub llm_pct: f32,
+    /// 其余域（unclassified 等）配额百分比
+    #[serde(default = "default_quota_other")]
+    pub other_pct: f32,
+}
+
+fn default_quota_user() -> f32 {
+    40.0
+}
+fn default_quota_llm() -> f32 {
+    30.0
+}
+fn default_quota_other() -> f32 {
+    30.0
+}
+
+/// 时效键衰减配置（工具族设计档 A2）：key 子串模式命中即时效键，按 age 半衰期
+/// 降权（衰减≠删除——跌出帽仍可 memory_get 显式查）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StalenessDecay {
+    /// key 子串模式（contains 匹配；如 ".status"/".next_"/".pending."）
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    /// 半衰期（天）：score ×= 2^(-age_days/half_life)
+    #[serde(default = "default_staleness_half_life")]
+    pub half_life_days: f64,
+}
+
+fn default_staleness_half_life() -> f64 {
+    7.0
 }
 
 fn default_w_relevance() -> f32 {
@@ -453,6 +506,9 @@ impl Default for MemoryRecipe {
                 w_entity: 0.0,
                 usage_cap: default_usage_cap(),
                 half_life_days: default_half_life(),
+                recall_domain_quotas: None,
+                staleness_decay: None,
+                family_cap: None,
             },
             lifecycle: LifecycleConfig {
                 promote_min_confidence: default_promote_confidence(),
@@ -540,6 +596,12 @@ pub struct RetrievalPolicy {
     pub resident_promotion_confidence: f32,
     /// 配方版本戳（随召回结果落链）
     pub recipe_version: String,
+    /// 召回分域限额（工具族设计档 A1；None=关态零变化）
+    pub recall_domain_quotas: Option<RecallDomainQuotas>,
+    /// 时效键衰减（工具族设计档 A2；None=关态零变化）
+    pub staleness_decay: Option<StalenessDecay>,
+    /// 族帽（工具族设计档 A3；None=关态零变化）
+    pub family_cap: Option<u32>,
 }
 
 impl RetrievalPolicy {
@@ -562,6 +624,9 @@ impl RetrievalPolicy {
             resident_promotion_uses: recipe.budget.resident_promotion_uses,
             resident_promotion_confidence: recipe.budget.resident_promotion_confidence,
             recipe_version: recipe.recipe_version.clone(),
+            recall_domain_quotas: recipe.retrieval.recall_domain_quotas.clone(),
+            staleness_decay: recipe.retrieval.staleness_decay.clone(),
+            family_cap: recipe.retrieval.family_cap,
         }
     }
 
@@ -584,6 +649,9 @@ impl RetrievalPolicy {
             resident_promotion_uses: default_resident_promotion_uses(),
             resident_promotion_confidence: default_resident_promotion_confidence(),
             recipe_version: "lexical-legacy".to_string(),
+            recall_domain_quotas: None,
+            staleness_decay: None,
+            family_cap: None,
         }
     }
 
