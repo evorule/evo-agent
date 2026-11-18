@@ -80,14 +80,15 @@ use crate::io_handlers::tool_handler::ToolFunction;
 /// cargo 的 install/publish/login、git 的 config/-c 等间接执行面在
 /// active 直跑前被拒——白名单背书不覆盖参数级第三方执行/外发面。
 pub const ACTIVE_COMMANDS: &[&str] = &[
-    "cargo", // Rust build/test/clippy/fmt
-    "git",   // 版本控制(只读 + 安全的写:status/log/diff/add/commit)
-    "ls",    // 列目录
-    "cat",   // 读文件(替代 file_read 用)
-    "grep",  // 文本搜索
-    "rg",    // ripgrep(更快的 grep)
-    "make",  // 构建系统
-    "find",  // 文件查找
+    "cargo",  // Rust build/test/clippy/fmt
+    "git",    // 版本控制(只读 + 安全的写:status/log/diff/add/commit)
+    "ls",     // 列目录
+    "cat",    // 读文件(替代 file_read 用)
+    "grep",   // 文本搜索
+    "rg",     // ripgrep(更快的 grep)
+    "make",   // 构建系统
+    "find",   // 文件查找
+    "pytest", // Python 测试框架(与 cargo test 同级——测试命令,RunawayGuard 配额覆盖)
 ];
 
 /// **Candidate 备选**:有合法用途,但有风险,需用户批准
@@ -525,7 +526,7 @@ impl ExecutionProfile {
 /// (一次性环境内风险主体是任务时间,不是不可逆性)。
 pub const TRUSTED_ACTIVE_COMMANDS: &[&str] = &[
     // 工作台 active 全量保留(回归不变式见测试)
-    "cargo", "git", "ls", "cat", "grep", "rg", "make", "find",
+    "cargo", "git", "ls", "cat", "grep", "rg", "make", "find", "pytest",
     // shell/解释器:隔离环境内为任务本体
     "bash", "sh", "zsh", "fish", "python", "python3", "node", "ruby", "perl",
     // 工作台 candidate 升格:一次性环境内低风险/可重建
@@ -2575,8 +2576,8 @@ mod tests {
     fn test_platform_face_counts() {
         #[cfg(windows)]
         {
-            // 基线 8 − find 降档 1 + Windows 增量 3 = 10
-            assert_eq!(effective_active_commands().len(), 10);
+            // 基线 9 − find 降档 1 + Windows 增量 3 = 11
+            assert_eq!(effective_active_commands().len(), 11);
             // 基线 20 + Windows 增量 4(find/robocopy/fc/ipconfig) = 24
             assert_eq!(effective_candidate_commands().len(), 24);
             // 基线 34 + Windows 增量 11(shutdown 基线已列不重列) = 45
@@ -2589,7 +2590,7 @@ mod tests {
             assert!(PLATFORM_CANDIDATE_ADDITIONS.is_empty());
             assert!(PLATFORM_BLOCKED_ADDITIONS.is_empty());
             assert!(PLATFORM_DEMOTED_ACTIVE.is_empty());
-            assert_eq!(effective_active_commands().len(), 8);
+            assert_eq!(effective_active_commands().len(), 9);
             assert_eq!(effective_candidate_commands().len(), 20);
             assert_eq!(effective_blocked_commands().len(), 34);
         }
@@ -2783,7 +2784,7 @@ mod tests {
             assert!(msg.contains("findstr"), "Windows 增量应在列: {msg}");
             // active 面精确形态(降档 find 不在 active,Windows 增量三件在列)
             assert!(
-                msg.contains("cargo, git, ls, cat, grep, rg, make, findstr, where, tasklist"),
+                msg.contains("cargo, git, ls, cat, grep, rg, make, pytest, findstr, where, tasklist"),
                 "active 面渲染漂移: {msg}"
             );
         }
