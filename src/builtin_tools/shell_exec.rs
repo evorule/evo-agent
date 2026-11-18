@@ -2784,7 +2784,9 @@ mod tests {
             assert!(msg.contains("findstr"), "Windows 增量应在列: {msg}");
             // active 面精确形态(降档 find 不在 active,Windows 增量三件在列)
             assert!(
-                msg.contains("cargo, git, ls, cat, grep, rg, make, pytest, findstr, where, tasklist"),
+                msg.contains(
+                    "cargo, git, ls, cat, grep, rg, make, pytest, findstr, where, tasklist"
+                ),
                 "active 面渲染漂移: {msg}"
             );
         }
