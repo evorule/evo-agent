@@ -2019,6 +2019,9 @@ fn shell_exec_description() -> String {
          **Blocked (always rejected, no candidate path):** {}\n\n\
          **Rules:**\n\
          - No shell — args passed directly (no pipe, no redirect, no glob expansion)\n\
+         - Quotes group args: double/single quotes are consumed and an empty\n\
+         quoted segment passes an empty argument (e.g. `rg -n \"\" file` dumps\n\
+         all lines); backslash is a literal character, not an escape\n\
          - Shell metacharacters rejected: ; | & $ ` > < ( )\n\
          - To use a candidate command: the call returns a needs_approval proposal — \
          show it to the user; after they approve, re-issue the same call to execute",
