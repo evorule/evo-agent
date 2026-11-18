@@ -1454,6 +1454,60 @@ impl ShellExecTool {
         ))
     }
 
+    /// 命令行切分单源（引号感知 tokenizer；三调用点：candidate 评估/
+    /// AppContainer 低盒/宿主主路径——历史上各写各的 `split_whitespace`，
+    /// 从不去引号，`rg -n "" file` 的 `""` 被原样传成两字符 pattern）
+    ///
+    /// 语义（最小引号集，Windows 路径友好）：
+    /// - 引号外按 ASCII 空白切分；
+    /// - 双引号 `"…"` / 单引号 `'…'`：内容逐字保留（含空白），引号自身消费；
+    ///   **空引号段 `""` 产出一个空 token（保留不丢）**；
+    /// - 相邻段直接拼接（`a"b c"d` → `ab cd`）；
+    /// - 反斜杠是字面字符不是转义符（`D:\dir\file` 逐字通过）；
+    /// - 未闭合引号 = fail-visible 解析错误（不猜、不静默截断）；
+    /// - 引号内元字符不豁免：切分产出的 token 仍须过
+    ///   [`Self::check_no_shell_metachars`]（安全姿态与历史一致）。
+    fn tokenize_command(cmd: &str) -> Result<Vec<String>, String> {
+        let mut toks: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut cur_open = false;
+        let mut chars = cmd.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' | '\'' => {
+                    let close = c;
+                    cur_open = true;
+                    loop {
+                        match chars.next() {
+                            Some(ch) if ch == close => break,
+                            Some(ch) => cur.push(ch),
+                            None => {
+                                return Err(format!(
+                                    "unterminated {} quote in command",
+                                    if close == '"' { "double" } else { "single" }
+                                ));
+                            }
+                        }
+                    }
+                }
+                ch if ch.is_whitespace() => {
+                    if cur_open {
+                        toks.push(std::mem::take(&mut cur));
+                        cur_open = false;
+                    }
+                }
+                ch => {
+                    cur_open = true;
+                    cur.push(ch);
+                }
+            }
+        }
+        if cur_open {
+            toks.push(cur);
+        }
+        Ok(toks)
+    }
+
     /// 拒绝任何含 shell metacharacter 的 arg
     fn check_no_shell_metachars(parts: &[&str]) -> Result<(), String> {
         const BAD: &[char] = &[';', '|', '&', '`', '$', '>', '<', '\n', '\r', '(', ')'];
@@ -1975,10 +2029,14 @@ impl ShellExecTool {
         if matches!(self.backend, ExecBackend::DockerExec { .. }) {
             return None;
         }
-        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-        if parts.is_empty() {
+        let owned = match Self::tokenize_command(cmd_str) {
+            Ok(p) => p,
+            Err(_) => return None, // 解析错误形态留待 call 期显式报错，非审批范畴
+        };
+        if owned.is_empty() {
             return None;
         }
+        let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
         if Self::check_no_shell_metachars(&parts).is_err() {
             return None;
         }
@@ -2096,10 +2154,11 @@ impl ShellExecTool {
         // 沙箱设计 §6.4 职责分离)。网络面:低盒禁网由 OS 边界物理断绝
         // (capabilities=None),强于 shell_net_guard 白名单,不另设守卫。
         if let ExecBackend::AppContainer = &self.backend {
-            let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-            if parts.is_empty() {
+            let owned = Self::tokenize_command(cmd_str)?;
+            if owned.is_empty() {
                 return Err("empty command".to_string());
             }
+            let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
             let program = Self::program_name(parts[0]);
             if is_lowbox_program(program) {
                 #[cfg(windows)]
@@ -2120,11 +2179,12 @@ impl ShellExecTool {
             // 非清单命令:宿主回落(落穿至下方宿主路径,分类面照旧)
         }
 
-        // 1. 解析
-        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-        if parts.is_empty() {
+        // 1. 解析（引号感知单源；空引号段=空 token 保留，未闭合引号=显式错误）
+        let owned = Self::tokenize_command(cmd_str)?;
+        if owned.is_empty() {
             return Err("empty command".to_string());
         }
+        let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
 
         // 2. metacharacter check(无论 active / candidate / blocked 都要先过这一关)
         Self::check_no_shell_metachars(&parts)?;
@@ -2191,6 +2251,69 @@ mod tests {
 
     fn arg(command: &str) -> Value {
         arg_with(command, false)
+    }
+
+    // === 命令切分单源（引号感知 tokenizer）===
+
+    #[test]
+    fn test_tokenize_preserves_empty_quoted_token() {
+        // 缺陷回归锚：空引号段必须产出空 token（历史缺陷=split_whitespace
+        // 把两字符 `""` 原样传给子进程当 pattern，rg 零匹配 exit 1）
+        let toks = ShellExecTool::tokenize_command("rg -n \"\" D:/repo/README.md").unwrap();
+        assert_eq!(toks, vec!["rg", "-n", "", "D:/repo/README.md"]);
+    }
+
+    #[test]
+    fn test_tokenize_dequotes_and_groups() {
+        let toks = ShellExecTool::tokenize_command("git commit -m \"two words\"").unwrap();
+        assert_eq!(toks, vec!["git", "commit", "-m", "two words"]);
+        let toks = ShellExecTool::tokenize_command("rg -n '.' file").unwrap();
+        assert_eq!(toks, vec!["rg", "-n", ".", "file"]);
+    }
+
+    #[test]
+    fn test_tokenize_adjacent_segments_concat() {
+        let toks = ShellExecTool::tokenize_command("echo a\"b c\"d").unwrap();
+        assert_eq!(toks, vec!["echo", "ab cd"]);
+    }
+
+    #[test]
+    fn test_tokenize_backslash_is_literal() {
+        let toks = ShellExecTool::tokenize_command(r#"rg -n "x" D:\dir\file"#).unwrap();
+        assert_eq!(toks, vec!["rg", "-n", "x", r"D:\dir\file"]);
+    }
+
+    #[test]
+    fn test_tokenize_unterminated_quote_is_error() {
+        assert!(ShellExecTool::tokenize_command("rg \"abc").is_err());
+        assert!(ShellExecTool::tokenize_command("rg 'abc").is_err());
+        // 混合未闭合：双引号内单引号不闭合双引号
+        assert!(ShellExecTool::tokenize_command("echo \"a'").is_err());
+    }
+
+    #[test]
+    fn test_tokenize_whitespace_only_is_empty() {
+        assert!(ShellExecTool::tokenize_command("   ").unwrap().is_empty());
+        assert!(ShellExecTool::tokenize_command("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_quoted_metachar_still_rejected() {
+        // 引号不豁免元字符门：切分后 token 含 `(` 依旧 fail-visible（安全姿态不变）
+        let tool = ShellExecTool::new();
+        let err = tool
+            .call_sync(&arg("rg -n \"(\" file"))
+            .expect_err("quoted metachar must still be rejected");
+        assert!(err.contains("metacharacter"), "got: {err}");
+    }
+
+    #[test]
+    fn test_unterminated_quote_call_is_error() {
+        let tool = ShellExecTool::new();
+        let err = tool
+            .call_sync(&arg("rg \"unterminated"))
+            .expect_err("unterminated quote must fail visibly");
+        assert!(err.contains("unterminated"), "got: {err}");
     }
 
     // === 后台执行(P0a 余量):call_sync background=true → job_control 跨工具 ===
