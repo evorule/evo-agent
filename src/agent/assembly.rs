@@ -161,6 +161,34 @@ pub struct BudgetSpec {
     /// 缺省可得）;显式 `null` = 关闭 = 动态区仍嵌 system prompt 内。
     #[serde(default = "default_mechanism_messages_enabled")]
     pub mechanism_messages: Option<MechanismMessagesSpec>,
+    /// 历史 assistant 折叠声明（可选段;工具族设计档 B3/D2 影响分析裁定=缺省关:
+    /// None = 关闭,发送视图零变化。工具型画像史内 assistant 占比低,长文画像
+    /// 候显式开启——折叠对象=纯文本且非最新一条的 assistant 回复）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_fold: Option<AssistantFoldSpec>,
+}
+
+/// 历史 assistant 折叠声明（工具族设计档 B3/D2 影响分析）：发送视图内折叠
+/// 超阈值的纯文本 assistant 回复（无 tool_calls 且非最新一条——用户最可能
+/// 引用/续写最新回复）。权威历史不动，原文完整保留在会话 journal；折叠仅
+/// 作用于发送视图，锚定轮界施加不打断前缀缓存。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssistantFoldSpec {
+    /// 折叠字节阈值（utf-8 字节计;默认 16384=16KB,声明 0 校验期拒绝）
+    #[serde(default = "default_assistant_fold_threshold_bytes")]
+    pub threshold_bytes: usize,
+}
+
+impl Default for AssistantFoldSpec {
+    fn default() -> Self {
+        Self {
+            threshold_bytes: default_assistant_fold_threshold_bytes(),
+        }
+    }
+}
+
+fn default_assistant_fold_threshold_bytes() -> usize {
+    16 * 1024
 }
 
 /// 机制消息开关声明（γ 批 B-268:动态区[记忆分区/Handoff Base/todo]外移为
@@ -304,6 +332,7 @@ impl Default for BudgetSpec {
             tool_result_max_tokens: None,
             stale_result_demotion: default_stale_demotion_enabled(),
             mechanism_messages: default_mechanism_messages_enabled(),
+            assistant_fold: None,
         }
     }
 }
@@ -896,6 +925,12 @@ impl AssemblyExecutor {
     /// 陈旧工具结果发送视图降级声明(None = 默认关闭——发送视图零变化)
     pub fn stale_result_demotion(&self) -> Option<&StaleDemotionSpec> {
         self.recipe.budget.stale_result_demotion.as_ref()
+    }
+
+    /// 历史 assistant 折叠声明(None = 关闭——发送视图零变化;工具族设计档 B3,
+    /// D2 影响分析裁定=工具型画像低杠杆缺省关,长文画像候显式开启)
+    pub fn assistant_fold(&self) -> Option<&AssistantFoldSpec> {
+        self.recipe.budget.assistant_fold.as_ref()
     }
 
     /// 机制消息开关声明(None = 默认关闭——动态区仍嵌 system prompt 内,

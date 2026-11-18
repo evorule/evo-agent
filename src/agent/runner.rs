@@ -1510,6 +1510,10 @@ pub struct AgentRunner {
     /// 逐字节一致;Some = 历史中已消费的陈旧工具结果在发送视图降级为占位块,
     /// 原文落盘 tool_results 供 tool_result_fetch 取回,账本原文不动)
     stale_demotion: Option<crate::agent::assembly::StaleDemotionSpec>,
+    /// 历史 assistant 折叠声明(None = 默认关闭,发送视图零变化;Some = 纯文本
+    /// 且非最新一条的 assistant 回复超阈值折叠为首段+回捞注记——上下文设计档
+    /// B3/D2 影响分析裁定=缺省关,长文画像候显式开启)
+    assistant_fold: Option<crate::agent::assembly::AssistantFoldSpec>,
     /// 机制消息开关声明(None = 默认关闭——动态区嵌 system prompt,行为零
     /// 变化;Some = 动态区外移为独立机制消息,旧机制消息在发送视图按 β 同构
     /// 三条件降级为 digest 引用块,原文落盘 tool_results 供取回,禁写 journal)
@@ -1753,6 +1757,7 @@ impl AgentRunner {
             tool_result_max_tokens: 12_000,
             stale_demotion: None,
             mechanism_demotion: None,
+            assistant_fold: None,
             token_counter: None,
             adjudicator: tokio::sync::Mutex::new(
                 crate::agent::adjudicator::AdjudicationChannel::new(
@@ -2163,6 +2168,8 @@ impl AgentRunner {
         runner.stale_demotion = runner.assembly.stale_result_demotion().cloned();
         // 机制消息开关声明(配方可选段;缺省 None = 关闭,行为零变化)
         runner.mechanism_demotion = runner.assembly.mechanism_messages().cloned();
+        // 历史 assistant 折叠声明(配方可选段;缺省 None = 关闭,行为零变化)
+        runner.assistant_fold = runner.assembly.assistant_fold().cloned();
 
         // G11:从 def.output_format 构造 OutputValidator
         // schema 编译失败时早失败(可控),不让用户跑一半才发现配错
@@ -2837,6 +2844,52 @@ impl AgentRunner {
             }
         }
         view
+    }
+
+    /// 历史 assistant 折叠(工具族设计档 B3/D2 影响分析=Recipe 可选项缺省关):
+    /// 纯文本(无 tool_calls)且非最新一条的 assistant 回复,内容超阈值折叠为
+    /// 首段+回捞注记(权威历史不动,原文完整保留在权威历史与会话 journal)。
+    /// 工具型画像史内 assistant 占比低(实测 <20%),长文画像候显式开启。
+    fn apply_assistant_fold(&self, messages: &[Message]) -> Vec<Message> {
+        let Some(spec) = &self.assistant_fold else {
+            return messages.to_vec();
+        };
+        // 最新一条 assistant 保持全文(用户最可能引用/续写的对象)
+        let last_assistant = messages
+            .iter()
+            .rposition(|m| matches!(m, Message::Assistant { .. }));
+        let mut out = Vec::with_capacity(messages.len());
+        for (i, m) in messages.iter().enumerate() {
+            // 纯文本(无 tool_calls)才可折叠:tool-call 步进消息的 content 与
+            // 其 calls 必须保持连贯
+            let no_calls = match m {
+                Message::Assistant { tool_calls, .. } => {
+                    tool_calls.as_ref().is_none_or(|tc| tc.is_empty())
+                }
+                _ => false,
+            };
+            let foldable = no_calls && Some(i) != last_assistant;
+            if let Message::Assistant {
+                content,
+                tool_calls,
+            } = m
+            {
+                let fold = foldable && content.len() > spec.threshold_bytes;
+                if fold {
+                    let head: String = content.chars().take(400).collect();
+                    out.push(Message::Assistant {
+                        content: format!(
+                            "{head}\n...[assistant 历史回复已折叠:原文 {} 字符,全文在会话 journal;需要原文时请宿主按 journal 定位提供]",
+                            content.chars().count() - head.chars().count()
+                        ),
+                        tool_calls: tool_calls.clone(),
+                    });
+                    continue;
+                }
+            }
+            out.push(m.clone());
+        }
+        out
     }
 
     /// 陈旧机制消息发送视图降级(γ 批 B-268;β 同构接线形态):发送视图变换
@@ -5457,6 +5510,8 @@ impl AgentRunner {
                 stale_demotion: assembly.stale_result_demotion().cloned(),
                 // 机制消息开关声明沿链继承(与父 runner 同配方口径;None = 关闭)
                 mechanism_demotion: assembly.mechanism_messages().cloned(),
+                // 历史 assistant 折叠声明沿链继承(与父 runner 同配方口径)
+                assistant_fold: assembly.assistant_fold().cloned(),
                 token_counter: Some(chain_counter.clone()),
                 adjudicator: tokio::sync::Mutex::new(
                     crate::agent::adjudicator::AdjudicationChannel::new(
@@ -5803,7 +5858,9 @@ impl AgentRunner {
         let send_view_pending;
         let mut messages_to_send = if let Some(ctx) = &self.context_window {
             // 发送视图降级链(β 陈旧工具结果 → γ 陈旧机制消息;权威 messages 不动)
-            let demoted_view = self.apply_mechanism_demotion(&self.apply_stale_demotion(messages));
+            let demoted_view = self.apply_mechanism_demotion(
+                &self.apply_stale_demotion(&self.apply_assistant_fold(messages)),
+            );
             let mut trim_result = ctx.trim_detailed(&demoted_view);
             send_view_pending = trim_result.dropped.is_empty();
             if !trim_result.dropped.is_empty() {
@@ -5834,8 +5891,11 @@ impl AgentRunner {
             trim_result.messages
         } else {
             send_view_pending = true;
-            // 发送视图降级链(β 陈旧工具结果 → γ 陈旧机制消息;权威 messages 不动)
-            self.apply_mechanism_demotion(&self.apply_stale_demotion(messages))
+            // 发送视图降级链(assistant 折叠 → β 陈旧工具结果 → γ 陈旧机制
+            // 消息;权威 messages 不动)
+            self.apply_mechanism_demotion(
+                &self.apply_stale_demotion(&self.apply_assistant_fold(messages)),
+            )
         };
 
         // H1(自主交接设计)+G10(B-307):窗口余量信号行——每轮请求前按当前发送

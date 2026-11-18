@@ -7617,6 +7617,99 @@ fn stale_demotion_without_journal_dir_returns_original() {
     assert_eq!(serde_json::to_string(&view).unwrap(), snapshot);
 }
 
+// ===== 工具族设计档 B3:历史 assistant 折叠(缺省关;Recipe 可选段) =====
+
+#[test]
+fn assistant_fold_disabled_view_is_byte_identical() {
+    // 缺省关(None):发送视图与权威历史逐字节一致(D2 影响分析=工具型画像
+    // 史内 assistant 占比低,折叠缺省不启用)
+    let mut runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    assert!(runner.assistant_fold.is_none(), "缺省构造=未启用");
+    let long = "x".repeat(20_000);
+    let msgs = vec![
+        Message::User {
+            content: "问题".to_string(),
+            images: vec![],
+        },
+        Message::Assistant {
+            content: long.clone(),
+            tool_calls: None,
+        },
+        Message::User {
+            content: "继续".to_string(),
+            images: vec![],
+        },
+        Message::Assistant {
+            content: "最新回复".to_string(),
+            tool_calls: None,
+        },
+    ];
+    let snapshot = serde_json::to_string(&msgs).unwrap();
+    let view = runner.apply_assistant_fold(&msgs);
+    assert_eq!(
+        serde_json::to_string(&view).unwrap(),
+        snapshot,
+        "缺省关=逐字节一致"
+    );
+}
+
+#[test]
+fn assistant_fold_folds_old_pure_text_beyond_threshold() {
+    // 开启:非最新一条的纯文本 assistant 超阈值折叠为首段+回捞注记;最新一条
+    // assistant 保持全文(用户最可能引用/续写);tool-call 步进消息不折叠。
+    let mut runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    runner.assistant_fold = Some(crate::agent::assembly::AssistantFoldSpec {
+        threshold_bytes: 100,
+    });
+    let long_old = "旧长回复".repeat(200); // ~2400B > 100B 阈值
+    let msgs = vec![
+        Message::User {
+            content: "问题".to_string(),
+            images: vec![],
+        },
+        Message::Assistant {
+            content: long_old.clone(),
+            tool_calls: None,
+        },
+        Message::User {
+            content: "继续".to_string(),
+            images: vec![],
+        },
+        Message::Assistant {
+            content: "最新回复".to_string(),
+            tool_calls: None,
+        },
+        Message::Assistant {
+            content: "工具步进前置语".to_string(),
+            tool_calls: Some(vec![]),
+        },
+    ];
+    let view = runner.apply_assistant_fold(&msgs);
+    assert_eq!(view.len(), msgs.len(), "条数不变");
+    // 非最新长回复折叠
+    let folded = match &view[1] {
+        Message::Assistant { content, .. } => content.clone(),
+        _ => panic!("类型漂移"),
+    };
+    assert!(
+        folded.contains("assistant 历史回复已折叠"),
+        "超阈值折叠带注记: {folded}"
+    );
+    // 最新一条 assistant 保持全文(排除规则=非最新才折)
+    let last = match &view[3] {
+        Message::Assistant { content, .. } => content.clone(),
+        _ => panic!("类型漂移"),
+    };
+    assert_eq!(last, "最新回复", "最新一条 assistant 保持全文");
+    // tool-call 步进消息保持原文(短内容低于阈值)
+    assert!(
+        matches!(&view[4], Message::Assistant { tool_calls: Some(tc), .. } if tc.is_empty()),
+        "tool-call 步进消息原样保持"
+    );
+    // 权威 messages 不动
+    assert_eq!(msgs[1].content().len(), long_old.len(), "权威历史原文不动");
+}
+
 #[test]
 fn stale_demotion_enabled_replaces_stale_and_persists_fetchable_file() {
     // 开启:视图内陈旧结果替换为占位块,权威 messages 原文不变,文件落盘存在,
