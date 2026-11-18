@@ -3095,6 +3095,9 @@ impl AgentRunner {
                 .summary_model
                 .clone()
                 .unwrap_or_else(|| def.model.clone()),
+            // 工具族设计档键名迁移：缺省 true=既有行为（模型名嵌键）；
+            // 配方可调 false=模型无关键
+            model_prefix_in_stable_key: true,
             // 知识候选提取开关（默认 true；提取走 auditor sidecar，
             // 无审计通路时 sediment 内部自动跳过）
             enable_knowledge_extraction: def.memory.enable_knowledge_extraction,
