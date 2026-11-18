@@ -315,8 +315,13 @@ pub fn project_journal(raw: &str, chain_id: &str) -> Result<JournalProjection, E
 
 /// Unix 秒 → ISO 8601 UTC（秒精度；非法值返回空串）
 fn iso8601_utc(secs: u64) -> String {
-    chrono::DateTime::from_timestamp(secs as i64, 0)
-        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    time::OffsetDateTime::from_unix_timestamp(secs as i64)
+        .map(|dt| {
+            dt.format(&time::macros::format_description!(
+                "[year]-[month]-[day]T[hour]:[minute]:[second]Z"
+            ))
+            .unwrap_or_default()
+        })
         .unwrap_or_default()
 }
 

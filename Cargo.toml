@@ -53,8 +53,9 @@ url = "2"
 rand = "0.8"
 base64 = "0.22"
 
-# 回写上报（writeback）事件 occurred_at 的 ISO-8601 UTC 墙钟（server 转发器同款）
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# 时间戳格式化（writeback ISO-8601 墙钟 / EVID 证据投影 / HTTP-date / 上传前缀）：
+# time 0.3（unmaintained 面已迁移完毕；formatting+macros 供自定义格式描述）
+time = { version = "0.3", default-features = false, features = ["formatting", "macros", "std"] }
 
 # G7: 恒定时间比较(防时序攻击)
 subtle = "2"
