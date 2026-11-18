@@ -632,6 +632,15 @@ fn stable_relevance(record: &MemoryRecord, goal_uniq_sorted: &[String]) -> usize
         .count()
 }
 
+/// 键族（工具族设计档 A3）：key 去尾段后的父路径（`a.b.c` → `a.b`；无点=自身）。
+/// 同族=同父路径键，族帽防同族淹没召回帽。
+fn family_of(key: &str) -> String {
+    match key.rfind('.') {
+        Some(pos) => key[..pos].to_string(),
+        None => key.to_string(),
+    }
+}
+
 /// F-605：stable 层内部价值排序（09 规格 F-605，I5/I6 补强）
 ///
 /// 三因子确定性排序：相关性 desc（R05 词法对 goal 的命中数）▸
@@ -735,9 +744,23 @@ pub(crate) fn sort_by_policy(
                 + policy.w_usage * usage_hits.min(policy.usage_cap) as f32
                 + policy.w_authority * authority_weight(r)
                 + policy.w_entity * degrees[i] / max_degree;
-            policy.w_relevance * rel_norm
+            let mut score = policy.w_relevance * rel_norm
                 + policy.w_recency * recency
-                + policy.w_importance * importance
+                + policy.w_importance * importance;
+            // 时效键衰减（工具族设计档 A2）：key 命中 patterns 的条目按 age 半衰
+            // 期降权（score ×= 2^(-age_days/half_life)）——衰减≠删除，跌出帽仍
+            // 可显式查询。配置缺省关=零影响。
+            if let Some(sd) = &policy.staleness_decay {
+                if sd
+                    .patterns
+                    .iter()
+                    .any(|p| !p.is_empty() && r.key.contains(p.as_str()))
+                {
+                    let decay = 2.0_f64.powf(-(age_days / sd.half_life_days.max(0.01)));
+                    score *= decay as f32;
+                }
+            }
+            score
         })
         .collect();
     //排序：S desc ▸ timestamp desc ▸ confidence desc ▸ key asc（确定性全序）
@@ -825,21 +848,66 @@ pub(crate) fn layerize_stable(
         }
     }
 
-    // 召回层绝对帽：sort_by_policy 序前缀截取（低价值尾部落帽）
+    // 召回层填充三级串联（工具族设计档 A1/A3）：族帽（A3）→ 分域限额（A1）→
+    // 绝对帽（既有）。关态（配置 None）=原前缀截取语义逐条保持。
     let recall_total = recallable.len();
+    let mut kept: Vec<MemoryRecord> = Vec::new();
     let mut used = 0usize;
-    let cut = recallable
-        .iter()
-        .position(|r| {
-            used += ContextBudget::estimate_tokens(&r.value);
-            used > policy.stable_cap_tokens
-        })
-        .unwrap_or(recall_total);
-    recallable.truncate(cut);
-    if cut < recall_total {
+    let mut overflow = false;
+    let mut cut = 0usize;
+    let mut family_counts: std::collections::BTreeMap<String, u32> = Default::default();
+    let mut domain_used: std::collections::BTreeMap<u8, usize> = Default::default();
+    for r in recallable.iter() {
+        if overflow {
+            cut += 1;
+            continue;
+        }
+        // A3 族帽：同父路径键族最多 family_cap 条（None=关）；防同族淹没
+        if let Some(cap) = policy.family_cap {
+            if cap > 0 {
+                let fam = family_of(&r.key);
+                let cnt = family_counts.entry(fam).or_insert(0);
+                if *cnt >= cap {
+                    cut += 1;
+                    continue;
+                }
+                *cnt += 1;
+            }
+        }
+        let tok = ContextBudget::estimate_tokens(&r.value);
+        // A1 分域限额：user/llm/other 各占召回帽百分比（System 恒常驻不在此列）
+        if let Some(q) = &policy.recall_domain_quotas {
+            let bucket = match MemoryManager::stable_domain_of(&r.key) {
+                StableDomain::User => 0u8,
+                StableDomain::Llm => 1u8,
+                _ => 2u8,
+            };
+            let pct = match bucket {
+                0 => q.user_pct,
+                1 => q.llm_pct,
+                _ => q.other_pct,
+            };
+            let quota_tok = ((policy.stable_cap_tokens as f32) * pct.max(0.0) / 100.0) as usize;
+            let used_d = domain_used.get(&bucket).copied().unwrap_or(0);
+            if used_d + tok > quota_tok {
+                cut += 1;
+                continue;
+            }
+            *domain_used.entry(bucket).or_insert(0) += tok;
+        }
+        used += tok;
+        if used > policy.stable_cap_tokens {
+            overflow = true;
+            cut += 1;
+            continue;
+        }
+        kept.push(r.clone());
+    }
+    recallable = kept;
+    if cut > 0 {
         notices.push(format!(
             "memory budget: stable 召回层裁剪 {} 条(常驻 {} 条全保留,绝对帽 {} token)",
-            recall_total - cut,
+            cut,
             resident_system.len() + resident_user.len(),
             policy.stable_cap_tokens
         ));
@@ -5476,6 +5544,153 @@ mod tests {
         let keys1: Vec<&str> = stable.iter().map(|r| r.key.as_str()).collect();
         let keys2: Vec<&str> = stable2.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(keys1, keys2, "同输入双跑注入集逐位一致");
+    }
+
+    // ===== 工具族设计档 A 线：召回区分度 =====
+
+    fn quota_policy(cap: usize) -> crate::agent::recipe::RetrievalPolicy {
+        let mut p = layerize_policy();
+        p.stable_cap_tokens = cap;
+        p.recall_domain_quotas = Some(crate::agent::recipe::RecallDomainQuotas {
+            user_pct: 40.0,
+            llm_pct: 30.0,
+            other_pct: 30.0,
+        });
+        p
+    }
+
+    #[tokio::test]
+    async fn test_domain_quotas_bound_per_domain_injection() {
+        // A1 分域限额：帽 100 tok 分域 40/30/30——user 域 3 条(各 15 tok)只进
+        // 2 条(45>40 超额即拒)，llm/other 各 1 条(10 tok)全进；关态(None)同
+        // 输入全量进帽(前缀语义)。
+        let mk = |domain: &str, i: usize, ts: u64| {
+            let v = "x".repeat(60); // 60 ascii ≈ 15 tok
+            let mut r = MemoryRecord::new(&format!("{domain}.k{i}"), &v, ts);
+            r.fact_id = Some((domain.len() * 10 + i) as u64);
+            r
+        };
+        let mut stable = vec![
+            mk("stable.user", 1, 100),
+            mk("stable.user", 2, 101),
+            mk("stable.user", 3, 102),
+            mk("stable.llm", 1, 103),
+            mk("stable.llm", 2, 104),
+            mk("stable.other", 1, 105),
+            mk("stable.other", 2, 106),
+        ];
+        // system 常驻锚一条(不占召回帽,断言隔离)
+        let anchor = MemoryRecord::new("stable.system.anchor", "锚", 1);
+        stable.insert(0, anchor);
+        let usage = std::collections::HashMap::new();
+        let mut notices = Vec::new();
+        layerize_stable(&mut stable, &usage, &quota_policy(100), &mut notices);
+        let count_by = |prefix: &str| -> usize {
+            stable
+                .iter()
+                .filter(|r| r.key.starts_with(prefix) && r.key != "stable.system.anchor")
+                .count()
+        };
+        assert_eq!(
+            count_by("stable.user"),
+            2,
+            "user 配额 40 tok: 3 条中 2 条(各 10)"
+        );
+        assert!(count_by("stable.llm") >= 1, "llm 配额内全进");
+        assert!(
+            stable
+                .iter()
+                .any(|r| r.key.starts_with("stable.system.anchor")),
+            "system 常驻不受配额面影响"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_family_cap_bounds_same_parent_keys() {
+        // A3 族帽：同父路径键族 5 条(cap=2)只进 2 条(policy 序取前)；族外
+        // 条目不受影响；关态(None)同输入全进。
+        let mk = |key: &str, ts: u64| {
+            let mut r = MemoryRecord::new(key, "内容", ts);
+            r.fact_id = Some(ts);
+            r
+        };
+        let mut stable = vec![
+            mk("stable.llm.fam.k1", 100),
+            mk("stable.llm.fam.k2", 101),
+            mk("stable.llm.fam.k3", 102),
+            mk("stable.llm.fam.k4", 103),
+            mk("stable.llm.fam.k5", 104),
+            mk("stable.user.alone", 105),
+        ];
+        let usage = std::collections::HashMap::new();
+        let mut policy = layerize_policy();
+        policy.family_cap = Some(2);
+        let mut notices = Vec::new();
+        layerize_stable(&mut stable, &usage, &policy, &mut notices);
+        let fam_kept = stable
+            .iter()
+            .filter(|r| r.key.starts_with("stable.llm.fam."))
+            .count();
+        assert_eq!(fam_kept, 2, "族帽=同族最多 2 条");
+        assert!(
+            stable.iter().any(|r| r.key == "stable.user.alone"),
+            "族外条目不受族帽影响"
+        );
+        // 关态(None)：同输入全量进召回层
+        let mut stable2 = vec![
+            mk("stable.llm.fam.k1", 100),
+            mk("stable.llm.fam.k2", 101),
+            mk("stable.llm.fam.k3", 102),
+            mk("stable.llm.fam.k4", 103),
+            mk("stable.llm.fam.k5", 104),
+            mk("stable.user.alone", 105),
+        ];
+        let mut policy_off = layerize_policy();
+        policy_off.family_cap = None;
+        let usage = std::collections::HashMap::new();
+        layerize_stable(&mut stable2, &usage, &policy_off, &mut notices);
+        let fam_all = stable2
+            .iter()
+            .filter(|r| r.key.starts_with("stable.llm.fam."))
+            .count();
+        assert_eq!(fam_all, 5, "关态=族帽不生效(既有行为)");
+    }
+
+    #[test]
+    fn test_staleness_decay_demotes_matched_keys() {
+        // A2 时效衰减：key 命中 patterns 的条目按 age 半衰期降权——高置信旧
+        // 时效条目被新鲜条目反超（无配置时按置信序前者居首）。
+        let now = now_secs();
+        let mk = |key: &str, ts: u64, conf: f32| {
+            let mut r = MemoryRecord::new(key, "same tokens content here", ts);
+            r.confidence = Some(conf);
+            r
+        };
+        let mut policy = layerize_policy();
+        // 两侧相关性对齐：值同文；键含 goal 词元的口径此处用零 goal(词法 0,
+        // 排序由 recency+importance 主导)——衰减乘子是唯一判别器。
+        let mut stable = vec![
+            mk(
+                "stable.llm.stale.k.status",
+                now.saturating_sub(30 * 86400),
+                0.99,
+            ),
+            mk("stable.llm.fresh.k", now.saturating_sub(86400), 0.10),
+        ];
+        sort_by_policy(&mut stable, "", &policy, None);
+        assert_eq!(
+            stable[0].key, "stable.llm.stale.k.status",
+            "关态:高置信旧条目仍居首"
+        );
+        policy.staleness_decay = Some(crate::agent::recipe::StalenessDecay {
+            patterns: vec![".status".to_string()],
+            half_life_days: 7.0,
+        });
+        sort_by_policy(&mut stable, "", &policy, None);
+        assert_eq!(
+            stable[0].key, "stable.llm.fresh.k",
+            "时效键衰减后新鲜条目反超"
+        );
     }
 
     #[test]
