@@ -51,6 +51,10 @@ pub struct SedimentConfig {
     /// 路径段经消毒（非 `[a-zA-Z0-9-_]` 替换为 `-`）保证单一路径段；
     /// 原始模型名记入 value.source（`llm:{raw}`）。
     pub llm_model_id: String,
+    /// stable 键是否内嵌模型名（工具族设计档键名迁移：缺省 true=既有行为
+    /// `stable.llm.{model}.*`；false=模型无关键 `stable.llm.{key}`——与
+    /// 当前模型解耦，模型切换不产生键前缀断崖）
+    pub model_prefix_in_stable_key: bool,
     /// 是否启用知识候选提取（会话收尾巩固管线最小版）
     ///
     /// 会话收尾时在摘要/事实/事件产物之外，增一次 sidecar LLM 调用提取
@@ -91,6 +95,7 @@ impl Default for SedimentConfig {
             max_injected_events: 5,
             summary_rollup_threshold: 10,
             llm_model_id: "unknown".to_string(),
+            model_prefix_in_stable_key: true,
             enable_knowledge_extraction: true,
             min_messages_for_extraction: 4,
             enable_consolidation: true,
@@ -412,11 +417,17 @@ pub async fn sediment(
                     Vec::new()
                 };
                 for fact in &out.stable_facts {
-                    let key = format!(
-                        "stable.llm.{}.{}",
-                        sanitize_model_id(&cfg.llm_model_id),
-                        fact.key
-                    );
+                    // 工具族设计档键名迁移：model_prefix_in_stable_key=false 时
+                    // 键不含模型名（stable.llm.{key}），模型切换不产生键前缀断崖
+                    let key = if cfg.model_prefix_in_stable_key {
+                        format!(
+                            "stable.llm.{}.{}",
+                            sanitize_model_id(&cfg.llm_model_id),
+                            fact.key
+                        )
+                    } else {
+                        format!("stable.llm.{}", fact.key)
+                    };
                     let source = format!("llm:{}", cfg.llm_model_id);
                     // O-487①:工具清单类断言实况校验锚——不符拒写+warn
                     // (错误结论不固化;注册表未注入=无锚同拒)
