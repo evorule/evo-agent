@@ -2537,6 +2537,29 @@ impl AgentRunner {
         self.max_context_tokens = max_tokens;
     }
 
+    /// B-426 审计修复:WS/serve 路径补 assembly+降级链穿线(from_definition
+    /// 同口径)——①AssemblyExecutor 沿 def.assembly 配方替换缺省执行器
+    /// ②降级三件(stale/mech/fold)+tool_result_max_tokens 沿配方接线
+    /// 此前 construct_runner 从不触碰这些字段,WS 会话的降级链全无效
+    pub(crate) fn wire_assembly_and_demotion(&mut self, def: &AgentDefinition) {
+        let recipe = def.assembly.clone().unwrap_or_else(|| {
+            let mut r = crate::agent::assembly::AssemblyRecipe::default();
+            for slot in &mut r.slots {
+                if slot.id == "S3_memory" {
+                    if let Some(b) = slot.budget.as_mut() {
+                        b.ratio = def.memory.memory_budget_ratio;
+                    }
+                }
+            }
+            r
+        });
+        self.assembly = crate::agent::assembly::AssemblyExecutor::new(recipe);
+        self.tool_result_max_tokens = self.assembly.tool_result_max_tokens();
+        self.stale_demotion = self.assembly.stale_result_demotion().cloned();
+        self.mechanism_demotion = self.assembly.mechanism_messages().cloned();
+        self.assistant_fold = self.assembly.assistant_fold().cloned();
+    }
+
     /// G10:设置上下文摘要器(记忆压缩)
     ///
     /// 通常由 `from_definition` 根据 `def.memory.summary_model` 自动构造。
@@ -3042,46 +3065,11 @@ impl AgentRunner {
             let extractor = EventExtractor::new(self.llm_handler.clone(), config);
             self.extractor = Some(extractor);
         }
-        // 阶段 2(F-610):MemoryRecipe 策略规则集(内嵌 JSON;解析失败 warn 降级
-        // 词法 legacy,零影响)
-        if let Some(rj) = &def.memory.recipe {
-            match serde_json::from_value::<crate::agent::recipe::MemoryRecipe>(rj.clone()) {
-                Ok(recipe) => {
-                    let rollup = recipe.lifecycle.rollup_threshold;
-                    let journal_digest = recipe.sources.journal_digest;
-                    // 修复:failure_drafts 此前误接 journal_digest（复制粘贴错,
-                    // 草稿面从未被 Recipe 独立声明控制过）
-                    let failure_drafts = recipe.sources.failure_drafts;
-                    let material_harvest = recipe.sources.materials;
-                    let recipe_for_mem = recipe.clone();
-                    if let Some(mem) = self.memory.as_mut() {
-                        mem.set_recipe(recipe_for_mem);
-                    }
-                    // Recipe.rollup_threshold 覆盖同名 def 配置（策略数据化）
-                    self.sediment_config.summary_rollup_threshold = rollup;
-                    // Recipe.sources 三源穿线（跨源注册规格策略面；
-                    // 缺省关=既有 agent 零影响）
-                    self.sediment_config.enable_journal_digest = journal_digest;
-                    self.sediment_config.enable_failure_drafts = failure_drafts;
-                    self.sediment_config.enable_material_harvest = material_harvest;
-                    // 战役 B：任务域事件触发词穿线（Recipe sources.task_event_keywords
-                    // → extractor config.task_keywords；缺省空=既有 agent 零影响。
-                    // extract_from_conversation 内部复检 detect_trigger，
-                    // 故必须在 extractor config 层注入而非仅外层放行）
-                    if !recipe.sources.task_event_keywords.is_empty() {
-                        if let Some(extractor) = self.extractor.as_mut() {
-                            extractor.set_task_keywords(recipe.sources.task_event_keywords.clone());
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "MemoryRecipe 解析失败——召回走词法 legacy 路径");
-                }
-            }
-        }
         // C1:沉淀配置(总是构造,sediment_session 在 memory 为 None 时是 no-op)
         // C3/C4:从 MemoryConfig 读取 max_session_summaries/max_injected_events/
         //        summary_rollup_threshold/enable_event_extraction
+        // B-426 审计修复(P1-5):SedimentConfig 构造前移——先建基础配置,后由
+        // Recipe 穿线覆写(原顺序=Recipe 值先设,后被全量替换覆写=丢失)
         self.sediment_config = sediment::SedimentConfig {
             namespace: def.memory.namespace.clone(),
             enable_event_extraction: def.memory.memory_type != "none"
@@ -3118,6 +3106,43 @@ impl AgentRunner {
                 .knowledge_propose_min_confidence
                 .unwrap_or(0.7),
         };
+        // 阶段 2(F-610):MemoryRecipe 策略规则集(内嵌 JSON;解析失败 warn 降级
+        // 词法 legacy,零影响)——Recipe 穿线覆写在前置的 SedimentConfig 上
+        if let Some(rj) = &def.memory.recipe {
+            match serde_json::from_value::<crate::agent::recipe::MemoryRecipe>(rj.clone()) {
+                Ok(recipe) => {
+                    let rollup = recipe.lifecycle.rollup_threshold;
+                    let journal_digest = recipe.sources.journal_digest;
+                    // 修复:failure_drafts 此前误接 journal_digest（复制粘贴错,
+                    // 草稿面从未被 Recipe 独立声明控制过）
+                    let failure_drafts = recipe.sources.failure_drafts;
+                    let material_harvest = recipe.sources.materials;
+                    let recipe_for_mem = recipe.clone();
+                    if let Some(mem) = self.memory.as_mut() {
+                        mem.set_recipe(recipe_for_mem);
+                    }
+                    // Recipe.rollup_threshold 覆盖同名 def 配置（策略数据化）
+                    self.sediment_config.summary_rollup_threshold = rollup;
+                    // Recipe.sources 三源穿线（跨源注册规格策略面；
+                    // 缺省关=既有 agent 零影响）
+                    self.sediment_config.enable_journal_digest = journal_digest;
+                    self.sediment_config.enable_failure_drafts = failure_drafts;
+                    self.sediment_config.enable_material_harvest = material_harvest;
+                    // 战役 B：任务域事件触发词穿线（Recipe sources.task_event_keywords
+                    // → extractor config.task_keywords；缺省空=既有 agent 零影响。
+                    // extract_from_conversation 内部复检 detect_trigger，
+                    // 故必须在 extractor config 层注入而非仅外层放行）
+                    if !recipe.sources.task_event_keywords.is_empty() {
+                        if let Some(extractor) = self.extractor.as_mut() {
+                            extractor.set_task_keywords(recipe.sources.task_event_keywords.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "MemoryRecipe 解析失败——召回走词法 legacy 路径");
+                }
+            }
+        }
         // 阶段 3(F-611)+A2-2:自省记忆工具注册(声明面已在 step 2 按暴露条件
         // 预放行;此处声明了而条件不满足=配置矛盾,早失败)。置于 sediment_config
         // 赋值之后:写件(MemoryProposer)的 namespace 取自 sediment_config
