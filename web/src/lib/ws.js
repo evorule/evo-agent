@@ -715,6 +715,13 @@ function handleFrame(f) {
     case 'Info':
       pushMessage({ kind: 'info', text: String(f.message) });
       pushPanelEvent('sys', { label: 'Info', detail: String(f.message) });
+      // N-009:回合已被服务端放弃(serve 重启/abort-at-birth)时 stop 回执
+      // 「no active turn to interrupt」=终态等价物——不复位则前端永久卡
+      // 执行中(stop 按钮死锁,2026-11-19 实证三连击无响应)
+      if (String(f.message).includes('no active turn to interrupt')) {
+        finishStream();
+        turnActive.set(false);
+      }
       break;
     case 'CompactionPerformed': {
       // 主动压缩观测帧:一次性系统提示(前后字符数+摘要是否生成)

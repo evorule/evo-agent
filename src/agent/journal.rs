@@ -2332,6 +2332,14 @@ impl Drop for TurnEndGuard {
                 .writer
                 .end_turn_with_reason("aborted", 0, 0, Some(&reason));
         } else {
+            // N-009 仪器化:非 panic 走到 Drop 兜底=轮循环静默早退/回合 future
+            // 被外部放弃——此前只落 journal 无任何日志面,事故取证全盲
+            // (2026-11-19 会话 1795045491932 实证:aborted/0/0/null 唯一线索)
+            tracing::warn!(
+                session_id = %self.writer.session_id(),
+                "turn ended via guard drop without explicit end \
+                 (aborted/steps=0; early return or future dropped upstream)"
+            );
             let _ = self.writer.end_turn("aborted", 0, 0);
         }
     }
