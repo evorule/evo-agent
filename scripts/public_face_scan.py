@@ -43,9 +43,14 @@ TEXT_EXT = {
 # (pattern_id, regex) — keep in sync with the rules master (knowledge, 03).
 DENY = [
     ("internal-obs-id", re.compile(r"\bO-\d{2,3}\b")),
+    ("internal-obs-id-lower", re.compile(r"\bo\d{2,3}\b")),
+    ("internal-reg-id", re.compile(r"\bN-\d{1,3}\b")),
+    ("internal-batch-id", re.compile(r"\bB-\d{2,3}\b")),
     ("internal-lm-id", re.compile(r"\bLM-\d{1,3}\b")),
     ("internal-design-id", re.compile(r"\bdesign-\d{1,3}\b")),
     ("internal-doc-id", re.compile(r"\d{1,3}\s*号档")),
+    ("internal-pilot-codename", re.compile(r"\bi10\b")),
+    ("internal-gov-term", re.compile(r"试点|统帅|治理线")),
     ("private-repo-path", re.compile(r"(?i)D:[\\/]+knowledge")),
     ("secret-like-key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")),
 ]
