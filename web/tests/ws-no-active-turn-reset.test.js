@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
-// N-009 回归锁:回合已被服务端放弃(serve 重启/abort-at-birth)时,stop 回执
+// 回归锁:回合已被服务端放弃(serve 重启/abort-at-birth)时,stop 回执
 // 「no active turn to interrupt」是终态等价物——ws.js Info 分支必须复位
 // turnActive+finishStream,否则前端永久卡「执行中」(stop 按钮死锁,
 // 2026-11-19 实证三连击无响应)。同 ws-approval-auto 模式:MockWebSocket
@@ -66,10 +66,10 @@ beforeEach(async () => {
   newSession();
   await connect('new');
   MockWebSocket.last.open();
-  await sendMessage('恢复试点');
+  await sendMessage('恢复长跑');
 });
 
-describe('Info(no active turn)复位回合态(N-009)', () => {
+describe('Info(no active turn)复位回合态', () => {
   it('no active turn to interrupt → turnActive 复位 false', async () => {
     expect(get(turnActive)).toBe(true);
     MockWebSocket.last.deliver({

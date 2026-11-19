@@ -784,7 +784,7 @@ pub mod tests {
         assert_eq!(result["tools"].as_array().map(|a| a.len()), Some(0));
     }
 
-    // ===== stdout 单行上限(o101):超长单行内存膨胀防线 =====
+    // ===== stdout 单行上限:超长单行内存膨胀防线 =====
 
     fn pending_map_with(
         id: u64,

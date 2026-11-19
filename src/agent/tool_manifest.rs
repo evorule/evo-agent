@@ -519,7 +519,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // dev-feedback P2: 多 worktree 自动化(并行任务隔离的机制化承载;
         // 建仓检出保护/脏树 fail-visible/分支名白名单;GitWrite 域,
         // 审批走基线档)
-        // 开关豁免注记(登记册 o33 裁定=文档化豁免):不绑 agentTools.gitWrite
+        // 开关豁免注记(登记册  裁定=文档化豁免):不绑 agentTools.gitWrite
         // ——worktree 只建/删隔离检出,不改动主工作树与仓内提交状态,语义
         // 边界与 stash/bisect(stage/commit 级写族)不同层;豁免为有意选择
         b("worktree", vec![GitWrite]),
@@ -718,7 +718,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
                 m.approval_policy = ApprovalPolicy::ManualDefault;
                 m.timeout_class = TimeoutClass::Long;
             }
-            // shell_exec:超时改 Long(B-426 审计 P1-3:pytest/build 类命令
+            // shell_exec:超时改 Long(审计 P1-3:pytest/build 类命令
             // 常超 60s,Default 60s 会 kill;600s 与 build_check 同层)
             "shell_exec" => {
                 m.timeout_class = TimeoutClass::Long;

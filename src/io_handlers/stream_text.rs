@@ -6,7 +6,7 @@
 //!
 //! 逐网络块独立 `from_utf8_lossy` 解码会把「被 TCP/TLS 分块切开的多字节
 //! UTF-8 字符」替换成 U+FFFD——随机坏字（长会话高频 CJK 写入实测，存量
-//! 缺陷账 o10 ①型）的传输层根因。本累积器持有跨块的不完整多字节尾部，
+//! 缺陷账  ①型）的传输层根因。本累积器持有跨块的不完整多字节尾部，
 //! 只解码最长有效 UTF-8 前缀，尾部留待续块拼接；流中部出现真损坏
 //! （非法字节而非尾部截断）时 fail-visible 上抛，不 lossy 不猜。
 //!
@@ -80,7 +80,7 @@ impl StreamTextDecoder {
 mod tests {
     use super::*;
 
-    // o10 ①型复现:CJK「好」= E5 A5 BD 三字节,切块切在任意字节位
+    //  ①型复现:CJK「好」= E5 A5 BD 三字节,切块切在任意字节位
     #[test]
     fn cjk_split_across_chunks_reassembles_cleanly() {
         let full = "好".as_bytes();
@@ -109,9 +109,9 @@ mod tests {
 
     #[test]
     fn cjk_line_by_line_stream_no_fffd() {
-        // o10 实录形态:多行 CJK 文本按网络块随机切——13+ 例坏字的复现面
+        //  实录形态:多行 CJK 文本按网络块随机切——13+ 例坏字的复现面
         let text =
-            "交付文档状态更新并收口：o10 写通道坏字\n已按核实结论更新文档状态并收口：commit 已落\n";
+            "交付文档状态更新并收口： 写通道坏字\n已按核实结论更新文档状态并收口：commit 已落\n";
         let bytes = text.as_bytes();
         // 模拟 7 字节块流(必然切开多字节字符)
         let mut dec = StreamTextDecoder::new();

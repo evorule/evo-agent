@@ -357,7 +357,7 @@ impl CapabilityBoundary {
         };
         // 双域拆分(B 批「读宽写窄」):读域异于写域时逐族说明,LLM 精确自知
         // 「哪里可读、哪里可写」;同域时逐字节保持 v1 单根文案(黄金样本锁定,
-        // 零变化)。写面实域(B-367 声明跟实现):缺省合成路径 write_domain
+        // 零变化)。写面实域(声明跟实现):缺省合成路径 write_domain
         // 在场且异于沙箱根时优先渲染实域;显式声明路径(write_domain=None)
         // 两分支文案逐字节保持 v1。
         let write_domain = self
@@ -2898,7 +2898,7 @@ mod tests {
 
     #[test]
     fn test_capability_boundary_write_domain_rendered_as_write_face() {
-        // B-367 声明跟实现:write_domain 在场且异于沙箱根 → 可写域行如实
+        //  声明跟实现:write_domain 在场且异于沙箱根 → 可写域行如实
         // 渲染写面实域(toolkit workdir/workspace),不再拍 sandbox_root 全域
         let b = CapabilityBoundary {
             mode: "read_write".to_string(),

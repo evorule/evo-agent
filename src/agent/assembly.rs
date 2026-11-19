@@ -149,15 +149,15 @@ pub struct BudgetSpec {
     /// 生效值 clamp 1000..=100000,见 `AssemblyExecutor::tool_result_max_tokens`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result_max_tokens: Option<usize>,
-    /// 陈旧工具结果发送视图降级声明（可选段;五轮裁定批 G2/B-303:缺省/缺键
+    /// 陈旧工具结果发送视图降级声明（可选段;五轮裁定批 G2/:缺省/缺键
     /// = Some(默认参数) = 开启——"被裁内容必须可查可重建"纪律缺省成立;
     /// 显式 `null` = 关闭（逐字节回退旧行为）。缺省翻转属行为变更,
     /// 项目方 2026-11-12 裁定留痕于审计 §五）
     #[serde(default = "default_stale_demotion_enabled")]
     pub stale_result_demotion: Option<StaleDemotionSpec>,
-    /// 机制消息开关声明（可选段;γ 批 B-268:动态区[记忆分区/Handoff Base/todo]
+    /// 机制消息开关声明（可选段;γ 批 :动态区[记忆分区/Handoff Base/todo]
     /// 外移为独立机制消息,静态区跨轮字节级稳定 = 被动前缀缓存命中前提）。
-    /// 五轮裁定批 G2/B-303:缺省/缺键 = Some(默认参数) = 开启（前缀缓存收益
+    /// 五轮裁定批 G2/:缺省/缺键 = Some(默认参数) = 开启（前缀缓存收益
     /// 缺省可得）;显式 `null` = 关闭 = 动态区仍嵌 system prompt 内。
     #[serde(default = "default_mechanism_messages_enabled")]
     pub mechanism_messages: Option<MechanismMessagesSpec>,
@@ -191,7 +191,7 @@ fn default_assistant_fold_threshold_bytes() -> usize {
     16 * 1024
 }
 
-/// 机制消息开关声明（γ 批 B-268:动态区[记忆分区/Handoff Base/todo]外移为
+/// 机制消息开关声明（γ 批 :动态区[记忆分区/Handoff Base/todo]外移为
 /// 独立机制消息,静态区跨轮字节级稳定 = 被动前缀缓存命中前提）。降级参数
 /// 与 β 陈旧降级同参(复用 4/2000,不另立调参面)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,7 +262,7 @@ impl Default for StaleDemotionSpec {
     }
 }
 
-/// 五轮裁定批 G2/B-303:两层安全网缺省开启(显式 null 仍可关)
+/// 五轮裁定批 G2/:两层安全网缺省开启(显式 null 仍可关)
 fn default_stale_demotion_enabled() -> Option<StaleDemotionSpec> {
     Some(StaleDemotionSpec::default())
 }
@@ -817,7 +817,7 @@ fn render_handoff_base(h: &crate::agent::definition::HandoffPackage) -> String {
     seg
 }
 
-/// G5/B-311:组装入参对象(15 槽位源命名对齐原位置参数语义;统帅 2026-11-12
+/// G5/:组装入参对象(15 槽位源命名对齐原位置参数语义;项目方 2026-11-12
 /// 裁定 B 案收拢,推翻 L894 原注释"参数对象反损槽位可读性"取舍——37 处
 /// 调用点逐点核语义改写,行为零变化)
 pub struct AssemblyInputs<'a> {
@@ -981,10 +981,10 @@ impl AssemblyExecutor {
 
     /// 组装 system_prompt(按配方槽位序拼接)
     ///
-    /// 槽位源逐参数说明随 [`AssemblyInputs`] 字段注释收拢迁移(G5/B-311)。
+    /// 槽位源逐参数说明随 [`AssemblyInputs`] 字段注释收拢迁移(G5/)。
     /// Err 仅当配方声明了执行器不认识的预算基准(budget.base——validate 白名单
     /// 应已拦截,此处运行时兜底 fail-fast),不做静默降级。
-    // G5/B-311:原注释"收拢为参数对象反损槽位可读性"经统帅 2026-11-12 裁定 B 案推翻——37 处调用点逐点核语义改写,行为零变化
+    // G5/:原注释"收拢为参数对象反损槽位可读性"经项目方 2026-11-12 裁定 B 案推翻——37 处调用点逐点核语义改写,行为零变化
     pub fn assemble(&self, inp: AssemblyInputs<'_>) -> Result<String, String> {
         let AssemblyInputs {
             base_prompt,
@@ -1025,7 +1025,7 @@ impl AssemblyExecutor {
         )
     }
 
-    /// 组装分叉版(γ 批 B-268):配方开启 `mechanism_messages` 时,动态区
+    /// 组装分叉版(γ 批):配方开启 `mechanism_messages` 时,动态区
     /// (S3_memory 记忆分区/Handoff Base、S3c_todo)改渲染进独立机制段返回,
     /// 静态区不含任何机制分区标记(跨轮字节级稳定 = 被动前缀缓存命中前提);
     /// 关闭态/无动态内容物时与 [`Self::assemble`] 逐字节一致且机制段 None。
@@ -1105,7 +1105,7 @@ impl AssemblyExecutor {
             service_catalog,
         } = inp;
         let mut prompt = String::new();
-        // γ 批 B-268:机制段外移模式 = 分叉调用在场 且 配方声明开启。
+        // γ 批 :机制段外移模式 = 分叉调用在场 且 配方声明开启。
         // 两者缺一(默认配方/直调 assemble) = 全量嵌入,逐字节现行为。
         let mechanism_mode =
             mechanism_out.is_some() && self.recipe.budget.mechanism_messages.is_some();
@@ -1185,7 +1185,7 @@ impl AssemblyExecutor {
                 // 预算(结构字段完整性优先,体量小;与降级通知同口径)。
                 "recall" => {
                     if mechanism_mode {
-                        // γ 批 B-268:动态区外移——记忆分区/Handoff Base 渲染进
+                        // γ 批 :动态区外移——记忆分区/Handoff Base 渲染进
                         // 机制段(渲染器以 base="" 调用得纯记忆区,首段 "\n\n"
                         // 前缀去除;静态区不改写 = 跨轮字节级稳定)。底座块
                         // 不占记忆预算的口径与嵌入态一致。
@@ -1259,7 +1259,7 @@ impl AssemblyExecutor {
                 // 优先,Handoff Base 底座块同口径)
                 "todo_summary" => {
                     if mechanism_mode {
-                        // γ 批 B-268:动态区外移——todo 段渲染进机制段(机制段
+                        // γ 批 :动态区外移——todo 段渲染进机制段(机制段
                         // 为空时不带分隔前缀,段内容与嵌入态逐字节一致)
                         if let Some(seg) = todo_summary {
                             if !seg.trim().is_empty() {
@@ -1481,7 +1481,7 @@ mod tests {
         );
     }
 
-    /// 五轮裁定批 G2/B-303:两层安全网缺省开启(缺省/缺键 = Some);
+    /// 五轮裁定批 G2/:两层安全网缺省开启(缺省/缺键 = Some);
     /// 序列化面恒显式(Some 输出参数对象,None 输出 null——显式关经
     /// roundtrip 不语义泄漏回开启)
     #[test]
@@ -2891,7 +2891,7 @@ mod tests {
         assert_eq!(out, "base\n\nAGENTSMD");
     }
 
-    // ===== 批 B-268 γ-1:机制消息开关与动态区外移分叉 =====
+    // ===== 批  γ-1:机制消息开关与动态区外移分叉 =====
 
     /// 开启态配方夹具(mechanism_messages 声明 = Some)
     fn mechanism_on_recipe() -> AssemblyRecipe {
@@ -2900,14 +2900,14 @@ mod tests {
         r
     }
 
-    /// 显式关闭配方夹具(五轮裁定批 G2/B-303:缺省已翻转,显式 null 才是关闭)
+    /// 显式关闭配方夹具(五轮裁定批 G2/:缺省已翻转,显式 null 才是关闭)
     fn mechanism_off_recipe() -> AssemblyRecipe {
         let mut r = AssemblyRecipe::default();
         r.budget.mechanism_messages = None;
         r
     }
 
-    /// 缺省不变式(五轮裁定批 G2/B-303):默认配方 mechanism_messages = Some
+    /// 缺省不变式(五轮裁定批 G2/):默认配方 mechanism_messages = Some
     /// (开启);显式关闭态 assemble_split 与 assemble 逐字节一致且机制段 None
     /// (动态区仍嵌 system prompt 内 = 旧缺省行为)
     #[test]
@@ -3082,9 +3082,9 @@ mod tests {
         );
     }
 
-    // ===== 批 B-268 γ-4:开启态升版绑定 + 五件验收 =====
+    // ===== 批  γ-4:开启态升版绑定 + 五件验收 =====
 
-    /// 升版绑定开启态(五轮裁定批 G2/B-303 语义):缺省配方(翻转后=开启)
+    /// 升版绑定开启态(五轮裁定批 G2/ 语义):缺省配方(翻转后=开启)
     /// effective 版本 = 次版本 +1;显式关闭(声明 None)沿用声明版本不升版;
     /// 用户声明版开启同样按 +1 升(版本面反映实际生效形态)
     #[test]

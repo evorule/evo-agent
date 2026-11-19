@@ -152,7 +152,7 @@ impl FileWriteTool {
 
         // 写入
         std::fs::write(&target, content.as_bytes()).map_err(|e| format!("write failed: {}", e))?;
-        // o107 传输校验:写后回读逐字节比对(防传输层吞字);不匹配重写一次,仍不匹配显式报错 fail-visible
+        //  传输校验:写后回读逐字节比对(防传输层吞字);不匹配重写一次,仍不匹配显式报错 fail-visible
         let written_back =
             std::fs::read(&target).map_err(|e| format!("post-write verify read failed: {}", e))?;
         if written_back.as_slice() != content.as_bytes() {

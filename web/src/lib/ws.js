@@ -715,7 +715,7 @@ function handleFrame(f) {
     case 'Info':
       pushMessage({ kind: 'info', text: String(f.message) });
       pushPanelEvent('sys', { label: 'Info', detail: String(f.message) });
-      // N-009:回合已被服务端放弃(serve 重启/abort-at-birth)时 stop 回执
+  // :回合已被服务端放弃(serve 重启/abort-at-birth)时 stop 回执
       // 「no active turn to interrupt」=终态等价物——不复位则前端永久卡
       // 执行中(stop 按钮死锁,2026-11-19 实证三连击无响应)
       if (String(f.message).includes('no active turn to interrupt')) {
@@ -838,7 +838,7 @@ function handleFrame(f) {
       // 批② T0:后端 allowlist 静默批准(approver=workspace-allowlist)——
       // 前端会话记忆/清单镜像未命中(未加载/加载失败)时会已推待批卡,
       // 此处按工具名收卡转「已批准(工作区清单)」回执,不留可点击僵尸卡
-      // B-156 判据②:后端工作区内写默认 T0(approver=in-workspace)——
+  //  判据②:后端工作区内写默认 T0(approver=in-workspace)——
       // 同理收卡转「已批准(工作区内)」回执
       if (f.approved && (f.approver === 'workspace-allowlist' || f.approver === 'in-workspace')) {
         const list = get(messages);

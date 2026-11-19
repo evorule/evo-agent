@@ -753,7 +753,7 @@ pub async fn run_plan_loop_with_resume(
                     Some(sid) => sid.clone(),
                     None => WorkflowEngine::new_run_session_id(&initial_id),
                 };
-                // B-172 分流:恢复路径(run_session_id 在场)=Resume 续写同会话;
+                //  分流:恢复路径(run_session_id 在场)=Resume 续写同会话;
                 // 全新 run=New 开新档(撞号 fail-fast+身份锚)
                 let (mode, identity) = if run_session_id.is_some() {
                     (OpenMode::Resume, SessionIdentity::default())
@@ -1197,7 +1197,7 @@ pub async fn run_plan_execute(
     let plan_resume = match resume_session {
         Some(sid) => {
             let r = build_plan_loop_resume(&sessions_dir, sid)?;
-            // B-172:恢复装配恒为同会话续跑(Resume 模式:锚校验,旧档容忍)
+            // :恢复装配恒为同会话续跑(Resume 模式:锚校验,旧档容忍)
             let writer = JournalWriter::open_with_mode(
                 &sessions_dir,
                 sid,
@@ -2370,7 +2370,7 @@ mod tests {
             .expect("engine bootstrapped session id surfaced");
         let path = JournalWriter::path_for(&dir, &sid);
         let lines = read_all(&path).unwrap();
-        // B-172:New 模式开档账首落 session_opened 身份锚,其后三粒各一条检查点
+        // :New 模式开档账首落 session_opened 身份锚,其后三粒各一条检查点
         assert_eq!(lines.len(), 4, "身份锚 + 三粒各一条检查点");
         assert!(matches!(lines[0].event, JournalEvent::SessionOpened { .. }));
 

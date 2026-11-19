@@ -85,7 +85,7 @@ pub struct StaleOffload {
     pub digest: String,
 }
 
-/// G12(B-316):机制标记防伪——引用块真实性校验(纯函数,零 I/O)。
+/// G12:机制标记防伪——引用块真实性校验(纯函数,零 I/O)。
 /// 旧判定仅凭 `starts_with(标记)`:内容以标记字面量开头的工具输出/
 /// 用户输入会被误判为机制产物(跳过降级/误判已引用化)。现行判定:
 /// ①ref_id 与 digest 行齐备;②内容寻址族(stale-/mech-/trim-)ref_id
@@ -124,7 +124,7 @@ fn is_authentic_offload_block(content: &str, marker: &str) -> bool {
     content_addressed || has_path
 }
 
-/// R-4(B-358):降级/清除占位符统一构造(单源,机制优化修复技术设计 §3.1)。
+/// R-4:降级/清除占位符统一构造(单源,机制优化修复技术设计 §3.1)。
 ///
 /// 共享骨架+来源标记:首行 `[context-offloaded: source=... tool=... ref_id=...
 /// digest=...]`,随后 `ref_id:`/`digest:`/`bytes:` 结构行与取回指引——结构行
@@ -199,7 +199,7 @@ pub fn demote_stale_tool_results(
         if content.len() <= min_bytes {
             continue;
         }
-        // 已引用化内容跳过(不二次降级);G12(B-316):真实性校验——
+        // 已引用化内容跳过(不二次降级);G12:真实性校验——
         // 仅凭前缀会被同形内容骗过。R-4:统一形态 marker 同样跳过
         // (authentic 校验同构复用,防已外置内容二次降级丢 ref_id)
         if is_authentic_offload_block(content, "[TOOL_RESULT_REF]")
@@ -224,7 +224,7 @@ pub fn demote_stale_tool_results(
     (view, offloads)
 }
 
-/// 五轮裁定批 G8/B-303:trim 丢弃面 offload 产物(`trim-` 前缀内容寻址,
+/// 五轮裁定批 G8/:trim 丢弃面 offload 产物(`trim-` 前缀内容寻址,
 /// stale-/mech- 同族)。"被裁内容必须可查可重建"纪律的全链闭合件——
 /// trim 丢弃的消息经此落盘可取回,不再对模型永久不可见。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,7 +269,7 @@ pub fn trimmed_messages_block(off: &TrimmedOffload) -> String {
     )
 }
 
-/// 陈旧机制消息发送视图降级(γ 批 B-268,β 同构三条件;确定性纯函数):
+/// 陈旧机制消息发送视图降级(γ 批,β 同构三条件;确定性纯函数):
 /// 目标 = 首条 System(头部原 system)与最后一条 System(常驻最新机制
 /// 消息)之外的 System 消息。三条件全部满足才降级:①已消费——其后存在
 /// Assistant 消息;②距当前 ≥ `min_turns` 个 assistant 轮;③字节数 >
@@ -311,7 +311,7 @@ pub fn demote_stale_mechanism_messages(
         if content.len() <= min_bytes {
             continue;
         }
-        // 已降级占位块跳过(不二次降级);G12(B-316):指纹契约校验——
+        // 已降级占位块跳过(不二次降级);G12:指纹契约校验——
         // ref_id 后缀与 digest 尾段一致才是真降级块
         if is_authentic_offload_block(content, "[STALE_MECHANISM_MESSAGE]") {
             continue;
@@ -586,7 +586,7 @@ impl ContextWindowManager {
     }
 
     /// 实现策略:保留 system + 最近若干轮(tool_call/tool_result 原子对)
-    /// γ 批 B-268:机制消息独立原子组——头部原 system(首条 System)全保;
+    /// γ 批 :机制消息独立原子组——头部原 system(首条 System)全保;
     /// 机制消息(首条之后的 System 消息)只保最新一条常驻,其余进入可淘汰面
     /// (发送视图已先行按 β 同构三条件降级为 digest 引用块;此处作为普通
     /// 池成员参与尾部累加,预算不足时丢弃)
@@ -641,7 +641,7 @@ impl ContextWindowManager {
 
         if available_for_recent == 0 {
             // 极端情况:常驻面本身已占满 budget。
-            // 四轮审计 G16(B-285):不得把末条 User 一起丢。分层保底:
+            // 四轮审计 G16:不得把末条 User 一起丢。分层保底:
             // ① base+latest_mech+末条 User 都放得下 → 全保(γ 契约不破);
             // ② 否则 latest_mech 让位,保底 base+末条 User+hint;
             // ③ base+末条 User 仍超预算(系统提示本身超大)或无 User → 原行为。
@@ -756,7 +756,7 @@ impl ContextWindowManager {
                     }
                 }
                 if !has_caller {
-                    // 四轮审计 G17(B-285):孤儿 Tool 段(前邻非 Assistant
+                    // 四轮审计 G17:孤儿 Tool 段(前邻非 Assistant
                     // (tool_calls))整组放弃——发出即 wire 孤儿(tool_call_id
                     // 无配对),上游 400。段留在可淘汰池,自然落入 dropped。
                     continue;
@@ -809,7 +809,7 @@ impl ContextWindowManager {
 }
 
 impl ContextWindowManager {
-    /// 四轮审计 G13(B-285):摘要回填前的预算收顶。
+    /// 四轮审计 G13:摘要回填前的预算收顶。
     ///
     /// trim 只为 hint 预留 `hint_overhead`(配方注入值,缺省 15)token,摘要回填若不限长,
     /// 刚 fit 的发送视图会被重新撑爆。本方法按当前预算对摘要文本收顶:
@@ -871,7 +871,7 @@ mod tests {
     use crate::agent::translator::{ImageData, ToolCall};
     use serde_json::json;
 
-    /// G8/B-303:trim offload 确定性——同输入同 ref_id 同体同指纹;
+    /// G8/:trim offload 确定性——同输入同 ref_id 同体同指纹;
     /// 体逐条 JSON 行保真(含 images/tool_calls 元数据)
     #[test]
     fn test_trimmed_offload_deterministic_and_faithful() {
@@ -904,7 +904,7 @@ mod tests {
         assert!(a.ref_id.contains(&digest_hex[..digest_hex.len().min(16)]));
     }
 
-    /// G8/B-303:空 dropped = None;引用块含 ref_id/bytes/digest/取回指引
+    /// G8/:空 dropped = None;引用块含 ref_id/bytes/digest/取回指引
     #[test]
     fn test_trimmed_offload_empty_none_and_block_shape() {
         assert!(build_trimmed_offload(&[]).is_none());
@@ -941,7 +941,7 @@ mod tests {
         ]
     }
 
-    // ========== G12(B-316):机制标记防伪(引用块真实性校验) ==========
+    // ========== G12:机制标记防伪(引用块真实性校验) ==========
 
     /// 同形伪装:Tool 消息内容以 [TOOL_RESULT_REF] 字面量开头但无引用块
     /// 结构(无 ref_id/digest/path 行)——不得被误判为已引用化而跳过降级,
@@ -1641,7 +1641,7 @@ mod tests {
     }
 
     /// 已引用化内容跳过:不二次降级,原样保留
-    /// (G12(B-316)改指向真块形态:引用块须带 ref_id/digest/path 结构,
+    /// (G12改指向真块形态:引用块须带 ref_id/digest/path 结构,
     /// 防伪校验不误伤真块;原 fixture 缺 digest/path 行,按新判据=同形
     /// 伪装应被降级,见 test_g12_fake_marker_tool_result_still_demoted)
     #[test]
@@ -1746,7 +1746,7 @@ mod tests {
         assert_eq!(view.len(), msgs.len());
     }
 
-    // ===== 批 B-268 γ-3:机制消息独立原子组 + β 同构降级变换 =====
+    // ===== 批  γ-3:机制消息独立原子组 + β 同构降级变换 =====
 
     /// 机制消息降级目标 = 首条(头部原 system)与最后一条(常驻最新机制消息)
     /// 之外的 System 消息:中间旧机制消息满足三条件降级,两端零改动
@@ -1975,7 +1975,7 @@ mod tests {
         assert_eq!(trimmed[2].content(), "mech latest");
     }
 
-    // ========== B-285 四轮审计缝缺陷红测(G13/G16/G17) ==========
+    // ==========  四轮审计缝缺陷红测(G13/G16/G17) ==========
 
     /// G13: 摘要回填前的预算收顶——回填超预算时必须收缩;本就够小原样
     /// 放行;连最小摘要都容不下时回落 fallback(即不回填)。

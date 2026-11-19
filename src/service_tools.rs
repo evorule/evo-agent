@@ -357,7 +357,7 @@ async fn register_service_tools_with_delays(
 
     let mut registered = 0usize;
     // 启动点名探针：缺失/sensitive/重名逐类收集，循环后输出结构化汇总，
-    // 供装机面 fresh-install 点名与 CI 冒烟断言（B-051）
+    // 供装机面 fresh-install 点名与 CI 冒烟断言（）
     let mut missing: Vec<&str> = Vec::new();
     let mut skipped_sensitive: Vec<&str> = Vec::new();
     let mut skipped_duplicate: Vec<&str> = Vec::new();

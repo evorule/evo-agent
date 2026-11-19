@@ -996,7 +996,7 @@ impl WorkbenchSettingsStore {
     /// 合并读取：Default→User→Workspace（后层覆盖前层）。
     /// 返回 `(settings, sources)`；sources 每键标注 `default|user|workspace`。
     /// workspace 层未知键忽略、application scope 键拒收（stderr 留痕——手改
-    /// 该文件设 application 键曾致部署面误判「已激活」数小时，登记册 o31）、
+    /// 该文件设 application 键曾致部署面误判「已激活」数小时，登记册 ）、
     /// 非法值跳过（fail-soft）。
     pub fn merged(&self) -> (Map<String, Value>, Map<String, Value>) {
         let user = load_layer(&self.user_path);
@@ -1007,7 +1007,7 @@ impl WorkbenchSettingsStore {
                 if accept_workspace_value(&e, &v) {
                     workspace.insert(k, v);
                 } else if e.scope == "application" {
-                    // o31:application scope 键禁工作区覆盖是守护行为,但静默
+                    // :application scope 键禁工作区覆盖是守护行为,但静默
                     // 拒收曾致部署面误判(手改文件者以为生效)——stderr 留痕
                     eprintln!(
                         "[settings] workspace-layer override for application-scoped \

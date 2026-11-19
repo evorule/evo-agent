@@ -757,7 +757,7 @@ pub fn effective_capability_boundary(
 /// `def.capability_boundary` 在场时整份以声明为准(单一事实源,--read-root
 /// 不覆盖声明;声明自带 read_root 字段能力)。
 ///
-/// `write_face_root`(B-367 声明跟实现):写面工具实际绑定基根(=toolkit 装配
+/// `write_face_root`(声明跟实现):写面工具实际绑定基根(=toolkit 装配
 /// workdir 单源)。在场时合成边界携带 `write_domain`=该根/DEFAULT_WRITABLE_DIR,
 /// awareness「可写域」如实渲染子域——修复「声明=sandbox_root 全域、实际=
 /// workspace 子域」的文案失真。None(声明整份覆盖路径)=不携带,可写域=
@@ -799,7 +799,7 @@ pub fn effective_capability_boundary_with_read_root(
     let read_root = read_root
         .map(|r| simplify_verbatim(r.canonicalize().unwrap_or_else(|_| r.to_path_buf())))
         .filter(|r| r != &sandbox_root);
-    // 写面实域(B-367):toolkit 写面缺省绑定 workdir/DEFAULT_WRITABLE_DIR
+    // 写面实域:toolkit 写面缺省绑定 workdir/DEFAULT_WRITABLE_DIR
     // 子域;规范化口径与 sandbox_root 一致——基根 canonicalize(失败 fallback
     // cwd 拼接),叶子(workspace/ 尚不存在等)不参与 canonicalize,仅 join
     let write_domain = write_face_root.map(|w| {
@@ -925,7 +925,7 @@ pub fn apply_capability_boundary(
                 ),
             );
         }
-        // B-368（adjacent 缺口）：declared read_write 会话写面已全域
+        // （adjacent 缺口）：declared read_write 会话写面已全域
         // 重绑 sandbox_root，undo 快照栈必须随重绑同根——否则快照落盘根与
         // 写面根分叉，workspace_undo 对会话写入静默扑空。合成态不进此分支
         // （apply_capability_boundary 仅 declared 生效），undo 缺省绑定
@@ -965,7 +965,7 @@ pub fn wire_capability_boundary(
 /// 边界携带双域信息(awareness 自报);union toolkit 实例已在启动期按双根
 /// 绑定,此处合成仅产出 LLM 自报与状态面数据。
 ///
-/// `write_face_root`(B-367):写面工具实际绑定基根(=toolkit 装配 workdir
+/// `write_face_root`:写面工具实际绑定基根(=toolkit 装配 workdir
 /// 单源;与边界根 `--agent-root` 旋钮分存的部署形态下二者可异)。None=
 /// 不携带写面实域(声明整份覆盖路径,可写域=sandbox_root 即准确)。
 pub fn wire_capability_boundary_with_read_root(
@@ -1003,7 +1003,7 @@ pub fn checkpoint_writable_dir(
 // B2 skills 装配:声明解析 + read_skill 注册(serve/CLI/delegate 共用)
 // =============================================================================
 
-/// checkpoint 仓库根派生（B-368 案 A）：快照链绑**生效边界**——
+/// checkpoint 仓库根派生（ 案 A）：快照链绑**生效边界**——
 /// 合成态（write_domain 在场）取写面基根（write_domain 的父目录，= toolkit
 /// workdir），declared read_write（write_domain 缺席）取 sandbox_root（与
 /// "." 全域重绑同域）。`req_workspace`/`agent_root` 仅作声明缺席且合成
@@ -1018,7 +1018,7 @@ pub fn checkpoint_repo_root(
     agent_root: &Path,
     effective: &crate::agent::definition::CapabilityBoundary,
 ) -> std::path::PathBuf {
-    // 快照链跟生效边界(B-368):合成态=写面基根,declared=sandbox_root。
+    // 快照链跟生效边界:合成态=写面基根,declared=sandbox_root。
     // req_workspace/agent_root 保留兼容签名(req.workspace declared 注入时
     // sandbox_root 即其值,口径自然一致);声明与合成域均不携带时维持回落。
     let _ = (req_workspace, agent_root);
@@ -1032,7 +1032,7 @@ pub fn checkpoint_repo_root(
     }
 }
 
-/// undo 快照栈重绑根派生（B-368 adjacent 缺口）：declared read_write
+/// undo 快照栈重绑根派生（ adjacent 缺口）：declared read_write
 /// 会话写面被重绑到 sandbox_root 全域（"."），undo store 必须随重绑同根；
 /// 合成态 undo 缺省绑定 workdir/DEFAULT_WRITABLE_DIR（= write_domain），无需
 /// 重绑 → None。返回 (store_root, writable_subdir)。
@@ -2311,7 +2311,7 @@ service_tools = ["config_persist", "rule_sandbox"]
 
     #[test]
     fn test_effective_boundary_write_face_root_carries_write_domain() {
-        // B-367 声明跟实现:write_face_root 在场 → 合成边界携带 write_domain
+        //  声明跟实现:write_face_root 在场 → 合成边界携带 write_domain
         // (=该根/DEFAULT_WRITABLE_DIR 子域);None → 不携带(声明整份覆盖语义)
         let def = make_def(&["file_read", "file_write"], None);
         let eff = effective_capability_boundary_with_read_root(

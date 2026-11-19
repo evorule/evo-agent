@@ -813,7 +813,7 @@ impl WorkflowEngine {
             *slot = match self.ctx.journal_dir.clone() {
                 Some(dir) => {
                     let sid = Self::bootstrap_session_id(workflow_id);
-                    // B-172:run 级账本自举会话号带唯一指纹,恒为新档(New 模式;
+                    // :run 级账本自举会话号带唯一指纹,恒为新档(New 模式;
                     // 撞号 fail-fast 兜底指纹失效场景)
                     let writer = JournalWriter::open_with_mode(
                         &dir,
@@ -1120,7 +1120,7 @@ impl WorkflowEngine {
             // 配对:节点成功后 mark_node_done 即时打标(见 PhaseGate 时序契约),
             // 保证下一节点的门可查到前置标记。
             if let Some(gate) = &self.phase_gate {
-                // o86 前置可达性预检：phase 前置任务在设计期被 run_when 级联
+                //  前置可达性预检：phase 前置任务在设计期被 run_when 级联
                 // 跳过时，其 node_done 标记永不存在——phase 门必拒且归因误导
                 // （prerequisite mark missing 指向一个永远不会出现的标记）。
                 // 显式预检给出准确归因并即时失败（fail-visible）：治理语义
@@ -2454,7 +2454,7 @@ mod tests {
         let sid = find_planrun_sid(&dir).expect("run ledger session must exist");
         let path = JournalWriter::path_for(&dir, &sid);
         let lines = crate::agent::journal::read_all(&path).unwrap();
-        // B-172:New 模式开档账首落 session_opened 身份锚,其后三粒各一条检查点
+        // :New 模式开档账首落 session_opened 身份锚,其后三粒各一条检查点
         assert_eq!(lines.len(), 4, "身份锚 + 三粒各一条检查点");
         assert!(matches!(lines[0].event, JournalEvent::SessionOpened { .. }));
         let cut = lines
@@ -2483,7 +2483,7 @@ mod tests {
         let sid2 = engine2.run_ledger_session_id().unwrap();
         let lines2 =
             crate::agent::journal::read_all(&JournalWriter::path_for(&dir, &sid2)).unwrap();
-        // B-172:恢复代账本为 New 模式开新档,账首落身份锚(粒 1/2 未重执行)
+        // :恢复代账本为 New 模式开新档,账首落身份锚(粒 1/2 未重执行)
         assert_eq!(lines2.len(), 2, "身份锚 + 粒 3 检查点=零重执行");
         assert!(matches!(
             lines2[0].event,
@@ -4649,9 +4649,9 @@ mod tests {
         );
     }
 
-    // ===== 判据命令整体预算(o85):挂起判据不再楔死 workflow =====
+    // ===== 判据命令整体预算:挂起判据不再楔死 workflow =====
 
-    /// 跨平台挂起探针(白名单内、引号内分号——o67 引号感知语义):
+    /// 跨平台挂起探针(白名单内、引号内分号—— 引号感知语义):
     /// python/python3 睡 120s,judge 预算远小于此
     #[cfg(windows)]
     const HUNG_JUDGE_CMD: &str = "python -c \"import time; time.sleep(120)\"";
@@ -4775,9 +4775,9 @@ mod tests {
             "错误须指明互斥: {err}"
         );
     }
-    // ── 批 W：o73 恢复收敛 + o86 skipped 前置预检 ──
+    // ── 批 W： 恢复收敛 +  skipped 前置预检 ──
 
-    /// o73：restored LLM 节点在 resume 时必须幂等补提 node_done 标记
+    /// ：restored LLM 节点在 resume 时必须幂等补提 node_done 标记
     /// （reconcile-on-restart）——崩溃窗口（checkpoint 已落/mark 未落）后
     /// 不补标=下游 phase 门恒拒永久卡死。mockito 断言 mark 信号确已提交。
     #[tokio::test]
@@ -4842,7 +4842,7 @@ mod tests {
         );
     }
 
-    /// o86：phase 前置被 run_when 级联跳过时，显式预检给出准确归因并即时
+    /// ：phase 前置被 run_when 级联跳过时，显式预检给出准确归因并即时
     /// 失败（run_when 显式为真的节点不受级联约束，但其 depends_on 落在
     /// skipped 集 → 前置标记永不存在 → 必须立即可判读地失败，而非走进
     /// phase 门收下一条误导性 enforce violation）。

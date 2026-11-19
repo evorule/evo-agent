@@ -39,12 +39,12 @@ pub struct RetrievalConfig {
     /// usage 计数封顶（k：min(usage,k) 防高频条目垄断排序）
     #[serde(default = "default_usage_cap")]
     pub usage_cap: u32,
-    /// 召回期变体聚簇（D2-一期，B-369）：recall 注入前按路径首段聚簇，
+    /// 召回期变体聚簇（D2-一期）：recall 注入前按路径首段聚簇，
     /// 簇内仅保留 ranking 最高一条，其余退出本轮注入（读侧 only，零写面
     /// 变化）。缺省 false=既有行为零影响（缺省不变式）。
     #[serde(default)]
     pub variant_dedupe: bool,
-    /// 提取端写前归并（D2-二期，B-370）：sediment 稳定事实落库前按
+    /// 提取端写前归并（D2-二期）：sediment 稳定事实落库前按
     /// (语义首段, 归一属性) 对齐既有活跃事实，命中即复用既有 path 新版本
     /// 覆写（同 path 裁定链自动生效）；同极性值差异打 conflict 标记不自动
     /// supersede。缺省 false=既有行为零影响（缺省不变式）。
@@ -264,13 +264,13 @@ pub struct AdjudicationConfig {
     /// 词面相似阈值（分词集 Jaccard；缺省 0.6）
     #[serde(default = "default_similarity_threshold")]
     pub similarity_threshold: f32,
-    /// 独占值槽位（B-411 P2 同主题异值检测数据面；缺省=嵌入保守表，
+    /// 独占值槽位（ P2 同主题异值检测数据面；缺省=嵌入保守表，
     /// 解析失败回退空表=仅极性规则，保守取向同否定词表）
     #[serde(default = "default_value_slots")]
     pub value_slots: Vec<ValueSlot>,
 }
 
-/// 独占值槽位（B-411 P2）：声明「单值语义」的主题——同槽位两条稳定事实
+/// 独占值槽位（ P2）：声明「单值语义」的主题——同槽位两条稳定事实
 /// 断言不同具体值即矛盾候选。`key_tokens` 子串命中记录的 **key 字段**（非
 /// value 体：正文提及≠断言，防「工作区列表：D:\a、D:\b」类并列误报）。
 ///
@@ -451,7 +451,7 @@ impl Default for StorageConfig {
 
 /// 记忆配方规则集（F-610）：召回权重/生命周期/预算/源启用的策略声明面
 ///
-/// 部分声明语义（B-367）：策略节（tools/sources/adjudication/promote_gate/
+/// 部分声明语义（）：策略节（tools/sources/adjudication/promote_gate/
 /// storage/lex_ttl_secs）与本核四字段均带缺省——声明只需携带要覆盖的节，
 /// 未声明节取机制缺省（与 `MemoryRecipe::default()` 同源单点）。缺省不变式：
 /// 整份配方缺席（None）仍走词法 legacy 路径，行为零变化。
@@ -538,7 +538,7 @@ impl Default for MemoryRecipe {
     }
 }
 
-/// 部分声明缺省源（B-367）：与 `MemoryRecipe::default()` 同源单点，
+/// 部分声明缺省源（）：与 `MemoryRecipe::default` 同源单点，
 /// 供 serde 字段级缺省引用——禁止第二处手抄默认值。
 fn default_recipe_version() -> String {
     MemoryRecipe::default().recipe_version
@@ -759,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_value_slots_embedded_file_loads() {
-        // B-411 P2:独占值槽位数据文件外置——嵌入文件可解析、正主槽位在位、
+        //  P2:独占值槽位数据文件外置——嵌入文件可解析、正主槽位在位、
         // 保守纪律(裸泛词形不入表:并列语义碰撞)、recipe 旧 JSON 零迁移
         let slots = default_value_slots();
         assert!(!slots.is_empty(), "嵌入槽位表应可解析");
@@ -839,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_recipe_partial_declaration_policy_only_sections() {
-        // B-367 部分声明硬化:仅声明策略节(tools/adjudication),核四字段
+        //  部分声明硬化:仅声明策略节(tools/adjudication),核四字段
         // (recipe_version/retrieval/lifecycle/budget)缺省补齐——未声明节取
         // 机制缺省(与 MemoryRecipe::default() 同源单点)
         let json = r#"{

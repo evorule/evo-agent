@@ -116,7 +116,7 @@ impl ToolFunction for PythonExecTool {
         // o10①型坏字防线(P1 编辑面):载荷传输层单字节丢失会把多字节 UTF-8
         // 解成 U+FFFD 替换符——代码参数含替换符=载荷在途损坏的强信号(代码
         // 不含合法 U+FFFD,零误伤),fail-visible+重试指引(实测重试成功率高;
-        // file_write/edit_file 已有 o107 写层校验,本守卫补齐 python_exec
+        // file_write/edit_file 已有  写层校验,本守卫补齐 python_exec
         // 中转路径的工具入口检出)
         let fffd = code.matches('\u{FFFD}').count();
         if fffd > 0 {

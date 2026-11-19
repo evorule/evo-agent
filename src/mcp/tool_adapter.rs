@@ -904,7 +904,7 @@ mod tests {
         assert_eq!(result.as_str(), Some("small"));
     }
 
-    // ===== 注册面完整性(o78 all-or-nothing / o79 名称边界与碰撞 / o80 跨来源冒名) =====
+    // ===== 注册面完整性(all-or-nothing /  名称边界与碰撞 /  跨来源冒名) =====
 
     /// 跨来源冒名测试替身:既有非 MCP 来源条目的执行器
     struct NoopTool;
@@ -918,7 +918,7 @@ mod tests {
 
     #[test]
     fn test_mcp_identifier_validation_boundaries() {
-        // o79:server/tool 名边界——字符集镜像 PUT 面,tool 名另加 64 字节上限
+        // :server/tool 名边界——字符集镜像 PUT 面,tool 名另加 64 字节上限
         assert!(validate_mcp_identifier("server", "fs").is_ok());
         assert!(validate_mcp_identifier("server", "web-scraper_v2").is_ok());
         assert!(validate_mcp_identifier("tool", "read_file").is_ok());
@@ -937,7 +937,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_client_tools_contract_reject_is_all_or_nothing() {
-        // o78:注册循环中途契约拒绝不得残留前 k-1 工具——两阶段注册,
+        // :注册循环中途契约拒绝不得残留前 k-1 工具——两阶段注册,
         // 整 server 拒绝,状态面 failed 与实际可用面一致
         let (client, _transport) = make_client_with_tool_response().await;
         let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
@@ -956,7 +956,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_client_tools_rejects_nonconforming_names() {
-        // o79:远端 tools/list 透传的非法工具名 = 整 server 拒绝(不留合法子集)
+        // :远端 tools/list 透传的非法工具名 = 整 server 拒绝(不留合法子集)
         let (client, _transport) = make_client_with_tool_response().await;
         let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
         let tools = [spec("ok_tool"), spec("bad name")];
@@ -968,7 +968,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_client_tools_name_collision_refuses_shadow() {
-        // o79:`mcp_{server}_{tool}` 组合碰撞(a+b_c vs a_b+c 同产 mcp_a_b_c)
+        // :`mcp_{server}_{tool}` 组合碰撞(a+b_c vs a_b+c 同产 mcp_a_b_c)
         // ——后者显式拒绝,先注册者保持原样(always_allow 升档路径封死)
         let (client, _transport) = make_client_with_tool_response().await;
         let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
@@ -987,7 +987,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_client_tools_refuses_cross_source_shadow() {
-        // o80:同名冒名的结构根=覆盖无来源防线——MCP 注册撞上非 MCP 来源
+        // :同名冒名的结构根=覆盖无来源防线——MCP 注册撞上非 MCP 来源
         // 既有名时显式拒绝(先注册者胜),serve 面与 run/patrol 面两种装配序
         // 下等价安全,不再依赖注册顺序巧合
         let (client, _transport) = make_client_with_tool_response().await;
@@ -1021,7 +1021,7 @@ mod tests {
         ));
     }
 
-    // ===== 执行超时契约(o83):超时=终止,非放弃 =====
+    // ===== 执行超时契约:超时=终止,非放弃 =====
 
     /// 握手可通过、tools/call 永不响应的挂起 server 替身(纯 Rust,无外部依赖):
     /// 模拟「accept 后握住不回」的缺陷/恶意 server

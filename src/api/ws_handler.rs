@@ -1205,7 +1205,7 @@ async fn construct_runner(
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源;
         // run_streaming_inner 内按会话创建 {sid}.jsonl)
         .with_journal_dir(state.workdir().join("data").join("sessions"))
-        // checkpoint 仓库根跟生效边界（B-368 案 A：快照链与写面同根；
+        // checkpoint 仓库根跟生效边界（ 案 A：快照链与写面同根；
         // 合成态=write_face 基根=toolkit workdir，与 undo store 构建期绑定一致）
         .with_workspace_checkpoint_writable(
             &crate::api::serve_tools::checkpoint_repo_root(
@@ -1286,7 +1286,7 @@ async fn construct_runner(
     // 而定义声明窗口 204800)。与 from_definition 同口径接线(单一实现
     // wire_definition_context_window),链预算基数与裁剪管路随之归真。
     runner.wire_definition_context_window(def.context_window_tokens);
-    // B-426 审计修复:WS 路径补 assembly/降级链穿线(from_definition 同口径)——
+    //  审计修复:WS 路径补 assembly/降级链穿线(from_definition 同口径)——
     // AssemblyExecutor 沿 def.assembly 配方替换缺省执行器(tool_result_max_tokens
     // /降级参数/预算比例全部归真,不再吃缺省硬编码);降级三件沿链穿线
     runner.wire_assembly_and_demotion(&def);

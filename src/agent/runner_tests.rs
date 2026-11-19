@@ -272,7 +272,7 @@ fn test_context_signal_line_threshold_and_format() {
     assert_eq!(context_signal_line(19_600, 28_000, 38_000, 2), None); // 恰 70%
                                                                       // 设计示例口径:73%（输入预算 28k/38k），回合 N
     let line = context_signal_line(20_440, 28_000, 38_000, 7).unwrap(); // 73%
-                                                                        // G10/B-307:信号行改为独立 User 消息形态,无拼接空行前缀
+                                                                        // G10/:信号行改为独立 User 消息形态,无拼接空行前缀
     assert!(!line.starts_with('\n'), "独立消息形态无空行前缀: {line}");
     assert!(line.starts_with("[context] 窗口使用 73%"), "{line}");
     assert!(line.contains("输入预算 28k/38k"), "{line}");
@@ -284,7 +284,7 @@ fn test_context_signal_line_threshold_and_format() {
     assert_eq!(context_signal_line(999, 28_000, 0, 1), None);
 }
 
-/// G10/B-307:信号行注入形态——末尾独立 User 消息,首条 System 字节不动
+/// G10/:信号行注入形态——末尾独立 User 消息,首条 System 字节不动
 /// (前缀缓存前提);≤70% 静默零变化
 #[test]
 fn test_push_context_signal_appends_trailing_user_message() {
@@ -440,7 +440,7 @@ fn test_effective_params_records_assembly_recipe_triple() {
     let command = runner.build_call_external_command("sys", "goal", None);
     let eff = &command["params"]["effective_params"];
     assert_eq!(eff["assembly_protocol_version"], "assembly-v3");
-    // 默认配方(AgentRunner::new → default_executor;G2/B-303 缺省翻转后
+    // 默认配方(AgentRunner::new → default_executor;G2/ 缺省翻转后
     // mechanism_messages 缺省开启,开启态次版本 +1 → recipe-v1.4)
     assert_eq!(eff["assembly_recipe_version"], "recipe-v1.4");
     let hash = eff["assembly_recipe_hash"].as_str().unwrap();
@@ -497,7 +497,7 @@ fn test_external_recipe_v1_1_recorded_on_wire() {
     let command = runner.build_call_external_command("sys", "goal", None);
     let eff = &command["params"]["effective_params"];
     assert_eq!(eff["assembly_protocol_version"], "assembly-v3");
-    // G2/B-303 缺省翻转:声明 v1.1 配方未显式关 mechanism_messages →
+    // G2/ 缺省翻转:声明 v1.1 配方未显式关 mechanism_messages →
     // 缺省开启态 → effective 次版本 +1 = recipe-v1.2(版本面反映实际生效形态)
     assert_eq!(eff["assembly_recipe_version"], "recipe-v1.2");
     let hash = eff["assembly_recipe_hash"].as_str().unwrap();
@@ -1261,7 +1261,7 @@ async fn test_generate_acceptance_criteria_fail_visible_on_sidecar_failure() {
 /// 唯一临时目录(进程 id+纳秒;防测试间与跨运行残留账面互扰)
 fn o492_temp_dir(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
-        "o492-{tag}-{}-{}",
+        "-{tag}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1274,7 +1274,7 @@ fn o492_temp_dir(tag: &str) -> std::path::PathBuf {
 #[test]
 fn test_recover_acceptance_criteria_latest_wins() {
     let dir = o492_temp_dir("latest");
-    let sid = "s-o492-latest";
+    let sid = "s--latest";
     {
         let w = crate::agent::journal::JournalWriter::open(&dir, sid).unwrap();
         w.acceptance_criteria_generated("echo stale", "m1").unwrap();
@@ -1289,7 +1289,7 @@ fn test_recover_acceptance_criteria_latest_wins() {
 #[test]
 fn test_recover_acceptance_criteria_missing_event() {
     let dir = o492_temp_dir("missing");
-    let sid = "s-o492-missing";
+    let sid = "s--missing";
     {
         // 仅开立账面,不写判据事件(空文件)
         let _w = crate::agent::journal::JournalWriter::open(&dir, sid).unwrap();
@@ -1307,7 +1307,7 @@ fn test_recover_acceptance_criteria_missing_event() {
 fn test_recover_acceptance_criteria_missing_journal_file() {
     let dir = o492_temp_dir("nofile");
     std::fs::create_dir_all(&dir).unwrap();
-    let err = AgentRunner::recover_acceptance_criteria(&dir, "s-o492-nofile").unwrap_err();
+    let err = AgentRunner::recover_acceptance_criteria(&dir, "s--nofile").unwrap_err();
     assert!(err.contains("journal read failed"), "got: {err}");
 }
 
@@ -1315,7 +1315,7 @@ fn test_recover_acceptance_criteria_missing_journal_file() {
 #[test]
 fn test_recover_acceptance_criteria_revalidation_rejects_multiline() {
     let dir = o492_temp_dir("reval");
-    let sid = "s-o492-reval";
+    let sid = "s--reval";
     {
         let w = crate::agent::journal::JournalWriter::open(&dir, sid).unwrap();
         w.acceptance_criteria_generated("echo a\necho b", "m1")
@@ -1331,7 +1331,7 @@ fn test_recover_acceptance_criteria_revalidation_rejects_multiline() {
 async fn test_continuation_acceptance_recovery_fail_visible() {
     let mut server = mockito::Server::new_async().await;
     let client = EvoruleApiClient::new(&server.url());
-    let sid = "s-o492-fv";
+    let sid = "s--fv";
 
     server
         .mock("GET", format!("/api/sessions/{sid}/state").as_str())
@@ -1392,7 +1392,7 @@ async fn test_continuation_acceptance_recovery_fail_visible() {
 async fn test_continuation_acceptance_static_criteria_wins() {
     let mut server = mockito::Server::new_async().await;
     let client = EvoruleApiClient::new(&server.url());
-    let sid = "s-o492-static";
+    let sid = "s--static";
 
     let state_mock = server
         .mock("GET", format!("/api/sessions/{sid}/state").as_str())
@@ -1456,7 +1456,7 @@ async fn test_continuation_acceptance_static_criteria_wins() {
 async fn test_continuation_acceptance_recovery_success() {
     let mut server = mockito::Server::new_async().await;
     let client = EvoruleApiClient::new(&server.url());
-    let sid = "s-o492-ok";
+    let sid = "s--ok";
 
     let state_mock = server
         .mock("GET", format!("/api/sessions/{sid}/state").as_str())
@@ -3524,7 +3524,7 @@ async fn test_run_recall_before_prompt() {
         .await;
 
     // 5. persist_message: POST /api/sessions/99/payload
-    //    G2/B-303 缺省翻转:recall 内容随机制消息(独立 System)上行 persist——
+    //  G2/ 缺省翻转:recall 内容随机制消息(独立 System)上行 persist——
     //    精确 mock 吃含 recall 的 payload(时序验证意图保持),其余 persist 落 Any
     let _recall_persist_mock = server
         .mock("POST", "/api/sessions/99/payload")
@@ -3565,7 +3565,7 @@ async fn test_run_recall_before_prompt() {
     // run() 会因为空 SSE 流返回 error result，但不影响验证
     assert!(result.is_ok(), "run() should not return Err");
 
-    // G2/B-303:recall 上行时序验证面随缺省翻转迁移——recall_test_value 现随
+    // G2/:recall 上行时序验证面随缺省翻转迁移——recall_test_value 现随
     // 机制消息(独立 System)经 payload 通道上行(recall_persist_mock 命中即证,
     // 命中数含 sediment 断流补写故不做次数断言;内容完整性由 assembly 机制段
     // 单测在案)。command 上行照常校验。
@@ -6866,7 +6866,7 @@ fn test_emergency_trim_folds_oldest_and_compacts_keeps_recent_rounds() {
     assert!(report.after_chars < report.before_chars);
 }
 
-/// 紧急裁剪③层丢界补账(B-367):被压缩区角色分布随 report 落账
+/// 紧急裁剪③层丢界补账:被压缩区角色分布随 report 落账
 #[test]
 fn test_emergency_trim_reports_removed_role_inventory() {
     use super::emergency_trim_for_payload_limit;
@@ -8756,7 +8756,7 @@ async fn rebuild_delta_aligns_subsequent_persist_index() {
     // mock 命中即证明持久化落点为 messages.6(下标差对齐生效)
 }
 
-// ===== B-285 四轮审计缝缺陷红测(G14/G15) =====
+// =====  四轮审计缝缺陷红测(G14/G15) =====
 
 /// G14: 引用占位块承诺 bytes、fetch 只支持 chars——单位契约缝。修复后
 /// 两侧 chars 口径齐备(bytes 字段保留兼容),CJK 场景 offset 可对账。
@@ -8830,7 +8830,7 @@ fn fetch_verifies_digest_for_content_addressed_refs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ---- 五轮裁定批 G8/B-303: trim 丢弃面 offload(below-threshold 引用块补位) ----
+// ---- 五轮裁定批 G8/: trim 丢弃面 offload(below-threshold 引用块补位) ----
 
 fn g8_test_runner(dir: &std::path::Path) -> AgentRunner {
     AgentRunner::new(AgentConfig::default(), make_test_client()).with_journal_dir(dir.to_path_buf())
@@ -8938,7 +8938,7 @@ async fn g8_without_journal_dir_keeps_hint_unchanged() {
     }
 }
 
-// ---- 五轮裁定批 G4/B-307: 引用块截断后果说明在场(防文案回退) ----
+// ---- 五轮裁定批 G4/: 引用块截断后果说明在场(防文案回退) ----
 
 #[test]
 fn g4_reference_block_carries_truncation_consequence() {
