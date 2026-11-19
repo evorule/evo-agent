@@ -2664,6 +2664,9 @@ impl AgentRunner {
                         self.session_coding_profile = true;
                         self.coding_repo_map_segment =
                             crate::agent::repo_map::render_workspace_map(ws);
+                        // 索引预热(coding 档):后台一次性 ensure_index,fail-soft
+                        // (桥不可达/无运行时静默跳过;状态经 codegraph status 查)
+                        crate::builtin_tools::codegraph::spawn_background_ensure_index(ws);
                     }
                 }
             }
