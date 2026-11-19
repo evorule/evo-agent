@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
-// N-011:「复制 API Token」状态栏按钮的逻辑面(与组件分离供直测)。
+// 摩擦账目处置一:「复制 API Token」状态栏按钮的逻辑面(与组件分离供直测)。
 //
 // 语义:人类显式点击=token 交付动作——token 本就由壳 init_script 注入
 // webview localStorage(零新增暴露面),按钮只把它送进剪贴板;
