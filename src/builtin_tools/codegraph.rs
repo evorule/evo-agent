@@ -225,6 +225,43 @@ impl crate::io_handlers::tool_handler::ToolFunction for CodeGraphTool {
     }
 }
 
+/// coding 档开工索引预热(后台一次性;每工作区每 serve 进程至多一次)。
+///
+/// 进程内 tokio 任务直呼桥 `ensure_index`(写面=索引库,非工作区;与工具
+/// 面只读服务族不冲突)。fail-soft 全程:桥不可达/无运行时/重复触发一律
+/// 静默跳过(索引态经 `codegraph` 工具 `status` 服务可见,绝不阻塞会话
+/// 构造)。无 tokio 运行时的同步构造上下文直接跳过(不 panic)。
+pub fn spawn_background_ensure_index(workdir: &Path) {
+    static WARMED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let key = workdir
+        .canonicalize()
+        .unwrap_or_else(|_| workdir.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let set = WARMED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    {
+        let mut s = set.lock().unwrap_or_else(|e| e.into_inner());
+        if !s.insert(key.clone()) {
+            return; // 本进程已预热过该工作区
+        }
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return; // 同步构造上下文无运行时:fail-soft 跳过
+    };
+    handle.spawn(async move {
+        let transport = HttpTransport::from_env();
+        let payload = serde_json::json!({"projectPath": key});
+        match transport
+            .call("ensure_index", &payload, std::time::Duration::from_secs(180))
+            .await
+        {
+            Ok(_) => tracing::debug!(workspace = %key, "codegraph background index ready"),
+            Err(e) => tracing::debug!(workspace = %key, error = %e, "codegraph background index skipped (fail-soft)"),
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
