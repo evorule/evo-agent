@@ -708,7 +708,15 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             // （此前默认 AutoPolicy 属盘点遗漏，行为等价修正）。
             // python_exec：任意代码执行无白名单可用，任何调用都出提案
             // （执行体 evaluate_proposal 全审批，无 active 名单）
-            "shell_exec" | "http_get" | "web_fetch" => {
+            // shell_exec：candidate 审批档 + 超时 Long（pytest/build 类命令
+            // 常超 60s，Default 60s 会 kill；600s 与 build_check 同层）。
+            // 独立分支置前：与 candidate 族合并书写时超时赋值须同臂生效，
+            // 拆成后序分支会被前序族遮蔽成 unreachable（分派锁测试守门）。
+            "shell_exec" => {
+                m.approval_policy = ApprovalPolicy::ManualDefault;
+                m.timeout_class = TimeoutClass::Long;
+            }
+            "http_get" | "web_fetch" => {
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }
             // build_check:命令固定但构建执行工作区 build script(模型可先写
@@ -716,11 +724,6 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             // check 留量,超时标 Long(构建类)
             "build_check" => {
                 m.approval_policy = ApprovalPolicy::ManualDefault;
-                m.timeout_class = TimeoutClass::Long;
-            }
-            // shell_exec:超时改 Long(B-426 审计 P1-3:pytest/build 类命令
-            // 常超 60s,Default 60s 会 kill;600s 与 build_check 同层)
-            "shell_exec" => {
                 m.timeout_class = TimeoutClass::Long;
             }
             "python_exec" => {
@@ -1321,6 +1324,20 @@ mod tests {
             TimeoutClass::Long.duration(),
             std::time::Duration::from_secs(600)
         );
+    }
+
+    #[test]
+    fn test_shell_exec_timeout_class_is_long() {
+        // shell_exec 超时档分派锁：pytest/build 类命令常超 60s，须落 Long(600s)
+        // 且 candidate 审批档不丢。超时档赋值若被前序分支遮蔽（unreachable）
+        // 本锁即红——档必须真正生效，而非只在静态表上写出。
+        let m = lookup_static("shell_exec").expect("shell_exec manifest");
+        assert_eq!(
+            m.timeout_class.duration(),
+            std::time::Duration::from_secs(600),
+            "shell_exec timeout must be Long(600s)"
+        );
+        assert_eq!(m.approval_policy, ApprovalPolicy::ManualDefault);
     }
 
     #[test]
