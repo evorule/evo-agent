@@ -557,6 +557,25 @@ pub enum JournalEvent {
         /// schema 校验结果(写侧 fail-visible 拒写,应恒 true;保留字段容错)
         schema_ok: bool,
     },
+    /// 核销断点块检查点落账(长程核销批):long-horizon 会话内 handover_write
+    /// 成功写档后,由 runner 按工具名分支调用(best-effort,与 handover_written
+    /// 同风格)——机器从 journal 窗口投影的断点块底稿全文随事件入账(事实面
+    /// 机器代拟,语义面 LLM 补写;底稿全文是恢复面唯一状态载体,与
+    /// plan_loop_checkpointed 携带工作流全文同一口径)。恢复 = 回放最新本
+    /// 事件重建断点块状态(最新胜出;digest 逐字校验,失配拒绝恢复)。
+    /// 观测面,不参与步映射。
+    WriteoffCheckpointed {
+        /// 核销窗口号(窗口 = 最新 turn_started 起的 goal 进展单元;取其
+        /// turn_seq)
+        window: u64,
+        /// 窗口内 Completed 迁移清单(todo 条目 id;首次迁移顺序,去重)
+        completed_items: Vec<String>,
+        /// 断点块底稿全文(六字段中机器可推导字段的事实面 JSON;序列化键序
+        /// 规范化,同窗口投影逐字节可复算)
+        block_draft: String,
+        /// 底稿全文 digest(evorule-hash 口径;回放完整性校验主键)
+        block_digest: String,
+    },
     /// 子会话派生落账(自主交接设计 PR-H3):session_spawn 成功 fork 出子会话
     /// 后落账。server 侧 parent_session_id 链入账为机制层权威,本事件为应用
     /// 层派生锚——链对账/深度审计/派生时序取证消费。
@@ -2039,6 +2058,24 @@ impl JournalWriter {
         })
     }
 
+    /// 核销断点块检查点落账(长程核销批):long-horizon 会话 handover_write
+    /// 成功写档后由 runner 按工具名分支调用(best-effort,与 handover_written
+    /// 同风格);恢复=回放最新本事件重建断点块状态(最新胜出,digest 校验)。
+    pub fn writeoff_checkpointed(
+        &self,
+        window: u64,
+        completed_items: &[String],
+        block_draft: &str,
+        block_digest: &str,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::WriteoffCheckpointed {
+            window,
+            completed_items: completed_items.to_vec(),
+            block_draft: block_draft.to_string(),
+            block_digest: block_digest.to_string(),
+        })
+    }
+
     /// 子会话派生落账(自主交接设计 PR-H3):session_spawn 成功 fork 后由
     /// runner 侧按工具名分支调用(best-effort,与 handover_written 同风格)。
     pub fn session_spawned(
@@ -2219,6 +2256,7 @@ fn is_progress_event(e: &JournalEvent) -> bool {
             | JournalEvent::SessionResumed { .. }
             | JournalEvent::SessionSpawned { .. }
             | JournalEvent::HandoverWritten { .. }
+            | JournalEvent::WriteoffCheckpointed { .. }
             | JournalEvent::DelegateSpawned { .. }
     )
 }
@@ -3088,6 +3126,57 @@ mod tests {
             }
             other => panic!("expected self_audit, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_writeoff_checkpointed_roundtrip_and_replay_key() {
+        // 核销断点块检查点:序列化/反序列化往返(类型名 writeoff_checkpointed
+        // 进账) + 写者方法落账后可按行读回(恢复面凭最新本事件回放)。
+        let dir = std::env::temp_dir().join(format!("jf-wocp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-wocp").unwrap();
+            w.begin_turn("build the thing").unwrap();
+            let digest = evorule_digest("{\"goal\":\"g\"}");
+            w.writeoff_checkpointed(
+                3,
+                &["t1".to_string(), "t2".to_string()],
+                "{\"goal\":\"g\"}",
+                &digest,
+            )
+            .unwrap();
+        }
+        let path = JournalWriter::path_for(&dir, "s-wocp");
+        let lines = read_all(&path).unwrap();
+        let wocp = lines
+            .iter()
+            .filter_map(|l| match &l.event {
+                JournalEvent::WriteoffCheckpointed {
+                    window,
+                    completed_items,
+                    block_draft,
+                    block_digest,
+                } => Some((
+                    *window,
+                    completed_items.clone(),
+                    block_draft.clone(),
+                    block_digest.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(wocp.len(), 1, "exactly one writeoff_checkpointed line");
+        let (window, completed, draft, digest) = &wocp[0];
+        assert_eq!(*window, 3);
+        assert_eq!(completed, &vec!["t1".to_string(), "t2".to_string()]);
+        assert_eq!(draft, "{\"goal\":\"g\"}");
+        assert_eq!(
+            *digest,
+            evorule_digest(draft),
+            "digest is evorule-hash of the draft"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

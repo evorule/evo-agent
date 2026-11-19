@@ -1245,6 +1245,121 @@ async fn test_from_definition_longhorizon_marker_enables_conjunction() {
 }
 
 #[tokio::test]
+async fn test_checkpoint_freshness_guidance_two_level_at_gate() {
+    // Two-level soft guidance at the task_done write-off gate: the first
+    // stale finding appends the level-1 mark, a repeat escalates, a fresh
+    // window resets, and the next stale finding warns again. Mode-on only.
+    let dir = std::env::temp_dir().join(format!("rt-fresh-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let session = "s-fresh";
+    // Stale window: a completed-class todo transition with no newer
+    // breakpoint event (2ms spacing keeps the strictly-newer comparison
+    // deterministic at millisecond ts resolution).
+    {
+        let w = crate::agent::journal::JournalWriter::open(&dir, session).unwrap();
+        w.begin_turn("g").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        w.todo_updated(vec![crate::agent::journal::TodoItemSnapshot {
+            id: "t1".to_string(),
+            content: "step".to_string(),
+            status: "completed".to_string(),
+            priority: "medium".to_string(),
+        }])
+        .unwrap();
+    }
+    let mut def = make_def_with_tools(vec!["echo".to_string()]);
+    def.longhorizon = Some(true);
+    let mut runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap()
+            .with_journal_dir(dir.clone());
+    runner.session_id = Some(session.to_string());
+    let pieces = runner
+        .writeoff_gate_input()
+        .expect("enabled mode must project pieces");
+    assert_eq!(
+        pieces.freshness,
+        crate::agent::writeoff::FreshnessState::Stale,
+        "completed transition with no newer breakpoint is stale"
+    );
+    match runner.observe_checkpoint_freshness(runner.writeoff_gate_input().as_ref()) {
+        Some(mark) => assert_eq!(mark, crate::agent::handover_tool::CHECKPOINT_STALE_GUIDANCE),
+        None => panic!("first stale finding must warn"),
+    }
+    match runner.observe_checkpoint_freshness(runner.writeoff_gate_input().as_ref()) {
+        Some(mark) => assert_eq!(
+            mark,
+            crate::agent::handover_tool::CHECKPOINT_STALE_ESCALATED
+        ),
+        None => panic!("repeat stale finding must escalate"),
+    }
+    assert_eq!(runner.freshness_gate.violation_count(), 2);
+    // Fresh window: a breakpoint event strictly newer than the completion
+    // resets the gate.
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let w = crate::agent::journal::JournalWriter::open(&dir, session).unwrap();
+        w.handover_written(session, "shared.n.handovers.h-x", true)
+            .unwrap();
+    }
+    let fresh = runner
+        .writeoff_gate_input()
+        .expect("enabled mode must project pieces");
+    assert_eq!(
+        fresh.freshness,
+        crate::agent::writeoff::FreshnessState::Fresh
+    );
+    assert!(runner
+        .observe_checkpoint_freshness(runner.writeoff_gate_input().as_ref())
+        .is_none());
+    assert_eq!(
+        runner.freshness_gate.violation_count(),
+        0,
+        "fresh window resets the gate"
+    );
+    // Next stale finding warns at level 1 again (two-level, not a ratchet):
+    // a fresh completed-class transition newer than the breakpoint makes the
+    // window stale again.
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let w = crate::agent::journal::JournalWriter::open(&dir, session).unwrap();
+        w.todo_updated(vec![crate::agent::journal::TodoItemSnapshot {
+            id: "t2".to_string(),
+            content: "next step".to_string(),
+            status: "completed".to_string(),
+            priority: "medium".to_string(),
+        }])
+        .unwrap();
+    }
+    match runner.observe_checkpoint_freshness(runner.writeoff_gate_input().as_ref()) {
+        Some(mark) => assert_eq!(mark, crate::agent::handover_tool::CHECKPOINT_STALE_GUIDANCE),
+        None => panic!("stale finding after reset must warn at level 1"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_checkpoint_freshness_gate_never_observed_when_mode_off() {
+    // Default invariant: non-long-horizon runs build no gate input, so the
+    // freshness gate is never observed and stays at zero violations — the
+    // rejection feedback carries no checkpoint note.
+    let def = make_def_with_tools(vec!["echo".to_string()]);
+    let mut runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap();
+    assert!(runner.writeoff_gate_input().is_none());
+    assert!(runner.observe_checkpoint_freshness(None).is_none());
+    assert_eq!(
+        runner.freshness_gate.violation_count(),
+        0,
+        "mode off must not touch the gate state"
+    );
+}
+
+#[tokio::test]
 async fn test_generate_acceptance_criteria_noop_when_disabled() {
     // 开关缺省:方法为 no-op,零网络零状态变化(缺省不变式回归守门)
     let def = make_def_with_tools(vec!["echo".to_string()]);

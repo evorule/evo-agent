@@ -234,6 +234,7 @@ pub fn retention_class_of_type(event_type: &str) -> RetentionClass {
         | "handover_written" => RetentionClass::Exempt,
         // 恢复状态载体与门禁证据（释放破恢复/对账面）
         "plan_loop_checkpointed"
+        | "writeoff_checkpointed"
         | "plan_loop_finished"
         | "acceptance_criteria_generated"
         | "todo_updated"
@@ -297,6 +298,7 @@ impl JournalEvent {
             | JournalEvent::SessionCrashed { .. }
             | JournalEvent::SessionResumed { .. }
             | JournalEvent::HandoverWritten { .. }
+            | JournalEvent::WriteoffCheckpointed { .. }
             | JournalEvent::SessionSpawned { .. }
             | JournalEvent::ChainHalted { .. }
             | JournalEvent::RewindBudgetConsumed { .. }

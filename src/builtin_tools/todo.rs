@@ -22,6 +22,12 @@
 //! - **账面**：todo_write 成功后由 runner 落 journal `todo_updated` 全量快照
 //!   （runner 按工具名分支，handover_written 同款）；本工具不直接写 journal。
 //!
+//! 处置表四桶扩展（todo v2 disposition）：三态基础上增 Deferred（挂起，登记
+//! 不修）/Reworked（返工）/Transformed（转形态）——挂起/转形态**必附**
+//! `disposition_note`（处置判据+恢复条件，缺注拒写 fail-visible）；既有三态
+//! 行为与序列化对 v1 完全不变。另附**表项-动作对账计数器**（observe 态纯
+//! 函数：只计数不拦截，计划内/表外两计数，供漂移度量器后续批消费）。
+//!
 //! 治理面：CapDomain=Memory（handover 先例）+ Standard 免裁决 + AutoPolicy
 //! （进程内内存态读写，无沙箱/网络/子进程面）。
 
@@ -30,19 +36,27 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::agent::tool_intent::ToolIntentV1;
 use crate::io_handlers::tool_handler::ToolFunction;
 
 /// 清单条数上限（防清单膨胀挤占注入预算）
 pub const TODO_MAX_ITEMS: usize = 10;
 /// 单条内容字符上限
 pub const TODO_MAX_CONTENT_CHARS: usize = 500;
+/// 单条处置注记字符上限（与 content 同帽，防注记膨胀挤占注入预算）
+pub const TODO_MAX_NOTE_CHARS: usize = 500;
 
 /// 工具名
 pub const TODO_WRITE_TOOL: &str = "todo_write";
 /// 工具名
 pub const TODO_READ_TOOL: &str = "todo_read";
 
-/// 条目状态（三态；serde 小写）
+/// 条目状态（v2 六态四桶；serde 小写）
+///
+/// 四桶口径（处置表制度泛化）：进桶=Pending/InProgress/Completed 既有三态
+/// （行为与序列化对 v1 完全不变）；patch/处置桶=Reworked（返工）；登记桶=
+/// Deferred（挂起，必附 [`TodoItem::disposition_note`]，登记不修）；转形态桶=
+/// Transformed（派生到他形态，同样必附处置注记）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
@@ -52,6 +66,12 @@ pub enum TodoStatus {
     InProgress,
     /// 已完成
     Completed,
+    /// 挂起（登记不修：必附处置注记=处置判据+恢复条件）
+    Deferred,
+    /// 返工（patch 桶）
+    Reworked,
+    /// 转形态（派生到他形态：必附处置注记）
+    Transformed,
 }
 
 impl TodoStatus {
@@ -61,10 +81,19 @@ impl TodoStatus {
             "pending" => Ok(Self::Pending),
             "in_progress" => Ok(Self::InProgress),
             "completed" => Ok(Self::Completed),
+            "deferred" => Ok(Self::Deferred),
+            "reworked" => Ok(Self::Reworked),
+            "transformed" => Ok(Self::Transformed),
             other => Err(format!(
-                "invalid status '{other}' (allowed: pending | in_progress | completed)"
+                "invalid status '{other}' (allowed: pending | in_progress | completed | \
+                 deferred | reworked | transformed)"
             )),
         }
+    }
+
+    /// 挂起/转形态桶必附处置注记（登记不修纪律：缺注拒写，fail-visible）
+    pub fn requires_disposition_note(self) -> bool {
+        matches!(self, Self::Deferred | Self::Transformed)
     }
 
     /// 注入渲染用标记
@@ -73,6 +102,9 @@ impl TodoStatus {
             Self::Pending => " ",
             Self::InProgress => "*",
             Self::Completed => "x",
+            Self::Deferred => "D",
+            Self::Reworked => "R",
+            Self::Transformed => "T",
         }
     }
 
@@ -82,6 +114,9 @@ impl TodoStatus {
             Self::Pending => "pending",
             Self::InProgress => "in_progress",
             Self::Completed => "completed",
+            Self::Deferred => "deferred",
+            Self::Reworked => "reworked",
+            Self::Transformed => "transformed",
         }
     }
 }
@@ -122,6 +157,9 @@ impl TodoPriority {
 }
 
 /// 清单条目（LLM 面全量重写式提交）
+///
+/// v1 兼容：`disposition_note` 缺省反序列化为 None，且 None 时不参与序列化
+/// （`skip_serializing_if`）——v1 账面 JSON（四字段形态）逐字节不变。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TodoItem {
     /// 条目 id（LLM 命名，清单内唯一）
@@ -132,6 +170,10 @@ pub struct TodoItem {
     pub status: TodoStatus,
     /// 优先级
     pub priority: TodoPriority,
+    /// 处置注记（挂起/转形态必附：处置判据+恢复条件，登记不修形态；
+    /// 其余状态可选留痕。≤500 字符，在场即非空）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_note: Option<String>,
 }
 
 /// 会话内清单共享态（Arc 工具族+runner 三方共享）
@@ -163,7 +205,10 @@ impl TodoState {
 ///
 /// 规则：items 必须为数组（空数组=清空清单，合法）；每条 id 非空且清单内
 /// 唯一、content 非空且 ≤500 字符、status 必填枚举、priority 可缺省为
-/// medium（显式给值时须为合法枚举）。
+/// medium（显式给值时须为合法枚举）；`disposition_note` 可选，但在场即须
+/// 非空字符串且 ≤500 字符，**挂起（deferred）/转形态（transformed）条目必附**
+/// （处置判据+恢复条件，登记不修纪律：缺注拒写，handover 六字段先例同款
+/// fail-visible）。
 pub fn validate_todo_items(args: &Value) -> Result<Vec<TodoItem>, String> {
     let arr = match args.get("items").and_then(|v| v.as_array()) {
         Some(a) => a,
@@ -222,19 +267,56 @@ pub fn validate_todo_items(args: &Value) -> Result<Vec<TodoItem>, String> {
             Some(Value::String(s)) => TodoPriority::parse(s).map_err(|e| format!("{tag}: {e}")),
             Some(_) => Err(format!("{tag}: 'priority' must be a string")),
         };
-        // status/priority 校验错误入收集(逐条列明,fail-visible 一次报全)
+        let note = match entry.get("disposition_note") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    Err(format!(
+                        "{tag}: 'disposition_note' must be a non-empty string when present"
+                    ))
+                } else if t.chars().count() > TODO_MAX_NOTE_CHARS {
+                    Err(format!(
+                        "{tag}: disposition_note exceeds {TODO_MAX_NOTE_CHARS} chars (got {})",
+                        t.chars().count()
+                    ))
+                } else {
+                    Ok(Some(t.to_string()))
+                }
+            }
+            Some(_) => Err(format!("{tag}: 'disposition_note' must be a string")),
+        };
+        // status/priority/note 校验错误入收集(逐条列明,fail-visible 一次报全)
         if let Err(e) = &status {
             problems.push(e.clone());
         }
         if let Err(e) = &priority {
             problems.push(e.clone());
         }
-        if let (Some(id), Some(c), Ok(status), Ok(priority)) = (id, content, status, priority) {
+        if let Err(e) = &note {
+            problems.push(e.clone());
+        }
+        // 登记不修纪律:挂起/转形态必附处置注记(缺注拒写,fail-visible)
+        let usable_note = matches!(&note, Ok(Some(n)) if !n.is_empty());
+        if let Ok(st) = &status {
+            if st.requires_disposition_note() && !usable_note {
+                problems.push(format!(
+                    "{tag}: status '{}' requires a non-empty 'disposition_note' \
+                     (handling criteria + recovery condition; such entries are \
+                     registered only, not worked)",
+                    st.as_str()
+                ));
+            }
+        }
+        if let (Some(id), Some(c), Ok(status), Ok(priority), Ok(note)) =
+            (id, content, status, priority, note)
+        {
             items.push(TodoItem {
                 id: id.to_string(),
                 content: c.to_string(),
                 status,
                 priority,
+                disposition_note: note,
             });
         }
     }
@@ -247,17 +329,21 @@ pub fn validate_todo_items(args: &Value) -> Result<Vec<TodoItem>, String> {
 
 /// 渲染清单摘要（确定性纯函数：同状态逐字节同输出——装配槽位注入物）
 ///
-/// 格式：`## Current Todo List` 标题 + 未完成条目逐行（`- [ ]/* id content (priority)`）
-/// + 完成态计数行。空清单返回 None（槽位静默跳过）。
+/// 格式：`## Current Todo List` 标题；未完成条目逐行
+/// （`- [ ]/* id content (priority)`）；挂起桶单列段（在场时：
+/// `Deferred (registered only, not being worked):` 标题，逐行携带处置注记）；
+/// 完成态计数行。空清单返回 None（槽位静默跳过）。
 pub fn render_todo_summary(items: &[TodoItem]) -> Option<String> {
     if items.is_empty() {
         return None;
     }
     let mut out = String::from("## Current Todo List\n");
     let mut done = 0usize;
+    let mut deferred: Vec<&TodoItem> = Vec::new();
     for it in items {
         match it.status {
             TodoStatus::Completed => done += 1,
+            TodoStatus::Deferred => deferred.push(it),
             _ => {
                 out.push_str(&format!(
                     "- [{}] {} {} ({:?})\n",
@@ -269,11 +355,82 @@ pub fn render_todo_summary(items: &[TodoItem]) -> Option<String> {
             }
         }
     }
+    // 挂起桶单列渲染（登记不修：与在工条目分段，注记=恢复条件随行可见）
+    if !deferred.is_empty() {
+        out.push_str("Deferred (registered only, not being worked):\n");
+        for it in deferred {
+            out.push_str(&format!(
+                "- [{}] {} {} ({:?}){}\n",
+                it.status.marker(),
+                it.id,
+                it.content,
+                it.priority,
+                match it.disposition_note.as_deref() {
+                    Some(n) => format!(" | note: {n}"),
+                    None => String::new(),
+                }
+            ));
+        }
+    }
     out.push_str(&format!(
         "Completed: {done}/{}. Keep this list current via todo_write.",
         items.len()
     ));
     Some(out)
+}
+
+// ---------- 表项-动作对账计数器（observe 态纯函数） ----------
+
+/// 对账计数（observe 态输出；供漂移度量器结算面消费）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileCounts {
+    /// 计划内动作数（归到至少一个表项——含返工/转形态桶条目——或表自维护）
+    pub planned_actions: usize,
+    /// 表外动作数（无法归到任何表项的动作）
+    pub out_of_table_actions: usize,
+}
+
+/// 表项-动作对账计数器（纯函数；**observe 态：只计数，不拦截**）
+///
+/// 归属规则 v1（确定性、可复算）：
+/// 1. 表自维护动作（`todo_write`/`todo_read`，作用于表本身）恒归属计划内；
+/// 2. 其余动作按 `target_scope`（缺省视为空）与表项 id 集合做大小写不敏感
+///    子串匹配——**全桶 id 皆锚**（返工/转形态条目仍是归属锚，即其 patch/
+///    转形态派生动作同样归属）；命中任一锚=计划内，否则=表外。
+///
+/// observe 纪律（外泄扫描三态同款）：本函数零副作用、无拒绝路径，输出不流
+/// 入任何写门/审批判定——计数变化不改变任何行为；阈值与 enforce 态归漂移
+/// 度量器后续批（先 observe 攒数据再定阈值）。id 子串匹配是 v1 启发式（短
+/// id 可能过匹配/漏匹配）——观测态正是为量化该误报率而设，归属规则富化
+/// （如注记引用的派生锚、args 面匹配）随数据一起后置。
+pub fn reconcile_actions(items: &[TodoItem], signals: &[ToolIntentV1]) -> ReconcileCounts {
+    let anchors: Vec<String> = items
+        .iter()
+        .map(|it| it.id.trim().to_lowercase())
+        .filter(|a| !a.is_empty())
+        .collect();
+    let mut counts = ReconcileCounts {
+        planned_actions: 0,
+        out_of_table_actions: 0,
+    };
+    for sig in signals {
+        if sig.tool_name == TODO_WRITE_TOOL || sig.tool_name == TODO_READ_TOOL {
+            counts.planned_actions += 1;
+            continue;
+        }
+        let target = sig
+            .target_scope
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_lowercase();
+        if !target.is_empty() && anchors.iter().any(|a| target.contains(a)) {
+            counts.planned_actions += 1;
+        } else {
+            counts.out_of_table_actions += 1;
+        }
+    }
+    counts
 }
 
 // ---------- 工具执行体 ----------
@@ -433,18 +590,21 @@ mod tests {
                 content: "先做".into(),
                 status: TodoStatus::InProgress,
                 priority: TodoPriority::High,
+                disposition_note: None,
             },
             TodoItem {
                 id: "b".into(),
                 content: "后做".into(),
                 status: TodoStatus::Pending,
                 priority: TodoPriority::Low,
+                disposition_note: None,
             },
             TodoItem {
                 id: "c".into(),
                 content: "完成".into(),
                 status: TodoStatus::Completed,
                 priority: TodoPriority::Medium,
+                disposition_note: None,
             },
         ];
         let r1 = render_todo_summary(&items).expect("some");
@@ -500,6 +660,7 @@ mod tests {
             content: "y".into(),
             status: TodoStatus::Pending,
             priority: TodoPriority::Low,
+            disposition_note: None,
         }]);
         assert_eq!(state.snapshot().len(), 1);
         state.replace(vec![]);
@@ -556,6 +717,9 @@ mod tests {
                 content: s.content,
                 status: TodoStatus::parse(&s.status).unwrap_or(TodoStatus::Pending),
                 priority: TodoPriority::parse(&s.priority).unwrap_or(TodoPriority::Medium),
+                // journal 快照 v1 字段形态无注记面：回放重建注记置空（注记为
+                // 会话内存态+读面可见；快照面增量归快照 schema 批次）
+                disposition_note: None,
             })
             .collect();
         assert_eq!(rebuilt.len(), 2, "重建取末条快照=终态(非折叠)");
@@ -563,6 +727,333 @@ mod tests {
         assert_eq!(rebuilt[0].status, TodoStatus::Completed);
         assert_eq!(rebuilt[1].id, "t3");
         assert_eq!(rebuilt[1].priority, TodoPriority::Low);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 验收①:v1 三态账面序列化零红——无注记条目序列化不含 disposition_note
+    /// 键(四字段形态逐字节同 v1),v1 JSON(含显式 null 注记)反序列化无损。
+    #[test]
+    fn test_v1_three_state_serde_bytes_unchanged() {
+        let v1_item = TodoItem {
+            id: "t1".into(),
+            content: "既有三态条目".into(),
+            status: TodoStatus::InProgress,
+            priority: TodoPriority::High,
+            disposition_note: None,
+        };
+        let s = serde_json::to_string(&v1_item).expect("serialize");
+        assert_eq!(
+            s, r#"{"id":"t1","content":"既有三态条目","status":"in_progress","priority":"high"}"#,
+            "v1 form must be byte-identical (no disposition_note key)"
+        );
+        // v1 账面 JSON(无注记字段)反序列化 → 注记 None
+        let back: TodoItem = serde_json::from_str(&s).expect("v1 json parses");
+        assert_eq!(back, v1_item);
+        assert!(back.disposition_note.is_none());
+        // 显式 null 注记亦接受(v1 客户端形态)
+        let with_null: TodoItem = serde_json::from_value(json!({
+            "id": "t2", "content": "x", "status": "pending",
+            "priority": "low", "disposition_note": null
+        }))
+        .expect("null note parses");
+        assert!(with_null.disposition_note.is_none());
+    }
+
+    /// 验收②:四桶全形态 parse/as_str/serde 读写回放(六态值域互逆+注记保留)。
+    #[test]
+    fn test_four_bucket_full_form_roundtrip() {
+        let cases = [
+            ("pending", TodoStatus::Pending),
+            ("in_progress", TodoStatus::InProgress),
+            ("completed", TodoStatus::Completed),
+            ("deferred", TodoStatus::Deferred),
+            ("reworked", TodoStatus::Reworked),
+            ("transformed", TodoStatus::Transformed),
+        ];
+        for (word, st) in cases {
+            assert_eq!(TodoStatus::parse(word).expect("parse"), st);
+            assert_eq!(st.as_str(), word, "as_str 与 parse 值域互逆");
+            assert_eq!(TodoStatus::parse(st.as_str()).expect("re-parse"), st);
+        }
+        // 非法值 fail-visible 列全六态合法值域
+        let err = TodoStatus::parse("doing").unwrap_err();
+        for frag in [
+            "pending",
+            "in_progress",
+            "completed",
+            "deferred",
+            "reworked",
+            "transformed",
+        ] {
+            assert!(
+                err.contains(frag),
+                "allowed list must contain {frag}: {err}"
+            );
+        }
+        // 挂起+注记 serde 往返无损
+        let item = TodoItem {
+            id: "d1".into(),
+            content: "挂起条目".into(),
+            status: TodoStatus::Deferred,
+            priority: TodoPriority::Medium,
+            disposition_note: Some("恢复条件:上游 schema 批合入后重开".into()),
+        };
+        let v = serde_json::to_value(&item).expect("serialize");
+        assert_eq!(v["status"], "deferred");
+        assert!(v.get("disposition_note").is_some());
+        let back: TodoItem = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, item, "注记往返无损");
+        // 转形态同理（显式给状态——结构更新语法仅覆写注记字段）
+        let t = TodoItem {
+            status: TodoStatus::Transformed,
+            disposition_note: Some("转形态:并入 rule_set 批跟踪".into()),
+            ..item
+        };
+        let tv = serde_json::to_value(t.clone()).expect("serialize");
+        assert_eq!(tv["status"], "transformed");
+        let tb: TodoItem = serde_json::from_value(tv).expect("deserialize");
+        assert_eq!(tb, t);
+    }
+
+    /// 验收③:挂起/转形态缺 disposition_note 拒写(fail-visible,一次列明);
+    /// 附注后放行;返工/三态注记可选(不强制)。
+    #[test]
+    fn test_deferred_missing_note_rejected_fail_visible() {
+        // 挂起缺注 → 拒
+        let args = json!({"items": [item_args("t1", "登记不修", "deferred", Value::Null)]});
+        let err = validate_todo_items(&args).unwrap_err();
+        assert!(err.contains("items[0]"), "tagged: {err}");
+        assert!(
+            err.contains("disposition_note"),
+            "must name the missing field: {err}"
+        );
+        // 转形态缺注 → 拒
+        let args = json!({"items": [item_args("t2", "转形态", "transformed", Value::Null)]});
+        let err = validate_todo_items(&args).unwrap_err();
+        assert!(err.contains("disposition_note"), "{err}");
+        // 在场但空串注记 → 拒(两问题并列,一次报全)
+        let args = json!({"items": [{"id": "t3", "content": "x", "status": "deferred", "disposition_note": "   "}]});
+        let err = validate_todo_items(&args).unwrap_err();
+        assert!(err.contains("non-empty"), "{err}");
+        // 挂起附注 → 放行
+        let args = json!({"items": [{
+            "id": "t4", "content": "登记不修", "status": "deferred",
+            "disposition_note": "处置判据:非阻塞;恢复条件:依赖批合入"
+        }]});
+        let items = validate_todo_items(&args).expect("note present passes");
+        assert_eq!(items[0].status, TodoStatus::Deferred);
+        assert!(items[0].disposition_note.is_some());
+        // 返工(注记可选)与三态不强制注记 → 放行
+        for status in ["reworked", "pending", "in_progress", "completed"] {
+            let args = json!({"items": [item_args("t5", "x", status, Value::Null)]});
+            assert!(
+                validate_todo_items(&args).is_ok(),
+                "{status} must not require a note"
+            );
+        }
+        // 注记超帽 → 拒
+        let long = "字".repeat(TODO_MAX_NOTE_CHARS + 1);
+        let args = json!({"items": [{"id": "t6", "content": "x", "status": "deferred", "disposition_note": long}]});
+        let err = validate_todo_items(&args).unwrap_err();
+        assert!(err.contains("disposition_note exceeds"), "{err}");
+    }
+
+    /// 表项 fixture(对账计数器用:含返工/转形态/挂起桶各一)
+    fn fixture_table() -> Vec<TodoItem> {
+        vec![
+            TodoItem {
+                id: "parser-fix".into(),
+                content: "修复解析器".into(),
+                status: TodoStatus::InProgress,
+                priority: TodoPriority::High,
+                disposition_note: None,
+            },
+            TodoItem {
+                id: "registry-sweep".into(),
+                content: "登记扫尾".into(),
+                status: TodoStatus::Reworked,
+                priority: TodoPriority::Medium,
+                disposition_note: None,
+            },
+            TodoItem {
+                id: "doc-handover".into(),
+                content: "交接文档".into(),
+                status: TodoStatus::Transformed,
+                priority: TodoPriority::Medium,
+                disposition_note: Some("转形态:并入规则批;恢复条件:规则批开工".into()),
+            },
+            TodoItem {
+                id: "lsp-probe".into(),
+                content: "探针登记".into(),
+                status: TodoStatus::Deferred,
+                priority: TodoPriority::Low,
+                disposition_note: Some("登记不修;恢复条件:上游目录扩域后重开".into()),
+            },
+        ]
+    }
+
+    /// 信号构造(走真实 args 摘要口径;counter 只读 tool_name/target_scope)
+    fn sig(tool: &str, target: Option<&str>) -> ToolIntentV1 {
+        ToolIntentV1 {
+            tool_name: tool.to_string(),
+            target_scope: target.map(str::to_string),
+            args: None,
+            args_digest: crate::agent::tool_intent::args_digest(&json!({})),
+            session_ref: None,
+            schema_ver: crate::agent::tool_intent::TOOL_INTENT_SCHEMA_VER,
+        }
+    }
+
+    /// 验收④:对账计数器手工 fixture(10 动作/8 归表/2 表外)计数=2;
+    /// 同输入两次结算相等(确定性);planned+out=总信号数守恒。
+    #[test]
+    fn test_reconcile_fixture_10_actions_8_on_table_2_out() {
+        let table = fixture_table();
+        let signals = vec![
+            sig("file_write", Some("src/parser-fix/core.rs")), // 归(子串)
+            sig("file_edit", Some("SRC/PARSER-FIX/Lexer.rs")), // 归(大小写不敏感)
+            sig("shell_exec", Some("cargo test parser-fix")),  // 归
+            sig("file_write", Some("docs/registry-sweep.md")), // 归(返工桶仍锚)
+            sig("file_edit", Some("rules/doc-handover.json")), // 归(转形态桶仍锚=派生动作)
+            sig("file_read", Some("notes/lsp-probe.md")),      // 归(挂起桶仍锚)
+            sig("todo_write", None),                           // 归(表自维护)
+            sig("todo_read", None),                            // 归(表自维护)
+            sig("file_write", Some("out_of_sandbox:/tmp/x")),  // 表外
+            sig("shell_exec", None),                           // 表外(无 scope 不可归)
+        ];
+        let c1 = reconcile_actions(&table, &signals);
+        let c2 = reconcile_actions(&table, &signals);
+        assert_eq!(c1, c2, "同输入两次结算逐字段相等(确定性)");
+        assert_eq!(c1.planned_actions, 8, "8 on-table");
+        assert_eq!(c1.out_of_table_actions, 2, "fixture 表外计数=2");
+        assert_eq!(
+            c1.planned_actions + c1.out_of_table_actions,
+            signals.len(),
+            "守恒"
+        );
+        // 空表 → 除表自维护外全表外(无锚可归,observe 如实计数)
+        let empty = reconcile_actions(&[], &signals);
+        assert_eq!(empty.out_of_table_actions, 8);
+        assert_eq!(empty.planned_actions, 2);
+    }
+
+    /// 验收④(observe 语义):计数变化零拦截——计数器输出不流入写门,
+    /// 全表外信号在场的同批写路径照常放行;计数器零副作用。
+    #[test]
+    fn test_reconcile_observe_no_interception() {
+        let table = fixture_table();
+        let hostile = vec![sig("shell_exec", None); 5];
+        let c = reconcile_actions(&table, &hostile);
+        assert_eq!(c.out_of_table_actions, 5, "observe 如实计数");
+        // 写门不消费计数:挂起+附注的写照常放行(与计数无关)
+        let args = json!({"items": [{
+            "id": "t9", "content": "照常登记", "status": "deferred",
+            "disposition_note": "恢复条件:下一批开工"
+        }]});
+        assert!(
+            validate_todo_items(&args).is_ok(),
+            "write gate ignores counts"
+        );
+        // 纯函数零副作用:重放同输入结果不变,无隐藏态
+        let again = reconcile_actions(&table, &hostile);
+        assert_eq!(c, again);
+    }
+
+    /// 注入面:挂起桶单列渲染(与在工条目分段,注记随行可见;确定性;v1 形态
+    /// 清单不含挂起段=零红)。
+    #[test]
+    fn test_render_deferred_bucket_separate_with_note() {
+        let items = fixture_table();
+        let r1 = render_todo_summary(&items).expect("some");
+        let r2 = render_todo_summary(&items).expect("some");
+        assert_eq!(r1, r2, "byte-identical");
+        // 挂起段单列
+        assert!(
+            r1.contains("Deferred (registered only, not being worked):"),
+            "{r1}"
+        );
+        let dline = r1
+            .lines()
+            .find(|l| l.contains("lsp-probe"))
+            .expect("deferred line present");
+        assert!(dline.starts_with("- [D]"), "{dline}");
+        assert!(
+            dline.contains("note: 登记不修"),
+            "note rides the line: {dline}"
+        );
+        // 在工条目仍内联(返工/转形态标记),挂起条目不混入在工段
+        assert!(r1.contains("- [*] parser-fix"));
+        assert!(r1.contains("- [R] registry-sweep"));
+        assert!(r1.contains("- [T] doc-handover"));
+        let work_head = r1.split("Deferred (registered").next().expect("head");
+        assert!(
+            !work_head.contains("lsp-probe"),
+            "deferred not in work section"
+        );
+        assert!(r1.contains("Completed: 0/4"));
+        // v1 形态清单(无挂起)不含挂起段=渲染零红
+        let v1_only = vec![TodoItem {
+            id: "a".into(),
+            content: "先做".into(),
+            status: TodoStatus::InProgress,
+            priority: TodoPriority::High,
+            disposition_note: None,
+        }];
+        let rv = render_todo_summary(&v1_only).expect("some");
+        assert!(!rv.contains("Deferred (registered"), "no deferred section");
+        assert!(rv.contains("- [*] a 先做 (High)"));
+    }
+
+    /// 四桶经既有 journal 快照形态(v1 字段:status 字符串)落账回放——状态六态
+    /// 互逆恢复;注记非快照字段,重建如实置空(快照面增量归快照 schema 批次)。
+    #[test]
+    fn test_journal_v1_shape_snapshot_four_bucket_replay() {
+        use crate::agent::journal::{JournalEvent, JournalWriter, TodoItemSnapshot};
+        let dir = std::env::temp_dir().join(format!("jf-todo-v2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let snap = |id: &str, status: TodoStatus| TodoItemSnapshot {
+            id: id.to_string(),
+            content: "四桶条目".to_string(),
+            status: status.as_str().to_string(),
+            priority: "medium".to_string(),
+        };
+        {
+            let w = JournalWriter::open(&dir, "s-todo-v2").unwrap();
+            w.todo_updated(vec![
+                snap("t1", TodoStatus::Deferred),
+                snap("t2", TodoStatus::Reworked),
+                snap("t3", TodoStatus::Transformed),
+            ])
+            .unwrap();
+        }
+        let w = JournalWriter::open(&dir, "s-todo-v2").unwrap();
+        let lines = w.read_lines().unwrap();
+        let latest = lines
+            .into_iter()
+            .filter_map(|l| match l.event {
+                JournalEvent::TodoUpdated { items } => Some(items),
+                _ => None,
+            })
+            .next_back()
+            .expect("latest todo_updated present");
+        let rebuilt: Vec<TodoItem> = latest
+            .into_iter()
+            .map(|s| TodoItem {
+                id: s.id,
+                content: s.content,
+                status: TodoStatus::parse(&s.status).unwrap_or(TodoStatus::Pending),
+                priority: TodoPriority::parse(&s.priority).unwrap_or(TodoPriority::Medium),
+                disposition_note: None,
+            })
+            .collect();
+        assert_eq!(rebuilt[0].status, TodoStatus::Deferred);
+        assert_eq!(rebuilt[1].status, TodoStatus::Reworked);
+        assert_eq!(rebuilt[2].status, TodoStatus::Transformed);
+        assert!(
+            rebuilt.iter().all(|it| it.disposition_note.is_none()),
+            "v1 snapshot shape carries no note; rebuild is honestly empty"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
