@@ -68,6 +68,7 @@ pub mod wire_attestation;
 pub mod workflow;
 pub mod workspace_checkpoint;
 pub mod writeback;
+pub mod writeoff;
 
 pub use approval::{
     new_proposal_id, ApprovalCallback, ApprovalDecision, ApprovalRequest, AutoApprove,

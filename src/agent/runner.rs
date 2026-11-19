@@ -1573,6 +1573,12 @@ pub struct AgentRunner {
     acceptance_command: Option<String>,
     /// G4 判据生成开关(先写后锁;from_definition 解析:静态判据优先,缺省 false 零变化)
     acceptance_generation: bool,
+    /// Write-off conjunction gate enabled (long-horizon capability marker
+    /// from the agent definition; `from_definition` reads it). false = the
+    /// acceptance gate keeps its criteria-only behavior (default invariant:
+    /// absent marker is zero behavior change). Child sessions spawn with
+    /// this off regardless of the root marker.
+    writeoff_enabled: bool,
     /// 进展停滞检测器(F2 空转克星)。跨轮持续观察
     /// (工具名,参数,结果)三元组,连续重复→警告→按 H2 阻塞收尾
     stagnation: crate::agent::stagnation::StagnationDetector,
@@ -1778,6 +1784,7 @@ impl AgentRunner {
             compaction_policy: None,
             acceptance_command: None,
             acceptance_generation: false,
+            writeoff_enabled: false,
             stagnation: crate::agent::stagnation::StagnationDetector::new(),
             sequence_loop: crate::agent::stagnation::SequenceLoopDetector::new(),
             pipeline_entry: crate::agent::pipeline::PipelineEntry::React,
@@ -3153,6 +3160,10 @@ impl AgentRunner {
         // G4:判据生成开关(缺省不变式——未声明/静态判据在手 = false,零行为变化)
         self.acceptance_generation =
             def.acceptance_generation == Some(true) && self.acceptance_command.is_none();
+        // Write-off conjunction gate (long-horizon mode): the definition
+        // marker wires the three-piece task_done admission; absent/false
+        // keeps the criteria-only behavior (default invariant).
+        self.writeoff_enabled = def.longhorizon == Some(true);
         // 用户决策 3 + G10：summary_model 单独配置,同时构造 ContextSummarizer
         if let Some(sm) = &def.memory.summary_model {
             self = self.with_summary_model(sm);
@@ -3232,6 +3243,31 @@ impl AgentRunner {
                 });
             }
         }
+    }
+
+    /// Write-off conjunction pieces for the acceptance gate (long-horizon
+    /// mode). `None` = mode off — the gate keeps its criteria-only behavior
+    /// (default invariant). The pieces are projected from the session
+    /// journal file (flushed line-append, so the read sees every recorded
+    /// event); a disabled or unreadable journal degrades to Unknown piece
+    /// states inside the returned input — it never flips the mode off
+    /// (unknown is not pass). The model never supplies these inputs (G8:
+    /// gate truth stays runner-computed).
+    fn writeoff_gate_input(&self) -> Option<crate::agent::writeoff::JournalPieces> {
+        if !self.writeoff_enabled {
+            return None;
+        }
+        let lines = self
+            .journal_dir
+            .as_ref()
+            .zip(self.session_id.as_ref())
+            .and_then(|(dir, sid)| {
+                let path = crate::agent::journal::JournalWriter::path_for(dir, sid);
+                crate::agent::journal::read_all_tolerant(&path).ok()
+            });
+        Some(crate::agent::writeoff::pieces_from_journal(
+            lines.as_deref(),
+        ))
     }
 
     /// M5-a:注入生效能力边界声明(serve/CLI 层按定义或启动配置合成后传入;
@@ -5565,6 +5601,10 @@ impl AgentRunner {
                 // 跨 runner 实例不继承;子任务门禁走静态判据穿线,本字段恒 false
                 // ——缺省不变式,子代理行为与 G4 前完全一致)
                 acceptance_generation: false,
+                // Write-off conjunction gate off for spawned children
+                // (long-horizon mode is a root-run concern; child gate
+                // behavior stays criteria-only — default invariant).
+                writeoff_enabled: false,
                 stagnation: crate::agent::stagnation::StagnationDetector::new(),
                 sequence_loop: crate::agent::stagnation::SequenceLoopDetector::new(),
                 pipeline_entry,
@@ -6314,8 +6354,19 @@ impl AgentRunner {
         let args = params.get("args").cloned().unwrap_or(Value::Null);
 
         // 判据自检门禁——task_done/task_blocked 提交前过验收;
-        // 拒绝时详情作为 tool_result 回喂 LLM(指令不提交引擎)
-        let args = match apply_acceptance_gate(self.acceptance_command.as_deref(), &args).await {
+        // 拒绝时详情作为 tool_result 回喂 LLM(指令不提交引擎)。
+        // long-horizon mode additionally hands the journal-projected
+        // pieces to the gate (task_done becomes the three-piece
+        // conjunction); non-long-horizon mode always passes None
+        // (behavior unchanged).
+        let writeoff_pieces = self.writeoff_gate_input();
+        let args = match apply_acceptance_gate(
+            self.acceptance_command.as_deref(),
+            &args,
+            writeoff_pieces.as_ref(),
+        )
+        .await
+        {
             GateOutcome::Allow(a) => a,
             GateOutcome::Reject(detail) => {
                 warn!(%session_id, %detail, "acceptance gate rejected instruction submission");
@@ -11182,10 +11233,17 @@ impl AgentRunner {
                                                // (内部 maybe_handle_approval,不产事件)
                                                // 判据自检门禁(与非流式 handle_call_service 同款)。
                                                // 拒绝 → 审计留痕 + 合成 tool 消息回喂 LLM + continue 下一个 tc
-                                               // (指令不提交引擎——判据不过不存在 done 退出路径)
+                                               // (指令不提交引擎——判据不过不存在 done 退出路径)。
+                                               // long-horizon mode additionally hands the
+                                               // journal-projected pieces to the gate (task_done
+                                               // becomes the three-piece conjunction);
+                                               // non-long-horizon mode always passes None
+                                               // (behavior unchanged).
+                                               let writeoff_pieces = runner.writeoff_gate_input();
                                                let args = match apply_acceptance_gate(
                                                    runner.acceptance_command.as_deref(),
                                                    &args,
+                                                   writeoff_pieces.as_ref(),
                                                )
                                                .await
                                                {

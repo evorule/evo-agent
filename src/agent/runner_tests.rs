@@ -1054,6 +1054,7 @@ fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
         context_window_tokens: None,
         acceptance_command: None,
         acceptance_generation: None,
+        longhorizon: None,
         verify: None,
         i2_lexicon: None,
         wall_clock_budget_secs: None,
@@ -1196,6 +1197,51 @@ async fn test_from_definition_acceptance_generation_explicit_on() {
             .unwrap();
     assert!(runner.acceptance_generation);
     assert!(runner.acceptance_command.is_none());
+}
+
+// === Write-off conjunction gate wiring (long-horizon capability marker) ===
+
+#[tokio::test]
+async fn test_from_definition_longhorizon_default_off() {
+    // Default invariant: absent longhorizon marker → gate disabled; the
+    // acceptance gate keeps its criteria-only admission (existing
+    // definitions are unaffected).
+    let def = make_def_with_tools(vec!["echo".to_string()]);
+    let runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap();
+    assert!(!runner.writeoff_enabled);
+    assert!(
+        runner.writeoff_gate_input().is_none(),
+        "mode off must not build gate input"
+    );
+}
+
+#[tokio::test]
+async fn test_from_definition_longhorizon_marker_enables_conjunction() {
+    // Declared marker → gate enabled. In enabled mode the gate input is
+    // always Some; journal absence degrades to Unknown piece states
+    // (unknown is not pass) and never flips the mode back off.
+    let mut def = make_def_with_tools(vec!["echo".to_string()]);
+    def.longhorizon = Some(true);
+    let runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap();
+    assert!(runner.writeoff_enabled);
+    let pieces = runner
+        .writeoff_gate_input()
+        .expect("enabled mode must build gate input");
+    assert_eq!(
+        pieces.evidence,
+        crate::agent::writeoff::EvidenceState::Unknown,
+        "no journal dir wired → evidence unknowable, not present/missing"
+    );
+    assert_eq!(
+        pieces.freshness,
+        crate::agent::writeoff::FreshnessState::Unknown
+    );
 }
 
 #[tokio::test]
