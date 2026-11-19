@@ -85,6 +85,7 @@ pub mod http_get;
 pub mod http_request;
 pub mod image_load;
 pub mod job_control;
+pub mod lsp_tool;
 pub mod net_guard;
 pub mod plan_submit;
 pub mod python_exec;
@@ -333,6 +334,12 @@ fn default_safe_toolkit_core(
     handler.register_static(
         codegraph::CODEGRAPH_TOOL,
         Arc::new(codegraph::CodeGraphTool::wired(&workdir_buf)),
+    );
+    // 语言服务器只读查询面(诊断/文档符号;agent 侧自持客户端,不占用 UI
+    // WS 桥单连接;server 不在 PATH=fail-visible 带安装指引)
+    handler.register_static(
+        lsp_tool::LSP_TOOL,
+        Arc::new(lsp_tool::LspTool::new(workdir_buf.clone())),
     );
     // dev-feedback P0a 余量:后台作业轮询面(与 shell_exec background=true
     // 启动面配对;同一进程级注册表;零新命令执行面)
@@ -1193,6 +1200,36 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                                   5} for search; {\"task\": \"how does login flow \
                                   work\"} for context; {\"symbol\": \"fnName\"} for \
                                   callers/callees/impact/node)."
+                        .to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "lsp".to_string(),
+            description: crate::builtin_tools::lsp_tool::lsp_description(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "action".to_string(),
+                    r#type: "string".to_string(),
+                    description: "One of: diagnostics, document_symbols. Unknown values \
+                                  are rejected with the valid list."
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "path".to_string(),
+                    r#type: "string".to_string(),
+                    description: "File path relative to the workspace root (supported: \
+                                  .rs, .ts/.tsx/.jsx, .py/.pyi)."
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "wait_ms".to_string(),
+                    r#type: "number".to_string(),
+                    description: "Optional max wait (ms) for the first diagnostics \
+                                  publish. Default 10000, cap 10000."
                         .to_string(),
                     required: false,
                 },

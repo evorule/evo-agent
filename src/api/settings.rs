@@ -934,6 +934,46 @@ pub fn delegate_max_concurrent(merged: &serde_json::Map<String, Value>) -> usize
         .unwrap_or(0)
 }
 
+/// agent 侧 LSP 工具面开关（与 UI 桥同键；缺省 true=开启，false=禁用）。
+pub fn lsp_agent_enabled(merged: &serde_json::Map<String, Value>) -> bool {
+    merged
+        .get("lsp.enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+/// coding 档激活态（workspace 层 `session.profile=coding`；与 runner 装载
+/// 单点同键同值语义）。
+pub fn coding_profile_active(merged: &serde_json::Map<String, Value>) -> bool {
+    merged.get("session.profile").and_then(|v| v.as_str()) == Some("coding")
+}
+
+/// 编辑回执诊断总门：coding 档 + LSP 开关双条件。
+/// ⚠️ `session.profile` 未经 settings 注册（零键裁定，runner 同款）——
+/// 必须直读 workspace 层文件，走 `merged()` 会被未注册键静默丢弃
+/// （测试实证：merged 面永远看不到该键）。读取失败 = 关 = 现行为。
+pub fn lsp_agent_gate(workdir: &Path) -> bool {
+    let coding = std::fs::read_to_string(workdir.join(".evo").join("settings.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| {
+            v.get("session.profile")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+        })
+        == Some("coding".to_string());
+    if !coding {
+        return false;
+    }
+    match WorkbenchSettingsStore::new(workdir) {
+        Ok(store) => {
+            let (merged, _) = store.merged();
+            lsp_agent_enabled(&merged)
+        }
+        Err(_) => false,
+    }
+}
+
 // =============================================================================
 // 存储路径白名单（防目录穿越）
 // =============================================================================
@@ -1162,6 +1202,50 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn lsp_agent_gate_requires_coding_profile_and_enabled() {
+        // 门自建 store(与生产同链);四态:缺省关/coding 开/显式关/manual 关
+        let dir = std::env::temp_dir().join(format!(
+            "evo-lsp-gate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // 缺省(无 settings):门关(manual 档=现状零变化)
+        assert!(!super::lsp_agent_gate(&dir));
+        // coding 档 + lsp 缺省开 → 门开
+        write_file(
+            &dir.join(".evo").join("settings.json"),
+            r#"{"session.profile": "coding"}"#,
+        );
+        assert!(super::lsp_agent_gate(&dir));
+        // lsp.enabled=false 显式关 → 门关
+        write_file(
+            &dir.join(".evo").join("settings.json"),
+            r#"{"session.profile": "coding", "lsp.enabled": false}"#,
+        );
+        assert!(!super::lsp_agent_gate(&dir));
+        // manual 档 → 门关(缺省不变式)
+        write_file(
+            &dir.join(".evo").join("settings.json"),
+            r#"{"session.profile": "manual", "lsp.enabled": true}"#,
+        );
+        assert!(!super::lsp_agent_gate(&dir));
+    }
+
+    #[test]
+    fn lsp_agent_enabled_defaults_true() {
+        let empty = serde_json::Map::new();
+        assert!(super::lsp_agent_enabled(&empty));
+        let mut off = serde_json::Map::new();
+        off.insert("lsp.enabled".to_string(), serde_json::json!(false));
+        assert!(!super::lsp_agent_enabled(&off));
+        let coding = serde_json::json!({"session.profile": "coding"});
+        assert!(super::coding_profile_active(coding.as_object().unwrap()));
+        assert!(!super::coding_profile_active(&serde_json::Map::new()));
     }
 
     fn user_file(dir: &Path) -> PathBuf {
