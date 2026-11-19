@@ -1025,7 +1025,7 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             // HandoverWritten:交接点语义锚(写档动作镜像已在 tool_invoked/
             // tool_result);v1 忽略,跨会话链步映射待 session_spawn 接线后一并设计
             JournalEvent::HandoverWritten { .. } => {}
-            // WriteoffCheckpointed:核销断点块检查点(长程核销批)——恢复状态
+            // WriteoffCheckpointed: checkpoint write-off entry (long-horizon batch) - recovery state
             // 载体,不映射步(观测面口径;断点块在 journal 侧凭最新本事件回放)
             JournalEvent::WriteoffCheckpointed { .. } => {}
             // SessionSpawned/ChainHalted(自主交接批):会话链派生/熔断语义锚

@@ -171,7 +171,7 @@ pub struct TodoItem {
     /// 优先级
     pub priority: TodoPriority,
     /// 处置注记（挂起/转形态必附：处置判据+恢复条件，登记不修形态；
-    /// 其余状态可选留痕。≤500 字符，在场即非空）
+    /// Other statuses: optional note. <=500 chars, non-empty when present)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition_note: Option<String>,
 }

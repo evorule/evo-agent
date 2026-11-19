@@ -557,7 +557,7 @@ pub enum JournalEvent {
         /// schema 校验结果(写侧 fail-visible 拒写,应恒 true;保留字段容错)
         schema_ok: bool,
     },
-    /// 核销断点块检查点落账(长程核销批):long-horizon 会话内 handover_write
+    /// Writeoff checkpoint ledger entry (long-horizon batch): in-session handover_write
     /// 成功写档后,由 runner 按工具名分支调用(best-effort,与 handover_written
     /// 同风格)——机器从 journal 窗口投影的断点块底稿全文随事件入账(事实面
     /// 机器代拟,语义面 LLM 补写;底稿全文是恢复面唯一状态载体,与
@@ -565,7 +565,7 @@ pub enum JournalEvent {
     /// 事件重建断点块状态(最新胜出;digest 逐字校验,失配拒绝恢复)。
     /// 观测面,不参与步映射。
     WriteoffCheckpointed {
-        /// 核销窗口号(窗口 = 最新 turn_started 起的 goal 进展单元;取其
+        /// Writeoff window seq (window = goal progress units since the newest turn_started;
         /// turn_seq)
         window: u64,
         /// 窗口内 Completed 迁移清单(todo 条目 id;首次迁移顺序,去重)
@@ -2058,7 +2058,7 @@ impl JournalWriter {
         })
     }
 
-    /// 核销断点块检查点落账(长程核销批):long-horizon 会话 handover_write
+    /// Writeoff checkpoint ledger entry (long-horizon batch): in-session handover_write
     /// 成功写档后由 runner 按工具名分支调用(best-effort,与 handover_written
     /// 同风格);恢复=回放最新本事件重建断点块状态(最新胜出,digest 校验)。
     pub fn writeoff_checkpointed(
@@ -3131,7 +3131,7 @@ mod tests {
 
     #[test]
     fn test_writeoff_checkpointed_roundtrip_and_replay_key() {
-        // 核销断点块检查点:序列化/反序列化往返(类型名 writeoff_checkpointed
+        // Writeoff checkpoint: serialize/deserialize roundtrip (variant writeoff_checkpointed
         // 进账) + 写者方法落账后可按行读回(恢复面凭最新本事件回放)。
         let dir = std::env::temp_dir().join(format!("jf-wocp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

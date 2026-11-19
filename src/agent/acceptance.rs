@@ -24,9 +24,26 @@
 //! piece itemized in the detail. Passing None (non-long-horizon mode)
 //! keeps the legacy criteria-only behavior byte-identical (default
 //! invariant).
+//!
+//! Acceptance evidence extension (long-horizon mode): when the caller
+//! hands in the runner-projected touch report
+//! ([`crate::agent::acceptance_evidence::TouchReport`]), two more
+//! machine faces join the admission decision. First, the evidence
+//! spot-check runs before the criteria command: recorded digests are
+//! recomputed against the extant checkpoint blob bytes, and any mismatch
+//! or missing blob refuses the submission without spending the criteria
+//! budget (a tampered ledger face is a refusal, not a pass). Second, the
+//! criteria command is executed twice and both stdout bytes and exit
+//! code must be bit-identical — a divergence means the criterion is not
+//! repeatable and the submission is honestly refused (discipline, not
+//! defect). Every `task_done` refusal additionally names the unreferenced
+//! touch paths when the model's anchors leave part of the projected touch
+//! surface uncovered (report credibility signal). Passing a None report
+//! (non-long-horizon mode) keeps behavior byte-identical.
 
 use serde_json::Value;
 
+use crate::agent::acceptance_evidence::{self, IntegrityVerdict, TouchReport};
 use crate::agent::writeoff::{self, CriteriaState, JournalPieces, WriteoffVerdict};
 
 /// 门禁结果
@@ -44,10 +61,20 @@ pub enum GateOutcome {
 /// = non-long-horizon mode, legacy criteria-only behavior. When Some, the
 /// `task_done` admission upgrades to the three-piece conjunction and both
 /// Reject and Unknown refuse the submission with the itemized detail.
+///
+/// `runner_report`: runner-projected acceptance evidence (touch surface,
+/// coverage, journal-anchor coverage, evidence spot-check verdict; also
+/// runner-computed, model never supplies it). None = the faces were not
+/// built (non-long-horizon mode) — no dual run, no spot-check, byte
+/// identical legacy behavior. When Some on a `task_done`, the spot-check
+/// verdict joins the admission decision, the criteria command runs twice
+/// under the bit-identical discipline, and every refusal names the
+/// unreferenced touch paths when coverage is incomplete.
 pub async fn apply_acceptance_gate(
     acceptance_command: Option<&str>,
     args: &Value,
     writeoff_pieces: Option<&JournalPieces>,
+    runner_report: Option<&TouchReport>,
 ) -> GateOutcome {
     let itype = args
         .get("instruction_type")
@@ -55,6 +82,20 @@ pub async fn apply_acceptance_gate(
         .unwrap_or("");
     match itype {
         "task_done" => {
+            // Evidence spot-check first (cheap read-only IO): recorded
+            // digests are recomputed against the extant checkpoint blobs,
+            // so a tampered ledger face refuses admission without
+            // spending the criteria command budget. The model cannot
+            // influence this face (runner-projected from the manifest
+            // SSOT), and the refusal names every failing artifact.
+            if let Some(report) = runner_report {
+                if let IntegrityVerdict::Reject { faces } = &report.integrity {
+                    return GateOutcome::Reject(format!(
+                        "task_done refused by evidence recomputation (fail-closed): {} — recorded ledger digests no longer match the extant artifacts",
+                        faces.join("; ")
+                    ) + &acceptance_evidence::coverage_rejection_line(report));
+                }
+            }
             let Some(cmd) = acceptance_command else {
                 // Conjunction mode without a configured command: the
                 // criteria piece cannot be established, so the conjunction
@@ -63,20 +104,76 @@ pub async fn apply_acceptance_gate(
                 if let Some(pieces) = writeoff_pieces {
                     let verdict =
                         writeoff::evaluate_conjunction(CriteriaState::Unconfigured, pieces);
-                    return GateOutcome::Reject(writeoff_refusal(&verdict));
+                    return GateOutcome::Reject(append_coverage(
+                        writeoff_refusal(&verdict),
+                        runner_report,
+                    ));
                 }
                 return GateOutcome::Allow(args.clone());
             };
-            let outcome = run_acceptance_command(cmd).await;
-            let passed = matches!(&outcome, Ok(o) if o.status.success());
-            let detail = match &outcome {
-                Err(e) => e.clone(),
-                Ok(o) => format!(
-                    "exit={:?} stdout_tail={} stderr_tail={}",
-                    o.status.code(),
-                    tail_str(&String::from_utf8_lossy(&o.stdout), 400),
-                    tail_str(&String::from_utf8_lossy(&o.stderr), 400),
-                ),
+            // Long-horizon mode runs the criterion command twice: stdout
+            // bytes + exit code must be bit-identical (a repeatable,
+            // side-effect-free criterion produces identical faces; a
+            // divergence means the criterion is not deterministic and the
+            // submission is honestly refused — discipline, not defect).
+            // Non-long-horizon mode keeps the single legacy run.
+            let (passed, detail) = if writeoff_pieces.is_some() {
+                let first = run_acceptance_command(cmd).await;
+                let second = run_acceptance_command(cmd).await;
+                match (first, second) {
+                    (Ok(a), Ok(b)) => {
+                        let describe = |o: &std::process::Output| {
+                            format!(
+                                "exit={:?} stdout_tail={}",
+                                o.status.code(),
+                                tail_str(&String::from_utf8_lossy(&o.stdout), 400)
+                            )
+                        };
+                        if acceptance_evidence::dual_run_bit_identical(
+                            a.status.code(),
+                            &a.stdout,
+                            b.status.code(),
+                            &b.stdout,
+                        ) {
+                            let passed = a.status.success();
+                            let detail = if passed {
+                                String::new()
+                            } else {
+                                format!("exit={:?}", a.status.code())
+                            };
+                            (passed, detail)
+                        } else {
+                            (
+                                false,
+                                format!(
+                                    "acceptance criteria non-deterministic: dual-run outputs diverged (run1: {} | run2: {}) — a done-admission criterion must be repeatable; this is discipline, not a defect",
+                                    describe(&a),
+                                    describe(&b)
+                                ),
+                            )
+                        }
+                    }
+                    (Err(e1), Err(e2)) => (
+                        false,
+                        format!("acceptance command failed on both runs: {e1} | {e2}"),
+                    ),
+                    (Err(e), _) | (_, Err(e)) => (false, format!("acceptance command failed: {e}")),
+                }
+            } else {
+                let outcome = run_acceptance_command(cmd).await;
+                match &outcome {
+                    Err(e) => (false, e.clone()),
+                    Ok(o) => {
+                        let passed = o.status.success();
+                        let detail = format!(
+                            "exit={:?} stdout_tail={} stderr_tail={}",
+                            o.status.code(),
+                            tail_str(&String::from_utf8_lossy(&o.stdout), 400),
+                            tail_str(&String::from_utf8_lossy(&o.stderr), 400),
+                        );
+                        (passed, detail)
+                    }
+                }
             };
             if let Some(pieces) = writeoff_pieces {
                 // Conjunction mode: the criteria result enters the
@@ -91,7 +188,10 @@ pub async fn apply_acceptance_gate(
                 };
                 let verdict = writeoff::evaluate_conjunction(criteria, pieces);
                 if !matches!(verdict, WriteoffVerdict::Pass) {
-                    return GateOutcome::Reject(writeoff_refusal(&verdict));
+                    return GateOutcome::Reject(append_coverage(
+                        writeoff_refusal(&verdict),
+                        runner_report,
+                    ));
                 }
             }
             let mut args = args.clone();
@@ -108,8 +208,11 @@ pub async fn apply_acceptance_gate(
             if passed {
                 GateOutcome::Allow(args)
             } else {
-                GateOutcome::Reject(format!(
-                    "验收判据未通过({detail})——task_done 已被门禁拒绝:判据不过不存在 done 退出路径"
+                GateOutcome::Reject(append_coverage(
+                    format!(
+                        "验收判据未通过({detail})——task_done 已被门禁拒绝:判据不过不存在 done 退出路径"
+                    ),
+                    runner_report,
                 ))
             }
         }
@@ -146,6 +249,20 @@ fn writeoff_refusal(verdict: &WriteoffVerdict) -> String {
         WriteoffVerdict::Unknown(detail) => format!(
             "task_done 已被合取门禁拒绝(unknown 不假装通过:{detail})——无法确证的合取件按拒绝处理,不存在 done 退出路径"
         ),
+    }
+}
+
+/// Append the unreferenced-touch-paths line to a `task_done` refusal when
+/// the runner report shows a coverage deficit (report credibility signal:
+/// the acceptance's own claims are cross-checked against what was actually
+/// touched). Empty report or complete coverage → unchanged text.
+fn append_coverage(rejection: String, runner_report: Option<&TouchReport>) -> String {
+    match runner_report {
+        Some(report) => format!(
+            "{rejection}{}",
+            acceptance_evidence::coverage_rejection_line(report)
+        ),
+        None => rejection,
     }
 }
 
@@ -370,7 +487,7 @@ mod tests {
             "instruction_type": "task_done",
             "params": { "milestone_current": 3 }
         });
-        match apply_acceptance_gate(Some("exit 0"), &args, None).await {
+        match apply_acceptance_gate(Some("exit 0"), &args, None, None).await {
             GateOutcome::Allow(a) => {
                 assert_eq!(a["params"]["acceptance_passed"], serde_json::json!(true));
                 // 原有 params 字段保留
@@ -386,7 +503,7 @@ mod tests {
             "instruction_type": "task_done",
             "params": {}
         });
-        match apply_acceptance_gate(Some("exit 3"), &args, None).await {
+        match apply_acceptance_gate(Some("exit 3"), &args, None, None).await {
             GateOutcome::Reject(d) => {
                 assert!(d.contains("验收判据未通过"));
                 // 拒绝不改写原 args 的语义:注入发生在 Allow 路径,此处 detail 已含原因
@@ -399,7 +516,7 @@ mod tests {
     async fn test_gate_unconfigured_allows_task_done() {
         let args = serde_json::json!({ "instruction_type": "task_done", "params": {} });
         assert!(matches!(
-            apply_acceptance_gate(None, &args, None).await,
+            apply_acceptance_gate(None, &args, None, None).await,
             GateOutcome::Allow(_)
         ));
     }
@@ -408,7 +525,7 @@ mod tests {
     async fn test_gate_task_blocked_requires_reason() {
         let no_reason = serde_json::json!({ "instruction_type": "task_blocked", "params": {} });
         assert!(matches!(
-            apply_acceptance_gate(None, &no_reason, None).await,
+            apply_acceptance_gate(None, &no_reason, None, None).await,
             GateOutcome::Reject(_)
         ));
         let with_reason = serde_json::json!({
@@ -416,7 +533,7 @@ mod tests {
             "params": { "reason": "deps unavailable, fail-visible" }
         });
         assert!(matches!(
-            apply_acceptance_gate(None, &with_reason, None).await,
+            apply_acceptance_gate(None, &with_reason, None, None).await,
             GateOutcome::Allow(_)
         ));
     }
@@ -425,7 +542,7 @@ mod tests {
     async fn test_gate_passthrough_other_instructions() {
         let args = serde_json::json!({ "instruction_type": "task_start", "params": {} });
         assert!(matches!(
-            apply_acceptance_gate(Some("exit 1"), &args, None).await,
+            apply_acceptance_gate(Some("exit 1"), &args, None, None).await,
             GateOutcome::Allow(_)
         ));
     }
@@ -514,7 +631,7 @@ mod tests {
             },
             FreshnessState::Fresh,
         );
-        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p)).await {
+        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), None).await {
             GateOutcome::Allow(a) => {
                 assert_eq!(a["params"]["acceptance_passed"], serde_json::json!(true));
             }
@@ -537,7 +654,7 @@ mod tests {
             },
             FreshnessState::Fresh,
         );
-        match apply_acceptance_gate(Some("exit 7"), &args, Some(&p)).await {
+        match apply_acceptance_gate(Some("exit 7"), &args, Some(&p), None).await {
             GateOutcome::Reject(d) => {
                 assert!(d.contains("缺项明细"), "{d}");
                 assert!(d.contains("acceptance criteria not met"), "{d}");
@@ -571,7 +688,7 @@ mod tests {
         ];
         for (evidence, freshness, needle) in cases {
             let p = pieces(evidence, freshness);
-            match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p)).await {
+            match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), None).await {
                 GateOutcome::Reject(d) => {
                     assert!(d.contains(needle), "case `{needle}` detail: {d}");
                 }
@@ -582,7 +699,7 @@ mod tests {
         }
         // All-missing case: every failing piece listed in one detail.
         let p = pieces(EvidenceState::Missing, FreshnessState::Missing);
-        match apply_acceptance_gate(Some("exit 3"), &done_args(), Some(&p)).await {
+        match apply_acceptance_gate(Some("exit 3"), &done_args(), Some(&p), None).await {
             GateOutcome::Reject(d) => {
                 assert!(d.contains("acceptance criteria not met"), "{d}");
                 assert!(d.contains("committed evidence missing"), "{d}");
@@ -597,7 +714,7 @@ mod tests {
         // Journal disabled/unreadable: both journal pieces are Unknown.
         // Unknown must refuse done — it must never degrade to a pass.
         let p = pieces(EvidenceState::Unknown, FreshnessState::Unknown);
-        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p)).await {
+        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), None).await {
             GateOutcome::Reject(d) => {
                 assert!(d.contains("unknown 不假装通过"), "{d}");
                 assert!(d.contains("cannot be established"), "{d}");
@@ -617,7 +734,7 @@ mod tests {
             },
             FreshnessState::Fresh,
         );
-        match apply_acceptance_gate(None, &done_args(), Some(&p)).await {
+        match apply_acceptance_gate(None, &done_args(), Some(&p), None).await {
             GateOutcome::Reject(d) => {
                 assert!(d.contains("cannot be established"), "{d}");
             }
@@ -634,11 +751,11 @@ mod tests {
         // all, and an unconfigured command still allows — the pieces that
         // would reject in conjunction mode are simply not consulted.
         assert!(matches!(
-            apply_acceptance_gate(Some("exit 0"), &done_args(), None).await,
+            apply_acceptance_gate(Some("exit 0"), &done_args(), None, None).await,
             GateOutcome::Allow(_)
         ));
         assert!(matches!(
-            apply_acceptance_gate(None, &done_args(), None).await,
+            apply_acceptance_gate(None, &done_args(), None, None).await,
             GateOutcome::Allow(_)
         ));
         // Legacy forged-flag negative still holds without the conjunction.
@@ -647,7 +764,7 @@ mod tests {
             "params": { "acceptance_passed": true }
         });
         assert!(matches!(
-            apply_acceptance_gate(Some("exit 3"), &args, None).await,
+            apply_acceptance_gate(Some("exit 3"), &args, None, None).await,
             GateOutcome::Reject(_)
         ));
     }
@@ -660,7 +777,7 @@ mod tests {
         let p = pieces(EvidenceState::Unknown, FreshnessState::Unknown);
         let blocked = serde_json::json!({ "instruction_type": "task_blocked", "params": {} });
         assert!(matches!(
-            apply_acceptance_gate(None, &blocked, Some(&p)).await,
+            apply_acceptance_gate(None, &blocked, Some(&p), None).await,
             GateOutcome::Reject(_)
         ));
         let blocked_ok = serde_json::json!({
@@ -668,13 +785,258 @@ mod tests {
             "params": { "reason": "honest exit" }
         });
         assert!(matches!(
-            apply_acceptance_gate(None, &blocked_ok, Some(&p)).await,
+            apply_acceptance_gate(None, &blocked_ok, Some(&p), None).await,
             GateOutcome::Allow(_)
         ));
         let start = serde_json::json!({ "instruction_type": "task_start", "params": {} });
         assert!(matches!(
-            apply_acceptance_gate(Some("exit 1"), &start, Some(&p)).await,
+            apply_acceptance_gate(Some("exit 1"), &start, Some(&p), None).await,
             GateOutcome::Allow(_)
         ));
+    }
+
+    // ===== Acceptance evidence faces (touch report, dual run, spot-check) =====
+
+    use crate::agent::acceptance_evidence::{
+        compute_touch_coverage, project_touch_surface, read_manifest_entries, spot_check_evidence,
+        TouchReport, TouchSurfaceEntry, DEFAULT_SPOT_CHECK_LIMIT,
+    };
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    /// Digest in the shared ledger convention (blake3:<hex>).
+    fn ev_digest(bytes: &[u8]) -> String {
+        format!("blake3:{}", blake3::hash(bytes).to_hex())
+    }
+
+    /// Fixture checkpoint store: manifest SSOT + content blob under a
+    /// temp workspace root (the gate consumes the projection read-only).
+    fn evidence_fixture(name: &str, body: &[u8], path: &str) -> (PathBuf, Vec<TouchSurfaceEntry>) {
+        let dir =
+            std::env::temp_dir().join(format!("d4-accept-gate-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".evo-checkpoint").join("blobs")).unwrap();
+        let hash = ev_digest(body);
+        let line = format!(
+            "{{\"seq\":1,\"ts\":1001,\"tool\":\"file_write\",\"path\":\"{path}\",\"kind\":\"content\",\"hash\":\"{hash}\",\"bytes\":{}}}",
+            body.len()
+        );
+        std::fs::write(
+            dir.join(".evo-checkpoint").join("manifest.jsonl"),
+            line + "\n",
+        )
+        .unwrap();
+        let blob = dir
+            .join(".evo-checkpoint")
+            .join("blobs")
+            .join(hash.strip_prefix("blake3:").unwrap());
+        std::fs::write(blob, body).unwrap();
+        let entries = read_manifest_entries(&dir);
+        (dir, project_touch_surface(&entries))
+    }
+
+    fn report_for(
+        dir: &std::path::Path,
+        surface: &[TouchSurfaceEntry],
+        referenced: &[&str],
+    ) -> TouchReport {
+        let refs: BTreeSet<String> = referenced.iter().map(|s| s.to_string()).collect();
+        TouchReport {
+            surface: surface.to_vec(),
+            coverage: compute_touch_coverage(surface, &refs),
+            journal_anchor_coverage: None,
+            integrity: spot_check_evidence(dir, surface, DEFAULT_SPOT_CHECK_LIMIT),
+        }
+    }
+
+    #[cfg(windows)]
+    fn append_counter_cmd(counter: &std::path::Path) -> String {
+        format!("@echo x>>{}", counter.display())
+    }
+
+    #[cfg(not(windows))]
+    fn append_counter_cmd(counter: &std::path::Path) -> String {
+        format!("echo x >> {}", counter.display())
+    }
+
+    #[tokio::test]
+    async fn test_dual_run_identical_outputs_allow_in_longhorizon_mode() {
+        // Mode-on with a repeatable criterion: two runs, identical exit
+        // and stdout — admission granted exactly as in legacy mode.
+        let p = pieces(
+            EvidenceState::Present {
+                digest: "d".to_string(),
+            },
+            FreshnessState::Fresh,
+        );
+        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), None).await {
+            GateOutcome::Allow(a) => {
+                assert_eq!(a["params"]["acceptance_passed"], serde_json::json!(true));
+            }
+            GateOutcome::Reject(d) => panic!("repeatable criterion must allow: {d}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dual_run_divergence_captured_as_non_determinism() {
+        // Negative: a criterion embedding varying output diverges across
+        // the two runs; the dual run must capture it and refuse honestly
+        // (discipline, not defect). This probe can only pass if the
+        // command genuinely executed twice with diverging output. The
+        // probe command is the exported assembly one (a GUID print — a
+        // time-based %RANDOM% collides when both runs spawn within the
+        // same system tick, measured on this host).
+        use crate::agent::acceptance_evidence::NONDETERMINISTIC_PROBE_CMD;
+        let nondet = NONDETERMINISTIC_PROBE_CMD;
+        let p = pieces(
+            EvidenceState::Present {
+                digest: "d".to_string(),
+            },
+            FreshnessState::Fresh,
+        );
+        match apply_acceptance_gate(Some(nondet), &done_args(), Some(&p), None).await {
+            GateOutcome::Reject(d) => {
+                assert!(d.contains("non-deterministic"), "{d}");
+                assert!(d.contains("dual-run"), "{d}");
+            }
+            GateOutcome::Allow(_) => panic!("a non-deterministic criterion must be refused"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dual_run_executes_twice_only_in_longhorizon_mode() {
+        // Execution-count proof through a file side effect: legacy mode
+        // runs the criterion once; long-horizon mode runs it twice.
+        let dir = std::env::temp_dir().join(format!("d4-accept-cnt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let counter = dir.join("counter.txt");
+        let cmd = append_counter_cmd(&counter);
+        let t0 = std::time::Instant::now();
+        match apply_acceptance_gate(Some(&cmd), &done_args(), None, None).await {
+            GateOutcome::Allow(a) => {
+                assert_eq!(a["params"]["acceptance_passed"], serde_json::json!(true));
+            }
+            GateOutcome::Reject(d) => panic!("deterministic criterion must allow: {d}"),
+        }
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(1),
+            "criterion must really run (elapsed {:?})",
+            t0.elapsed()
+        );
+        let content = std::fs::read_to_string(&counter).unwrap();
+        let runs = content.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(
+            runs, 1,
+            "non-long-horizon mode must run the criterion exactly once, got {content:?}"
+        );
+        // Long-horizon mode: the same style of criterion appends one line
+        // per execution — the dual run must leave exactly two.
+        let counter2 = dir.join("counter2.txt");
+        let cmd2 = append_counter_cmd(&counter2);
+        let p = pieces(
+            EvidenceState::Present {
+                digest: "d".to_string(),
+            },
+            FreshnessState::Fresh,
+        );
+        match apply_acceptance_gate(Some(&cmd2), &done_args(), Some(&p), None).await {
+            GateOutcome::Allow(_) => {}
+            GateOutcome::Reject(d) => {
+                panic!("deterministic criterion must allow in mode-on too: {d}")
+            }
+        }
+        let content2 = std::fs::read_to_string(&counter2).unwrap();
+        let runs2 = content2.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(
+            runs2, 2,
+            "long-horizon mode must run the criterion twice (dual run), got {content2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evidence_spot_check_blocks_on_tampered_blob() {
+        // Negative: after-capture blob tampering is detected by
+        // recomputation and refuses admission even though the criteria
+        // command would pass — recorded digests are never trusted.
+        let (dir, surface) = evidence_fixture("tamper", b"artifact-bytes", "a.txt");
+        let p = pieces(
+            EvidenceState::Present {
+                digest: "d".to_string(),
+            },
+            FreshnessState::Fresh,
+        );
+        // Honest store: evidence face ok, admission granted.
+        let report = report_for(&dir, &surface, &["a.txt"]);
+        assert_eq!(report.coverage.ratio_pct, 100);
+        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), Some(&report)).await {
+            GateOutcome::Allow(_) => {}
+            GateOutcome::Reject(d) => panic!("honest evidence must allow: {d}"),
+        }
+        // Tamper one byte of the blob on disk.
+        let hash = ev_digest(b"artifact-bytes");
+        let blob = dir
+            .join(".evo-checkpoint")
+            .join("blobs")
+            .join(hash.strip_prefix("blake3:").unwrap());
+        std::fs::write(&blob, b"artifact-byteZ").unwrap();
+        let tampered = report_for(&dir, &surface, &["a.txt"]);
+        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), Some(&tampered)).await {
+            GateOutcome::Reject(d) => {
+                assert!(d.contains("evidence recomputation"), "{d}");
+                assert!(d.contains("a.txt"), "{d}");
+            }
+            GateOutcome::Allow(_) => panic!("tampered evidence must refuse"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rejection_names_unreferenced_touch_paths() {
+        // Design fixture: 5 touched / 3 referenced = 60%; every task_done
+        // refusal must name the unreferenced paths (credibility signal).
+        let dir = std::env::temp_dir().join(format!("d4-accept-cov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".evo-checkpoint").join("blobs")).unwrap();
+        let hash = ev_digest(b"x");
+        let lines: Vec<String> = ["p1", "p2", "p3", "p4", "p5"]
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                format!(
+                    "{{\"seq\":{},\"ts\":{},\"tool\":\"file_write\",\"path\":\"{path}\",\"kind\":\"content\",\"hash\":\"{hash}\",\"bytes\":1}}",
+                    i + 1,
+                    1000 + i,
+                )
+            })
+            .collect();
+        std::fs::write(
+            dir.join(".evo-checkpoint").join("manifest.jsonl"),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+        let blob = dir
+            .join(".evo-checkpoint")
+            .join("blobs")
+            .join(hash.strip_prefix("blake3:").unwrap());
+        std::fs::write(blob, b"x").unwrap();
+        let surface = project_touch_surface(&read_manifest_entries(&dir));
+        assert_eq!(surface.len(), 5);
+        let report = report_for(&dir, &surface, &["p1", "p2", "p3"]);
+        assert_eq!(report.coverage.ratio_pct, 60, "5 touched / 3 referenced");
+        let p = pieces(
+            EvidenceState::Present {
+                digest: "d".to_string(),
+            },
+            FreshnessState::Fresh,
+        );
+        match apply_acceptance_gate(Some("exit 1"), &done_args(), Some(&p), Some(&report)).await {
+            GateOutcome::Reject(d) => {
+                assert!(d.contains("acceptance criteria not met"), "{d}");
+                assert!(d.contains("3/5"), "{d}");
+                assert!(d.contains("60%"), "{d}");
+                assert!(d.contains("p4") && d.contains("p5"), "{d}");
+            }
+            GateOutcome::Allow(_) => panic!("failing criterion must refuse"),
+        }
     }
 }
