@@ -1586,6 +1586,12 @@ pub struct AgentRunner {
     /// 重复;指纹 result-free,滑动窗判重复与交替)。streaming react 循环
     /// 每轮工具调用定型处 observe,标记复用两级软指引。
     sequence_loop: crate::agent::stagnation::SequenceLoopDetector,
+    /// Checkpoint-freshness gate (long-horizon write-off batch). Observed
+    /// at the task_done write-off gate when the journal-projected freshness
+    /// piece is stale/missing: two-level fail-visible guidance appended to
+    /// the rejection feedback (first violation warns, a repeat escalates;
+    /// fresh windows reset). Mode off → never observed (default invariant).
+    freshness_gate: crate::agent::handover_tool::FreshnessGate,
     /// 管道入口类标记(delegate 统一装配批;默认 React 主路径)
     ///
     /// CallerContext.entry 的 runner 侧单一来源:execute_tool_call_gated /
@@ -1787,6 +1793,7 @@ impl AgentRunner {
             writeoff_enabled: false,
             stagnation: crate::agent::stagnation::StagnationDetector::new(),
             sequence_loop: crate::agent::stagnation::SequenceLoopDetector::new(),
+            freshness_gate: crate::agent::handover_tool::FreshnessGate::new(),
             pipeline_entry: crate::agent::pipeline::PipelineEntry::React,
             assembly_scope_focus: false,
             i2_verdict_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -3268,6 +3275,82 @@ impl AgentRunner {
         Some(crate::agent::writeoff::pieces_from_journal(
             lines.as_deref(),
         ))
+    }
+
+    /// Checkpoint-freshness soft guidance at the task_done gate
+    /// (long-horizon mode). Observes the journal-projected freshness piece
+    /// through the two-level gate and returns the fail-visible mark to
+    /// append to the rejection feedback (`None` = nothing to append; also
+    /// `None` when the mode is off — the gate is never observed without the
+    /// write-off pieces, so non-long-horizon runs see zero behavior
+    /// change).
+    fn observe_checkpoint_freshness(
+        &mut self,
+        pieces: Option<&crate::agent::writeoff::JournalPieces>,
+    ) -> Option<&'static str> {
+        let pieces = pieces?;
+        match self.freshness_gate.observe(pieces.freshness.clone()) {
+            crate::agent::handover_tool::FreshnessGuidance::None => None,
+            crate::agent::handover_tool::FreshnessGuidance::Warn(mark) => Some(mark),
+            crate::agent::handover_tool::FreshnessGuidance::Escalate(mark) => Some(mark),
+        }
+    }
+
+    /// Long-horizon batch: after a successful `handover_write` in write-off
+    /// mode, record the machine-projected checkpoint block as a
+    /// writeoff_checkpointed journal event (structured recovery carrier:
+    /// window number, completed-transition list, block draft + digest;
+    /// replay rebuilds the breakpoint state from the newest such event,
+    /// latest wins). Best-effort like handover_written: projection or
+    /// append failures warn and degrade — the call mirror
+    /// (tool_invoked/tool_result) still covers the write itself.
+    fn record_writeoff_checkpointed(
+        journal: Option<&crate::agent::journal::JournalWriter>,
+        writeoff_enabled: bool,
+        tool_name: &str,
+        result: &Value,
+    ) {
+        if !writeoff_enabled || tool_name != crate::agent::handover_tool::HANDOVER_WRITE_TOOL {
+            return;
+        }
+        let Some(j) = journal else {
+            return;
+        };
+        let path = result.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        if path.is_empty() {
+            return;
+        }
+        let schema_ok = result
+            .get("schema_ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !schema_ok {
+            return;
+        }
+        let lines = match j.read_lines() {
+            Ok(lines) => lines,
+            Err(e) => {
+                tracing::warn!(error = %e, "writeoff_checkpointed journal read failed");
+                return;
+            }
+        };
+        let Some(proj) = crate::agent::handover_tool::project_checkpoint_window(&lines) else {
+            tracing::warn!("writeoff_checkpointed projection skipped: no turn window");
+            return;
+        };
+        let draft_str = match serde_json::to_string(&proj.draft) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "writeoff_checkpointed draft serialization failed");
+                return;
+            }
+        };
+        let digest = crate::agent::journal::evorule_digest(&draft_str);
+        if let Err(e) =
+            j.writeoff_checkpointed(proj.window, &proj.completed_items, &draft_str, &digest)
+        {
+            tracing::warn!(error = %e, "writeoff_checkpointed journal append failed");
+        }
     }
 
     /// M5-a:注入生效能力边界声明(serve/CLI 层按定义或启动配置合成后传入;
@@ -5219,11 +5302,30 @@ impl AgentRunner {
             }
             let exec: std::sync::Arc<dyn ToolFunction> = match name {
                 crate::agent::handover_tool::HANDOVER_WRITE_TOOL => {
-                    std::sync::Arc::new(HandoverWriteTool::wired(
+                    let tool = HandoverWriteTool::wired(
                         namespace.clone(),
                         client.clone(),
                         session_id.to_string(),
-                    ))
+                    );
+                    // Long-horizon mode: attach the machine checkpoint-block
+                    // draft provider (projects the fact face from the session
+                    // journal at call time). Mode off → no provider, the
+                    // legacy full-six-field contract applies unchanged
+                    // (default invariant).
+                    let tool = if self.writeoff_enabled {
+                        let dir = self.journal_dir.clone();
+                        let sid = session_id.to_string();
+                        tool.with_writeoff_draft(std::sync::Arc::new(move || {
+                            let dir = dir.as_ref()?;
+                            let path = crate::agent::journal::JournalWriter::path_for(dir, &sid);
+                            let lines = crate::agent::journal::read_all_tolerant(&path).ok()?;
+                            crate::agent::handover_tool::project_checkpoint_window(&lines)
+                                .map(|w| w.draft)
+                        }))
+                    } else {
+                        tool
+                    };
+                    std::sync::Arc::new(tool)
                 }
                 _ => {
                     std::sync::Arc::new(HandoverReadTool::wired(namespace.clone(), client.clone()))
@@ -5401,6 +5503,8 @@ impl AgentRunner {
                                     &s.priority,
                                 )
                                 .unwrap_or(crate::builtin_tools::todo::TodoPriority::Medium),
+                                // journal 快照 v1 字段形态无注记面:回放重建注记置空
+                                disposition_note: None,
                             })
                             .collect(),
                     );
@@ -5607,6 +5711,7 @@ impl AgentRunner {
                 writeoff_enabled: false,
                 stagnation: crate::agent::stagnation::StagnationDetector::new(),
                 sequence_loop: crate::agent::stagnation::SequenceLoopDetector::new(),
+                freshness_gate: crate::agent::handover_tool::FreshnessGate::new(),
                 pipeline_entry,
                 assembly_scope_focus,
                 i2_verdict_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -6370,11 +6475,19 @@ impl AgentRunner {
             GateOutcome::Allow(a) => a,
             GateOutcome::Reject(detail) => {
                 warn!(%session_id, %detail, "acceptance gate rejected instruction submission");
-                return Ok(serde_json::json!({
+                // Checkpoint-freshness soft guidance (long-horizon mode):
+                // two-level mark appended to the rejection feedback so the
+                // model sees the stale-breakpoint cue on the next round.
+                let checkpoint_note = self.observe_checkpoint_freshness(writeoff_pieces.as_ref());
+                let mut rejection = serde_json::json!({
                     "status": "rejected_by_acceptance_gate",
                     "detail": detail,
                     "guidance": "task_done 需判据自检通过(acceptance_passed=true);task_blocked 需非空 reason。请继续工作或按 fail-visible 诚实退出。"
-                }));
+                });
+                if let Some(note) = checkpoint_note {
+                    rejection["checkpoint_note"] = serde_json::json!(note);
+                }
+                return Ok(rejection);
             }
         };
 
@@ -7040,6 +7153,12 @@ impl AgentRunner {
                 .execute_tool_call_gated(session_id, tool_name, &first_args, journal, Some(cached))
                 .await?;
             Self::record_handover_written(journal, session_id, tool_name, &final_result);
+            Self::record_writeoff_checkpointed(
+                journal,
+                self.writeoff_enabled,
+                tool_name,
+                &final_result,
+            );
             Self::record_session_spawned(journal, session_id, tool_name, &final_result);
             self.record_todo_updated(journal, tool_name);
             return Ok(ToolExecStage::Done(ToolExecOutcome {
@@ -7075,6 +7194,12 @@ impl AgentRunner {
                             }
                         }
                         Self::record_handover_written(journal, session_id, tool_name, &tool_result);
+                        Self::record_writeoff_checkpointed(
+                            journal,
+                            self.writeoff_enabled,
+                            tool_name,
+                            &tool_result,
+                        );
                         Self::record_session_spawned(journal, session_id, tool_name, &tool_result);
                         self.record_todo_updated(journal, tool_name);
                         // B22-C T1:流式面工具完成事件——与 execute_tool_call_gated
@@ -7289,6 +7414,12 @@ impl AgentRunner {
         // session_spawned(server 因果链权威无损,账面镜像缺席;实测 844
         // 直通路径有、847 审批路径无即此根因)。handover_write 同理对称补挂。
         Self::record_handover_written(journal, session_id, tool_name, &final_result);
+        Self::record_writeoff_checkpointed(
+            journal,
+            self.writeoff_enabled,
+            tool_name,
+            &final_result,
+        );
         Self::record_session_spawned(journal, session_id, tool_name, &final_result);
         self.record_todo_updated(journal, tool_name);
 
@@ -11250,6 +11381,11 @@ impl AgentRunner {
                                                    GateOutcome::Allow(a) => a,
                                                    GateOutcome::Reject(detail) => {
                                                        warn!(%session_id, %detail, "acceptance gate rejected instruction submission");
+                                                       // Checkpoint-freshness soft guidance
+                                                       // (long-horizon mode): two-level mark
+                                                       // appended to the rejection feedback.
+                                                       let checkpoint_note = runner
+                                                           .observe_checkpoint_freshness(writeoff_pieces.as_ref());
                                                        if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
                                                            if let Err(e) = j.tool_result(cid, "rejected", &detail, runner.execution_profile_marker()) {
                                                                warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
@@ -11257,9 +11393,12 @@ impl AgentRunner {
                                                        }
                                                        tool_calls.push(tool_name.clone());
                                                        let tool_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
+                                                       let note_suffix = checkpoint_note
+                                                           .map(|note| format!(",\"checkpoint_note\":\"{note}\""))
+                                                           .unwrap_or_default();
                                                        messages.push(Message::Tool {
                                                            content: format!(
-                                                               "{{\"status\":\"rejected_by_acceptance_gate\",\"detail\":\"{detail}\"}}"
+                                                               "{{\"status\":\"rejected_by_acceptance_gate\",\"detail\":\"{detail}\"{note_suffix}}}"
                                                            ),
                                                            tool_name: tool_name.clone(),
                                                            images: Vec::new(),

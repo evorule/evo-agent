@@ -1915,12 +1915,17 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
             description: "Replace the session todo list with the given items (FULL rewrite, \
                           not a patch — always submit the complete list). Each item: id \
                           (unique short key within the list), content (1-500 chars, \
-                          actionable), status (pending | in_progress | completed), \
-                          priority (high | medium | low, default medium). Max 10 items; \
-                          an empty array clears the list. The current list summary is \
-                          injected into your system prompt each turn — keep it current: \
-                          mark an item in_progress before starting it and completed \
-                          immediately when done. The list lives only for this session."
+                          actionable), status (pending | in_progress | completed | \
+                          deferred | reworked | transformed), priority (high | medium | \
+                          low, default medium). Items with status deferred or transformed \
+                          additionally REQUIRE a non-empty disposition_note (handling \
+                          criteria + recovery condition — deferred items are registered \
+                          only, never worked on until their recovery condition holds). \
+                          Max 10 items; an empty array clears the list. The current list \
+                          summary is injected into your system prompt each turn — keep it \
+                          current: mark an item in_progress before starting it and \
+                          completed immediately when done. The list lives only for this \
+                          session."
                 .to_string(),
             parameters: vec![ParameterSpec {
                 name: "items".to_string(),
@@ -1935,9 +1940,10 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "todo_read".to_string(),
             description: "Read the current session todo list (items with id/content/status/\
-                          priority plus a count). Read-only — use it to re-check the exact \
-                          state when the injected summary is not enough. The list lives \
-                          only for this session."
+                          priority plus optional disposition_note, and a count). \
+                          Read-only — use it to re-check the exact state when the \
+                          injected summary is not enough. The list lives only for this \
+                          session."
                 .to_string(),
             parameters: vec![],
         },
