@@ -9193,3 +9193,181 @@ fn coding_profile_absent_defaults_manual_zero_change() {
     assert!(!runner.session_coding_profile_for_test());
     assert!(runner.coding_repo_map_segment_for_test().is_none());
 }
+
+// === Acceptance evidence (long-horizon batch): projection injection,
+// === self-proof arming, fail-closed gate input, spot-check limit
+
+/// Fixture checkpoint store under a temp workspace root (manifest SSOT
+/// + content blob), consumed read-only by the runner projection.
+fn d4_checkpoint_fixture(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("rt-d4-{}-{}", name, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".evo-checkpoint").join("blobs")).unwrap();
+    let hash = format!("blake3:{}", blake3::hash(b"hello").to_hex());
+    let line = format!(
+        "{{\"seq\":1,\"ts\":1001,\"tool\":\"file_write\",\"path\":\"a.txt\",\"kind\":\"content\",\"hash\":\"{hash}\",\"bytes\":5}}"
+    );
+    std::fs::write(
+        dir.join(".evo-checkpoint").join("manifest.jsonl"),
+        line + "\n",
+    )
+    .unwrap();
+    let blob = dir
+        .join(".evo-checkpoint")
+        .join("blobs")
+        .join(hash.strip_prefix("blake3:").unwrap());
+    std::fs::write(blob, b"hello").unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn test_acceptance_evidence_injection_overwrites_forged_surface() {
+    // Touch-surface projection is a manifest direct read (LLM zero
+    // participation): a model-supplied value under the runner-owned
+    // params keys is overwritten with the manifest truth.
+    let dir = d4_checkpoint_fixture("inj");
+    let mut def = make_def_with_tools(vec!["echo".to_string()]);
+    def.longhorizon = Some(true);
+    let mut runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap()
+            .with_workspace_checkpoint_writable(&dir, "workspace");
+    runner.session_id = Some("s-d4".to_string());
+    let mut args = serde_json::json!({
+        "instruction_type": "task_done",
+        "params": { "touch_surface": "FORGED-BY-MODEL", "anchors": ["a.txt"] }
+    });
+    let report = runner
+        .prepare_acceptance_evidence(&mut args)
+        .await
+        .expect("longhorizon + wired store must build the report");
+    assert_eq!(report.surface.len(), 1);
+    assert_eq!(report.surface[0].path, "a.txt");
+    assert_eq!(report.coverage.covered, 1, "the referenced path is covered");
+    assert_eq!(report.coverage.ratio_pct, 100);
+    assert_eq!(
+        report.integrity,
+        crate::agent::acceptance_evidence::IntegrityVerdict::Ok {
+            checked: 1,
+            empty_sample: false,
+        },
+        "honest blob recomputes clean"
+    );
+    // Runner-owned keys now carry the manifest truth; the forged value
+    // is gone (overwrite semantics — the surface cannot be forged).
+    assert_eq!(
+        args["params"]["touch_surface"][0]["path"],
+        serde_json::json!("a.txt")
+    );
+    assert_eq!(
+        args["params"]["touch_surface"][0]["hash"],
+        serde_json::json!(format!("blake3:{}", blake3::hash(b"hello").to_hex()))
+    );
+    assert_eq!(
+        args["params"]["touch_coverage"]["touched"],
+        serde_json::json!(1)
+    );
+    assert!(
+        args["params"]["journal_anchor_coverage"].is_null(),
+        "journal absent → the statistic is honestly unknowable, not fabricated"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_acceptance_evidence_mode_off_zero_impact() {
+    // Default invariant: non-long-horizon runners build no report and
+    // leave the args untouched — even forged keys pass through unmodified.
+    let dir = d4_checkpoint_fixture("off");
+    let def = make_def_with_tools(vec!["echo".to_string()]);
+    let runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap()
+            .with_workspace_checkpoint_writable(&dir, "workspace");
+    let mut args = serde_json::json!({
+        "instruction_type": "task_done",
+        "params": { "touch_surface": "FORGED-BY-MODEL" }
+    });
+    assert!(runner
+        .prepare_acceptance_evidence(&mut args)
+        .await
+        .is_none());
+    assert_eq!(
+        args["params"]["touch_surface"],
+        serde_json::json!("FORGED-BY-MODEL"),
+        "mode off = args untouched (zero behavior change)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_writeoff_selfproof_arms_and_passes_once() {
+    // Assembly self-proof: not armed at construction, armed at the first
+    // ensure call with all three probes passing (mode opens), and the
+    // arming is one-shot (a second call re-runs nothing observable — the
+    // verdict stays). Mode-off runners never arm.
+    let mut def = make_def_with_tools(vec!["echo".to_string()]);
+    def.longhorizon = Some(true);
+    let runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap();
+    assert!(
+        runner.writeoff_selfproof.get().is_none(),
+        "construction must not arm (probes run at first gate use, before any admission)"
+    );
+    runner.ensure_writeoff_selfproof().await;
+    assert_eq!(
+        runner.writeoff_selfproof.get(),
+        Some(&true),
+        "a working gate passes all three negative probes and the mode opens"
+    );
+    // Mode-off runner: ensure is a no-op, the verdict stays un-armed.
+    let def = make_def_with_tools(vec!["echo".to_string()]);
+    let off =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap();
+    off.ensure_writeoff_selfproof().await;
+    assert!(
+        off.writeoff_selfproof.get().is_none(),
+        "mode off never arms"
+    );
+}
+
+#[tokio::test]
+async fn test_selfproof_failure_keeps_gate_input_none_fail_closed() {
+    // Fail-closed branch: a failed self-proof verdict closes the mode —
+    // writeoff_gate_input falls back to None (criteria-only admission)
+    // even though the marker is on. Before arming, the legacy behavior
+    // holds (un-armed = D-1 semantics for direct/test access).
+    let mut def = make_def_with_tools(vec!["echo".to_string()]);
+    def.longhorizon = Some(true);
+    let runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap();
+    assert!(
+        runner.writeoff_gate_input().is_some(),
+        "un-armed direct access keeps the D-1 semantics (pieces projected)"
+    );
+    runner.writeoff_selfproof.set(false).unwrap();
+    assert!(
+        runner.writeoff_gate_input().is_none(),
+        "failed self-proof must keep the write-off mode closed (fail-closed)"
+    );
+}
+
+#[tokio::test]
+async fn test_evidence_spot_check_limit_default_and_builder() {
+    let def = make_def_with_tools(vec!["echo".to_string()]);
+    let runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap();
+    assert_eq!(runner.evidence_spot_check_limit, 3, "default sample size");
+    let tuned = runner.with_evidence_spot_check_limit(5);
+    assert_eq!(tuned.evidence_spot_check_limit, 5);
+}

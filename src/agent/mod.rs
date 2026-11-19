@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 //! Agent orchestration layer -- AI Agent run loop, tool registry, and memory manager.
 pub mod acceptance;
+pub mod acceptance_evidence;
 pub mod adjudication;
 pub mod adjudicator;
 pub mod approval;

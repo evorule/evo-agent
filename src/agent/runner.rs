@@ -1579,6 +1579,22 @@ pub struct AgentRunner {
     /// absent marker is zero behavior change). Child sessions spawn with
     /// this off regardless of the root marker.
     writeoff_enabled: bool,
+    /// Acceptance evidence (long-horizon batch): workspace root retained
+    /// when the checkpoint store is wired, so the touch-surface projection
+    /// can read the store's on-disk manifest SSOT. The store itself is
+    /// consumed strictly read-only (its manifest/blob layout contract);
+    /// None = no checkpoint store wired, the touch-surface face is absent.
+    checkpoint_workdir: Option<std::path::PathBuf>,
+    /// Acceptance evidence (long-horizon batch): one-shot assembly
+    /// self-proof verdict. `Some(true)` = the three negative probes passed
+    /// and the long-horizon mode is open; `Some(false)` = a probe failed
+    /// and the mode stays closed for this runner (fail-closed); `None` =
+    /// not armed yet — the first gate use arms it before any admission
+    /// decision (the probes precede the first real `task_done` verdict).
+    writeoff_selfproof: std::sync::OnceLock<bool>,
+    /// Acceptance evidence (long-horizon batch): evidence spot-check
+    /// sample size (newest-first touch entries; default 3).
+    evidence_spot_check_limit: usize,
     /// 进展停滞检测器(F2 空转克星)。跨轮持续观察
     /// (工具名,参数,结果)三元组,连续重复→警告→按 H2 阻塞收尾
     stagnation: crate::agent::stagnation::StagnationDetector,
@@ -1791,6 +1807,9 @@ impl AgentRunner {
             acceptance_command: None,
             acceptance_generation: false,
             writeoff_enabled: false,
+            checkpoint_workdir: None,
+            writeoff_selfproof: std::sync::OnceLock::new(),
+            evidence_spot_check_limit: crate::agent::acceptance_evidence::DEFAULT_SPOT_CHECK_LIMIT,
             stagnation: crate::agent::stagnation::StagnationDetector::new(),
             sequence_loop: crate::agent::stagnation::SequenceLoopDetector::new(),
             freshness_gate: crate::agent::handover_tool::FreshnessGate::new(),
@@ -2988,6 +3007,7 @@ impl AgentRunner {
         workdir: &std::path::Path,
         writable_dir: &str,
     ) -> Self {
+        self.checkpoint_workdir = Some(workdir.to_path_buf());
         self.checkpoint = Some(std::sync::Arc::new(
             crate::agent::workspace_checkpoint::CheckpointStore::new(workdir, writable_dir),
         ));
@@ -3000,6 +3020,15 @@ impl AgentRunner {
                 ),
             ));
         }
+        self
+    }
+
+    /// Acceptance evidence sample size (long-horizon batch): how many of
+    /// the newest touch-surface entries are spot-checked (digest
+    /// recomputation against the extant blob) at `task_done` time.
+    /// Default 3. Non-long-horizon runners never build the sample.
+    pub fn with_evidence_spot_check_limit(mut self, limit: usize) -> Self {
+        self.evidence_spot_check_limit = limit;
         self
     }
 
@@ -3267,6 +3296,14 @@ impl AgentRunner {
         if !self.writeoff_enabled {
             return None;
         }
+        // Fail-closed arming: when the one-shot assembly self-proof ran
+        // and failed, the mode stays closed for this runner (criteria-only
+        // admission). An un-armed verdict never appears on real gate paths
+        // — the call sites arm before projecting — so a None here only
+        // means direct/test access, which keeps the legacy behavior.
+        if self.writeoff_selfproof.get() == Some(&false) {
+            return None;
+        }
         let lines = self
             .journal_dir
             .as_ref()
@@ -3278,6 +3315,90 @@ impl AgentRunner {
         Some(crate::agent::writeoff::pieces_from_journal(
             lines.as_deref(),
         ))
+    }
+
+    /// One-shot assembly self-proof for the long-horizon mode (acceptance
+    /// evidence batch). Runs the three negative probes through the real
+    /// gate machinery — a forged pass flag cannot grant admission, a
+    /// known-bad criterion goes red, a non-deterministic criterion is
+    /// captured by the dual run — and records the verdict once. Any probe
+    /// failing keeps the mode closed for this runner (fail-closed: an
+    /// idle gate that cannot go red must not pretend to protect
+    /// anything); the failure is logged fail-visible. Mode off = no-op
+    /// (non-long-horizon runners never arm, zero behavior change).
+    async fn ensure_writeoff_selfproof(&self) {
+        if !self.writeoff_enabled || self.writeoff_selfproof.get().is_some() {
+            return;
+        }
+        let report = crate::agent::acceptance_evidence::run_assembly_selfproof().await;
+        let ok = report.all_pass();
+        if !ok {
+            tracing::error!(
+                failures = ?report.failures,
+                "long-horizon assembly self-proof FAILED: the write-off mode stays closed (fail-closed); criteria-only admission applies to this runner"
+            );
+        }
+        let _ = self.writeoff_selfproof.set(ok);
+    }
+
+    /// Runner-computed acceptance evidence for a `task_done` submission
+    /// (long-horizon mode only; the model supplies none of it). Projects
+    /// the touch surface from the checkpoint manifest SSOT, computes the
+    /// model-reference coverage and the journal-anchor coverage, runs the
+    /// evidence spot-check (digest recomputation over extant blobs), and
+    /// injects the report into runner-owned `task_done` params keys
+    /// (overwrite semantics — a model-supplied value under those keys is
+    /// replaced, so the surface cannot be forged). Returns None when the
+    /// mode is off, the instruction is not `task_done`, or no checkpoint
+    /// store is wired — the gate then runs without the evidence faces
+    /// (default invariant for non-long-horizon runners).
+    async fn prepare_acceptance_evidence(
+        &self,
+        args: &mut Value,
+    ) -> Option<crate::agent::acceptance_evidence::TouchReport> {
+        if !self.writeoff_enabled {
+            return None;
+        }
+        let itype = args
+            .get("instruction_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if itype != "task_done" {
+            return None;
+        }
+        let workdir = self.checkpoint_workdir.as_ref()?;
+        let entries = crate::agent::acceptance_evidence::read_manifest_entries(workdir);
+        let surface = crate::agent::acceptance_evidence::project_touch_surface(&entries);
+        let referenced = crate::agent::acceptance_evidence::extract_referenced_paths(args);
+        let coverage =
+            crate::agent::acceptance_evidence::compute_touch_coverage(&surface, &referenced);
+        let journal_lines = self
+            .journal_dir
+            .as_ref()
+            .zip(self.session_id.as_ref())
+            .and_then(|(dir, sid)| {
+                let path = crate::agent::journal::JournalWriter::path_for(dir, sid);
+                crate::agent::journal::read_all_tolerant(&path).ok()
+            });
+        let journal_anchor_coverage = journal_lines.as_deref().map(|lines| {
+            crate::agent::acceptance_evidence::compute_anchor_coverage(
+                &crate::agent::acceptance_evidence::journal_anchors(lines),
+                &surface,
+            )
+        });
+        let integrity = crate::agent::acceptance_evidence::spot_check_evidence(
+            workdir,
+            &surface,
+            self.evidence_spot_check_limit,
+        );
+        let report = crate::agent::acceptance_evidence::TouchReport {
+            surface,
+            coverage,
+            journal_anchor_coverage,
+            integrity,
+        };
+        crate::agent::acceptance_evidence::inject_touch_report(args, &report);
+        Some(report)
     }
 
     /// Checkpoint-freshness soft guidance at the task_done gate
@@ -5712,6 +5833,13 @@ impl AgentRunner {
                 // (long-horizon mode is a root-run concern; child gate
                 // behavior stays criteria-only — default invariant).
                 writeoff_enabled: false,
+                // Acceptance evidence faces are long-horizon concerns too:
+                // children carry no checkpoint store and no self-proof
+                // arming (mode off = faces never built — default invariant).
+                checkpoint_workdir: None,
+                writeoff_selfproof: std::sync::OnceLock::new(),
+                evidence_spot_check_limit:
+                    crate::agent::acceptance_evidence::DEFAULT_SPOT_CHECK_LIMIT,
                 stagnation: crate::agent::stagnation::StagnationDetector::new(),
                 sequence_loop: crate::agent::stagnation::SequenceLoopDetector::new(),
                 freshness_gate: crate::agent::handover_tool::FreshnessGate::new(),
@@ -6467,11 +6595,20 @@ impl AgentRunner {
         // pieces to the gate (task_done becomes the three-piece
         // conjunction); non-long-horizon mode always passes None
         // (behavior unchanged).
+        // Acceptance evidence (long-horizon mode): arm the one-shot
+        // assembly self-proof first (any probe failing keeps the mode
+        // closed), then build the runner-projected touch report for
+        // task_done and inject it into runner-owned params keys. Mode off
+        // = both no-ops, zero behavior change.
+        self.ensure_writeoff_selfproof().await;
+        let mut args = args;
+        let acceptance_report = self.prepare_acceptance_evidence(&mut args).await;
         let writeoff_pieces = self.writeoff_gate_input();
         let args = match apply_acceptance_gate(
             self.acceptance_command.as_deref(),
             &args,
             writeoff_pieces.as_ref(),
+            acceptance_report.as_ref(),
         )
         .await
         {
@@ -11373,11 +11510,25 @@ impl AgentRunner {
                                                // becomes the three-piece conjunction);
                                                // non-long-horizon mode always passes None
                                                // (behavior unchanged).
+                                               // Acceptance evidence (long-horizon
+                                               // mode): arm the one-shot assembly
+                                               // self-proof first (any probe
+                                               // failing keeps the mode closed),
+                                               // then build the runner-projected
+                                               // touch report for task_done and
+                                               // inject it into runner-owned
+                                               // params keys. Mode off = both
+                                               // no-ops, zero behavior change.
+                                               runner.ensure_writeoff_selfproof().await;
+                                               let mut args = args;
+                                               let acceptance_report =
+                                                   runner.prepare_acceptance_evidence(&mut args).await;
                                                let writeoff_pieces = runner.writeoff_gate_input();
                                                let args = match apply_acceptance_gate(
                                                    runner.acceptance_command.as_deref(),
                                                    &args,
                                                    writeoff_pieces.as_ref(),
+                                                   acceptance_report.as_ref(),
                                                )
                                                .await
                                                {
