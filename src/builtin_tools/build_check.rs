@@ -26,7 +26,7 @@
 //!   同 shell 装配、同 256KB 输出帽、同超时杀进程语义。
 //! - 无状态:每次调用返回当前全量现状(增量去重只属于 verify 门禁回喂)。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -66,6 +66,104 @@ struct CheckProfile {
     kind: ProfileKind,
 }
 
+// =============================================================================
+// D6 声明化剖面:workspace 层 `.evo/profiles.toml`(项目方 authored)
+// =============================================================================
+
+/// profiles.toml 路径锚
+pub const DECLARED_PROFILES_FILE: &str = ".evo/profiles.toml";
+/// 声明剖面超时钳制上限(秒)
+pub const DECLARED_TIMEOUT_CAP: u64 = 1800;
+
+/// 一条项目方声明剖面(数据封闭:argv/超时/解析器均由 toml 声明,模型只按键选)
+#[derive(Debug, Clone)]
+pub(crate) struct DeclaredProfile {
+    pub key: String,
+    pub command: String,
+    pub matcher: String,
+    pub timeout_secs: u64,
+}
+
+/// 装载 workspace 层声明剖面。
+///
+/// fail-closed 语义:文件不存在 = 零声明 = 现行为;文件存在但解析失败
+/// = 全部声明弃用,返回 `Some(err)` 供调用方在「未知剖面」报错中 visible
+/// 留痕(绝不静默半装载)。字段校验:command 非空;键 [a-z0-9_]+;超时
+/// 钳制 [10, 1800]。
+fn load_declared_profiles(workdir: &Path) -> (Vec<DeclaredProfile>, Option<String>) {
+    let path = workdir.join(DECLARED_PROFILES_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return (Vec::new(), None), // 不存在 = 现行为
+    };
+    let parsed: toml::Value = match toml::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "declared profiles file {DECLARED_PROFILES_FILE} failed to parse \
+                     and was fully rejected (builtin profiles only): {e}"
+                )),
+            )
+        }
+    };
+    let table = match parsed.get("profiles").and_then(|v| v.as_table()) {
+        Some(t) => t.clone(),
+        None => return (Vec::new(), None),
+    };
+    let mut out = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    for (key, body) in &table {
+        let key_ok = !key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        let command = body
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if !key_ok {
+            problems.push(format!("[profiles.{key}] key must be [a-z0-9_]+"));
+            continue;
+        }
+        if command.is_empty() {
+            problems.push(format!("[profiles.{key}] missing/empty 'command'"));
+            continue;
+        }
+        let timeout_secs = body
+            .get("timeout_secs")
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u64)
+            .unwrap_or(BUILD_CHECK_TIMEOUT_SECS)
+            .clamp(10, DECLARED_TIMEOUT_CAP);
+        let matcher = body
+            .get("parser")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(DeclaredProfile {
+            key: key.clone(),
+            command: command.to_string(),
+            matcher,
+            timeout_secs,
+        });
+    }
+    if !problems.is_empty() {
+        // 单条字段问题:弃用该条但保留其余(整文件拒仅限顶层解析失败——
+        // 两者都 visible,粒度不同如实区分)
+        return (
+            out,
+            Some(format!(
+                "some declared profiles in {DECLARED_PROFILES_FILE} were rejected: {}",
+                problems.join("; ")
+            )),
+        );
+    }
+    (out, None)
+}
+
 const PROFILES: &[CheckProfile] = &[
     CheckProfile {
         key: "cargo_check",
@@ -96,6 +194,8 @@ const PROFILES: &[CheckProfile] = &[
 /// `build_check` 工具(执行缝注入:生产=工作目录 shell;测试=打桩)
 pub struct BuildCheckTool {
     runner: Arc<dyn CommandRunner>,
+    /// 工作区根(声明化剖面装载锚:`.evo/profiles.toml`)
+    workdir: PathBuf,
 }
 
 impl BuildCheckTool {
@@ -103,13 +203,34 @@ impl BuildCheckTool {
     pub fn wired(workdir: &Path) -> Self {
         Self {
             runner: Arc::new(ShellCommandRunner::new(workdir)),
+            workdir: workdir.to_path_buf(),
         }
     }
 
     /// 测试缝(注入打桩 runner;仅测试构建编译,生产路径走 [`wired`])
     #[cfg(test)]
     pub(crate) fn with_runner(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            workdir: PathBuf::from("."),
+        }
+    }
+
+    /// 测试缝:带工作区根(声明化剖面单测用)
+    #[cfg(test)]
+    pub(crate) fn with_runner_and_workdir(
+        runner: Arc<dyn CommandRunner>,
+        workdir: PathBuf,
+    ) -> Self {
+        Self { runner, workdir }
+    }
+
+    /// 项目方声明的剖面(单测直测装载器)
+    #[cfg(test)]
+    pub(crate) fn declared_profiles_for_test(
+        workdir: &Path,
+    ) -> (Vec<DeclaredProfile>, Option<String>) {
+        load_declared_profiles(workdir)
     }
 
     /// 解析单次命令输出为结构化诊断集(错误/告警计数+帽内条目)
@@ -230,35 +351,66 @@ impl BuildCheckTool {
 impl crate::io_handlers::tool_handler::ToolFunction for BuildCheckTool {
     async fn call(&self, args: &Value) -> IoResult {
         // profile 解析:缺省/Null=cargo_check(现行为逐字节兼容);非字符串=
-        // 显式报错;未知键=fail-visible 列出合法剖面(不猜,不静默回落)
-        let profile =
-            match args.get("profile") {
-                None | Some(Value::Null) => PROFILES
+        // 显式报错;未知键=fail-visible 列出内建+声明全剖面(不猜,不静默
+        // 回落)。声明剖面装载失败=visible 留痕(报错尾段+信封 profiles_note)。
+        let (declared, load_problem) = load_declared_profiles(&self.workdir);
+        enum ProfileRef<'a> {
+            Builtin(&'static CheckProfile),
+            Declared(&'a DeclaredProfile),
+        }
+        let valid_list = format!(
+            "{}{}",
+            PROFILES
+                .iter()
+                .map(|p| p.key)
+                .collect::<Vec<_>>()
+                .join(", "),
+            if declared.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", declared: {}",
+                    declared
+                        .iter()
+                        .map(|d| d.key.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        );
+        let profile = match args.get("profile") {
+            None | Some(Value::Null) => ProfileRef::Builtin(
+                PROFILES
                     .iter()
                     .find(|p| p.key == "cargo_check")
                     .expect("cargo_check profile present in const table"),
-                Some(Value::String(s)) => PROFILES
-                    .iter()
-                    .find(|p| p.key == s.as_str())
-                    .ok_or_else(|| {
-                        format!(
-                            "build_check: unknown profile \"{s}\" (valid profiles: {})",
-                            PROFILES
-                                .iter()
-                                .map(|p| p.key)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    })?,
-                Some(_) => return Err("build_check: profile must be a string".to_string()),
-            };
+            ),
+            Some(Value::String(s)) => {
+                if let Some(p) = PROFILES.iter().find(|p| p.key == s.as_str()) {
+                    ProfileRef::Builtin(p)
+                } else if let Some(d) = declared.iter().find(|d| d.key == s.as_str()) {
+                    ProfileRef::Declared(d)
+                } else {
+                    let mut msg = format!(
+                        "build_check: unknown profile \"{s}\" (valid profiles: {valid_list})"
+                    );
+                    if let Some(w) = &load_problem {
+                        msg.push_str("; ");
+                        msg.push_str(w);
+                    }
+                    return Err(msg);
+                }
+            }
+            Some(_) => return Err("build_check: profile must be a string".to_string()),
+        };
         let started = Instant::now();
+        let (command, timeout_secs, declared_flag) = match &profile {
+            ProfileRef::Builtin(p) => (p.command, BUILD_CHECK_TIMEOUT_SECS, false),
+            ProfileRef::Declared(d) => (d.command.as_str(), d.timeout_secs, true),
+        };
         let out = self
             .runner
-            .run(
-                profile.command,
-                Duration::from_secs(BUILD_CHECK_TIMEOUT_SECS),
-            )
+            .run(command, Duration::from_secs(timeout_secs))
             .await
             .map_err(|e| format!("build_check could not run the check command: {e}"))?;
 
@@ -267,15 +419,34 @@ impl crate::io_handlers::tool_handler::ToolFunction for BuildCheckTool {
             s.push_str(&out.stderr);
             s
         };
-        let (errors, warnings, diags, truncated) = match profile.kind {
-            ProfileKind::RustcShort => Self::collect_diagnostics(&combined, profile.matcher),
-            ProfileKind::CargoTest => Self::collect_cargo_test(&combined),
-            ProfileKind::Pytest => Self::collect_pytest(&combined),
+        let (errors, warnings, diags, truncated) = match &profile {
+            ProfileRef::Builtin(p) => match p.kind {
+                ProfileKind::RustcShort => Self::collect_diagnostics(&combined, p.matcher),
+                ProfileKind::CargoTest => Self::collect_cargo_test(&combined),
+                ProfileKind::Pytest => Self::collect_pytest(&combined),
+            },
+            ProfileRef::Declared(d) => {
+                // 声明剖面解析器:可选 parser=rustc/pytest;缺省=不解析
+                // (verdict 由 exit code 判,计数零——如实形态)
+                match d.matcher.as_str() {
+                    "$rustc" | "rustc" => Self::collect_diagnostics(&combined, "$rustc"),
+                    "pytest" => Self::collect_pytest(&combined),
+                    _ => (0, 0, Vec::new(), false),
+                }
+            }
         };
         let verdict = classify_verdict(out.exit_code, errors);
 
+        let profile_key = match &profile {
+            ProfileRef::Builtin(p) => p.key,
+            ProfileRef::Declared(d) => d.key.as_str(),
+        };
+        let pytest_like = match &profile {
+            ProfileRef::Builtin(p) => p.kind == ProfileKind::Pytest,
+            ProfileRef::Declared(d) => d.matcher == "pytest",
+        };
         let note = if verdict == "unknown" {
-            if profile.kind == ProfileKind::Pytest {
+            if pytest_like {
                 Some(
                     "non-zero exit with no parseable failure lines: pytest output did not \
                      contain --tb=line failure entries (collection error? check the \
@@ -294,8 +465,8 @@ impl crate::io_handlers::tool_handler::ToolFunction for BuildCheckTool {
         };
 
         let mut map = serde_json::json!({
-            "profile": profile.key,
-            "command": profile.command,
+            "profile": profile_key,
+            "command": command,
             "exit_code": out.exit_code,
             "timed_out": out.timed_out,
             "verdict": verdict,
@@ -304,8 +475,14 @@ impl crate::io_handlers::tool_handler::ToolFunction for BuildCheckTool {
             "truncated": truncated,
             "elapsed_ms": started.elapsed().as_millis() as u64,
         });
-        if let Some(n) = note {
-            if let Some(o) = map.as_object_mut() {
+        if let Some(o) = map.as_object_mut() {
+            if declared_flag {
+                o.insert("declared".to_string(), Value::Bool(true));
+            }
+            if let Some(w) = &load_problem {
+                o.insert("profiles_note".to_string(), Value::String(w.clone()));
+            }
+            if let Some(n) = note {
                 o.insert("note".to_string(), Value::String(n));
             }
         }
@@ -456,6 +633,124 @@ mod tests {
             }))),
         });
         (BuildCheckTool::with_runner(runner.clone()), runner)
+    }
+
+    // === D6 声明化剖面 ===
+
+    fn temp_workspace() -> PathBuf {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        // TempDir drop 即清理;防提早回收:泄漏式留存(测试进程生命周期)
+        std::mem::forget(dir);
+        root
+    }
+
+    #[test]
+    fn declared_loader_absent_file_zero_declared() {
+        let ws = temp_workspace();
+        let (declared, problem) = BuildCheckTool::declared_profiles_for_test(&ws);
+        assert!(declared.is_empty());
+        assert!(problem.is_none());
+    }
+
+    #[test]
+    fn declared_loader_valid_toml_loads() {
+        let ws = temp_workspace();
+        std::fs::create_dir_all(ws.join(".evo")).unwrap();
+        std::fs::write(
+            ws.join(".evo").join("profiles.toml"),
+            "[profiles.mypy]\r\ncommand = \"mypy --strict .\"\r\nparser = \"\"\r\ntimeout_secs = 600\r\n",
+        )
+        .unwrap();
+        let (declared, problem) = BuildCheckTool::declared_profiles_for_test(&ws);
+        assert!(problem.is_none());
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].key, "mypy");
+        assert_eq!(declared[0].command, "mypy --strict .");
+        assert_eq!(declared[0].timeout_secs, 600);
+    }
+
+    #[test]
+    fn declared_loader_bad_toml_rejects_all_visible() {
+        let ws = temp_workspace();
+        std::fs::create_dir_all(ws.join(".evo")).unwrap();
+        std::fs::write(ws.join(".evo").join("profiles.toml"), "not = [valid toml").unwrap();
+        let (declared, problem) = BuildCheckTool::declared_profiles_for_test(&ws);
+        assert!(declared.is_empty(), "坏 toml 全弃用(fail-closed)");
+        assert!(problem.is_some(), "visible 留痕在案");
+    }
+
+    #[test]
+    fn declared_loader_timeout_clamped() {
+        let ws = temp_workspace();
+        std::fs::create_dir_all(ws.join(".evo")).unwrap();
+        std::fs::write(
+            ws.join(".evo").join("profiles.toml"),
+            "[profiles.slow]\r\ncommand = \"slow-check\"\r\ntimeout_secs = 99999\r\n",
+        )
+        .unwrap();
+        let (declared, _) = BuildCheckTool::declared_profiles_for_test(&ws);
+        assert_eq!(declared[0].timeout_secs, 1800, "钳制到 1800 上限");
+    }
+
+    #[tokio::test]
+    async fn declared_profile_runs_declared_command_with_flag() {
+        // 集成:声明剖面被键选→按声明命令执行+信封 declared=true
+        let ws = temp_workspace();
+        std::fs::create_dir_all(ws.join(".evo")).unwrap();
+        std::fs::write(
+            ws.join(".evo").join("profiles.toml"),
+            "[profiles.mypy]\r\ncommand = \"mypy --strict .\"\r\n",
+        )
+        .unwrap();
+        let runner = Arc::new(CommandCaptureRunner {
+            command: Mutex::new(None),
+            output: Mutex::new(Some(Ok(CommandOutput {
+                exit_code: Some(0),
+                stdout: "Success: no issues".to_string(),
+                stderr: String::new(),
+                timed_out: false,
+            }))),
+        });
+        let tool = BuildCheckTool::with_runner_and_workdir(runner, ws);
+        let r = tool
+            .call(&serde_json::json!({"profile": "mypy"}))
+            .await
+            .unwrap();
+        assert_eq!(r.get("profile").and_then(|v| v.as_str()), Some("mypy"));
+        assert_eq!(
+            r.get("command").and_then(|v| v.as_str()),
+            Some("mypy --strict .")
+        );
+        assert_eq!(r.get("declared").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[tokio::test]
+    async fn unknown_declared_key_error_lists_both_families() {
+        let ws = temp_workspace();
+        std::fs::create_dir_all(ws.join(".evo")).unwrap();
+        std::fs::write(
+            ws.join(".evo").join("profiles.toml"),
+            "[profiles.mypy]\r\ncommand = \"mypy --strict .\"\r\n",
+        )
+        .unwrap();
+        let runner = Arc::new(CommandCaptureRunner {
+            command: Mutex::new(None),
+            output: Mutex::new(Some(Ok(CommandOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: false,
+            }))),
+        });
+        let tool = BuildCheckTool::with_runner_and_workdir(runner, ws);
+        let err = tool
+            .call(&serde_json::json!({"profile": "nope"}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("cargo_check"), "内建族在列: {err}");
+        assert!(err.contains("declared: mypy"), "声明族在列: {err}");
     }
 
     #[tokio::test]
