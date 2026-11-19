@@ -69,6 +69,7 @@ pub mod companion_observe;
 pub mod delegate_many;
 pub mod delegate_tool;
 pub mod edit_file;
+pub mod env_doctor;
 pub mod exfil_scan;
 pub mod file_create;
 pub mod file_delete;
@@ -340,6 +341,12 @@ fn default_safe_toolkit_core(
     handler.register_static(
         lsp_tool::LSP_TOOL,
         Arc::new(lsp_tool::LspTool::new(workdir_buf.clone())),
+    );
+    // 编程环境预检(只读探针矩阵;版本查询零写面,ReadOnly 显式标定;
+    // 环境缺口动手前显式暴露)
+    handler.register_static(
+        env_doctor::ENV_DOCTOR_TOOL,
+        Arc::new(env_doctor::EnvDoctorTool::new(workdir_buf.clone())),
     );
     // dev-feedback P0a 余量:后台作业轮询面(与 shell_exec background=true
     // 启动面配对;同一进程级注册表;零新命令执行面)
@@ -1234,6 +1241,11 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     required: false,
                 },
             ],
+        },
+        ToolSpec {
+            name: "env_doctor".to_string(),
+            description: crate::builtin_tools::env_doctor::env_doctor_description(),
+            parameters: vec![],
         },
         ToolSpec {
             name: "http_get".to_string(),

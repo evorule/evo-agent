@@ -520,6 +520,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // spawn 机械,不占用 UI WS 桥单连接;Process 域=本机子进程, ReadOnly
         // 显式标定见下方读写分级臂)
         b("lsp", vec![Process]),
+        // 编程环境预检(只读探针矩阵:cargo/rustc/git/python/pytest/node
+        // 版本查询零写面,ReadOnly 显式标定;环境缺口动手前显式暴露)
+        b("env_doctor", vec![Process]),
         // dev-feedback P2: 多 worktree 自动化(并行任务隔离的机制化承载;
         // 建仓检出保护/脏树 fail-visible/分支名白名单;GitWrite 域,
         // 审批走基线档)
@@ -654,7 +657,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             | "code_search" | "codegraph" | "chain_status" | "git_status" | "git_diff"
             | "git_log" | "query_journal" | "query_trace" | "read_back" | "diff_runs"
             | "read_skill" | "memory_recall" | "audit_query" | "audit_summary" | "todo_read"
-            | "handover_read" | "web_search" | "lsp" => {
+            | "handover_read" | "web_search" | "lsp" | "env_doctor" => {
                 m.side_effect = EffectClass::ReadOnly;
             }
             _ => {}
@@ -1198,9 +1201,24 @@ mod tests {
         //     数量锁 115→116）
         //   （语言服务器只读查询面 lsp +1：Process 域 ReadOnly 标定，
         //     数量锁 116→117，server 不在 PATH=fail-visible 带安装指引）
-        assert_eq!(builtin_manifests().len(), 49);
+        //   （编程环境预检 env_doctor +1：Process 域 ReadOnly 标定，
+        //     数量锁 117→118，版本查询探针零写面）
+        assert_eq!(builtin_manifests().len(), 50);
         assert_eq!(rule_manifests().len(), 60);
-        assert_eq!(all().len(), 117);
+        assert_eq!(all().len(), 118);
+    }
+
+    #[test]
+    fn test_env_doctor_manifest_present() {
+        // 环境预检挂契约面——manifest 在册(ReadOnly 只读分级)+ spec 在册
+        let m = lookup_static("env_doctor").expect("manifest registered");
+        assert_eq!(m.side_effect, EffectClass::ReadOnly);
+        assert!(
+            crate::builtin_tools::default_tool_specs()
+                .iter()
+                .any(|s| s.name == "env_doctor"),
+            "spec present in default_tool_specs"
+        );
     }
 
     #[test]
@@ -1230,7 +1248,7 @@ mod tests {
         names.extend(memory_manifests().iter().map(|m| m.name.clone()));
         // 数量锁(与模块头「内置+规则+delegate+memory」演进同源;计数漂移
         // 此处当场红)
-        assert_eq!(names.len(), 117, "static manifest count lock");
+        assert_eq!(names.len(), 118, "static manifest count lock");
         let mut sorted = names.clone();
         sorted.sort();
         let before = sorted.len();
@@ -1369,7 +1387,7 @@ mod tests {
             .filter(|m| m.side_effect == EffectClass::ReadOnly)
             .map(|m| m.name.as_str())
             .collect();
-        assert_eq!(readonly.len(), 31, "ReadOnly 标定数锁: {:?}", readonly);
+        assert_eq!(readonly.len(), 32, "ReadOnly 标定数锁: {:?}", readonly);
         let look = |n: &str| lookup_static(n).unwrap().side_effect;
         // 内置只读族抽样
         assert_eq!(look("file_read"), EffectClass::ReadOnly);
