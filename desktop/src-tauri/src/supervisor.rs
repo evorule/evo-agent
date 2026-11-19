@@ -150,7 +150,7 @@ impl Supervisor {
 
     fn log_line(&self, line: &str) {
         if let Ok(mut log) = open_shell_log(&self.paths) {
-            writeln!(log, "{line}").ok();
+            writeln!(log, "[{}] {line}", utc_stamp_now()).ok();
         }
     }
 
@@ -202,11 +202,15 @@ impl Supervisor {
     }
 
     /// 子进程监视：退出即触发守护决策。
+    ///
+    /// N-009 仪器化：exit code 不再丢弃——access violation(-1073741819)/
+    /// stack overflow(-1073741571)/abort(3)/clean(0) 在 [guard] 日志一行
+    /// 即可判别退出方式（2026-11-19 事故曾因无码可读而全盲）。
     fn monitor(self: &Arc<Self>, kind: ChildKind, epoch: u64) {
         let sup = self.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(MONITOR_TICK);
-            let exited = {
+            let exit_code: Option<Option<i32>> = {
                 let mut st = sup.state.lock().unwrap();
                 if st.shutting_down || st.degraded || st.monitor_epoch != epoch {
                     break;
@@ -222,27 +226,28 @@ impl Supervisor {
                 };
                 match child {
                     Some(c) => match c.try_wait() {
-                        Ok(Some(_)) => true,
-                        Ok(None) => false,
-                        Err(_) => true,
+                        Ok(Some(status)) => Some(status.code()),
+                        Ok(None) => None,
+                        Err(_) => Some(None),
                     },
                     None => break,
                 }
             };
-            if exited {
-                if kind == ChildKind::LlmExecutor {
-                    sup.handle_executor_exit();
-                } else {
-                    sup.handle_exit(kind);
-                }
-                break;
+            let Some(code) = exit_code else {
+                continue;
+            };
+            if kind == ChildKind::LlmExecutor {
+                sup.handle_executor_exit(code);
+            } else {
+                sup.handle_exit(kind, code);
             }
+            break;
         });
     }
 
     /// 执行体退出：单独重生（复用原端口，serve 端点 env 不变）；崩溃超限
     /// 只停用 LLM 面（LLM 调用如实报错），不进降级页、不拖累整组。
-    fn handle_executor_exit(self: &Arc<Self>) {
+    fn handle_executor_exit(self: &Arc<Self>, exit_code: Option<i32>) {
         let respawn_ok = {
             let mut st = self.state.lock().unwrap();
             if st.shutting_down || st.degraded || st.runtime.is_none() {
@@ -257,12 +262,17 @@ impl Supervisor {
             st.executor_crashes.len() < CRASH_LIMIT
         };
         if respawn_ok {
-            self.log_line("[guard] llm-executor exited; solo respawn");
+            self.log_line(&format!(
+                "[guard] llm-executor exited (code={}); solo respawn",
+                fmt_exit_code(exit_code)
+            ));
             self.spawn_executor_restart();
         } else {
-            self.log_line(
-                "[guard] llm-executor crash limit reached; LLM disabled until services restart",
-            );
+            self.log_line(&format!(
+                "[guard] llm-executor crash limit reached (code={}); \
+                 LLM disabled until services restart",
+                fmt_exit_code(exit_code)
+            ));
         }
     }
 
@@ -327,7 +337,7 @@ impl Supervisor {
         });
     }
 
-    fn handle_exit(self: &Arc<Self>, kind: ChildKind) {
+    fn handle_exit(self: &Arc<Self>, kind: ChildKind, exit_code: Option<i32>) {
         let decision = {
             let mut st = self.state.lock().unwrap();
             if st.shutting_down || st.degraded || st.runtime.is_none() {
@@ -358,15 +368,17 @@ impl Supervisor {
         match decision {
             Decision::Restart => {
                 self.log_line(&format!(
-                    "[guard] {} exited; auto group restart",
-                    kind.name()
+                    "[guard] {} exited (code={}); auto group restart",
+                    kind.name(),
+                    fmt_exit_code(exit_code)
                 ));
                 self.spawn_restart();
             }
             Decision::Degrade => {
                 self.log_line(&format!(
-                    "[guard] {} exited; crash limit reached, degrading",
-                    kind.name()
+                    "[guard] {} exited (code={}); crash limit reached, degrading",
+                    kind.name(),
+                    fmt_exit_code(exit_code)
                 ));
                 self.show_degrade(&format!(
                     "{} 进程异常退出，60 秒内连续崩溃已达 {} 次，已停止自动重启。",
@@ -507,4 +519,76 @@ fn open_shell_log(paths: &ResolvedPaths) -> Result<std::fs::File, String> {
         .append(true)
         .open(paths.logs_dir.join("shell.log"))
         .map_err(|e| format!("open shell.log: {e}"))
+}
+
+/// UTC 墙钟戳（依赖-free civil-from-days，Hinnant 算法与 atif.rs 同源；
+/// UTC 纪法与 serve.log/engine.log 可直接并读——2026-11-19 N-009 取证
+/// 曾被无时间戳的 shell.log 致盲，决策行无时序即无法与子进程日志对齐）
+fn utc_stamp_now() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs() as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// days since epoch → (year, month, day)（Howard Hinnant civil_from_days）
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_097 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// exit code 渲染：None（信号终止形态/wait 失败）如实记 unknown。
+/// Windows 负值即 NTSTATUS：-1073741819=0xC0000005 access violation、
+/// -1073741571=0xC00000FD stack overflow、3=abort()、0=clean exit。
+fn fmt_exit_code(code: Option<i32>) -> String {
+    match code {
+        Some(c) => c.to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_civil_from_days_epoch_anchors() {
+        // 1970-01-01
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // 2026-11-19（N-009 批当日）
+        assert_eq!(civil_from_days(20_776), (2026, 11, 19));
+        // 闰年 2024-02-29
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+    }
+
+    #[test]
+    fn test_utc_stamp_shape_and_fmt_exit_code() {
+        let stamp = utc_stamp_now();
+        // 形态锚:YYYY-MM-DDTHH:MM:SSZ（20 字符定长）
+        assert_eq!(stamp.len(), 20, "got: {stamp}");
+        assert!(stamp.ends_with('Z'));
+        assert_eq!(fmt_exit_code(Some(0)), "0");
+        assert_eq!(fmt_exit_code(Some(-1_073_741_819)), "-1073741819");
+        assert_eq!(fmt_exit_code(None), "unknown");
+    }
 }
