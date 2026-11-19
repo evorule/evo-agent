@@ -40,6 +40,7 @@
     attributionRows,
   } from '../lib/equilibrium.js';
   import { version } from '../../package.json';
+  import { copyApiToken } from '../lib/tokenCopy.js';
 
   // 版本面:桌面形态优先壳版本(=安装版本,tauri.conf.json 同源),构建期
   // package.json 仅回落(浏览器形态)。壳版本不可得时静默维持回落。
@@ -51,6 +52,25 @@
   let panelOpen = false;
   let bellEl = null;
   let panelEl = null;
+
+  // ---- N-011:token 显式复制门(人类点击=交付动作) ----
+  // token 本就由壳 init_script 注入 webview localStorage——按钮零新增
+  // 暴露面,只把「翻窗找 token」变「点一下开门」;剪贴板=OS 瞬态,不落盘。
+  let tokenLabel = 'Token';
+  let tokenTimer = null;
+  async function copyToken() {
+    const { ok, reason } = await copyApiToken();
+    if (tokenTimer) clearTimeout(tokenTimer);
+    tokenLabel = ok
+      ? '已复制 ✓'
+      : reason === 'empty'
+        ? 'Token 未注入'
+        : '复制失败';
+    tokenTimer = setTimeout(() => {
+      tokenLabel = 'Token';
+      tokenTimer = null;
+    }, 1600);
+  }
 
   // ---- 批 I 段 3:工作区 + 审批档位显性化(纯读态;入口跳转) ----
   let wsPath = '';
@@ -192,6 +212,11 @@
     <span class="sb-item" title="文件编码">UTF-8</span>
     <span class="sb-item" title="语言模式">{langLabel}</span>
     <span class="sb-item conn {conn.cls}" title="工作台连接态">{conn.text}</span>
+    <button
+      class="sb-item token"
+      onclick={copyToken}
+      title="复制 API Token(供自动化/外部调用通道;点击即复制,人类显式交付)"
+    >{tokenLabel}</button>
     <button
       class="sb-item bell"
       bind:this={bellEl}
