@@ -572,7 +572,7 @@ impl ToolExecutionPipeline {
         // 调用不会到达此处。pre_tool deny=显式拒绝回喂（UserHook 阶段）；
         // rewrite=参数改写进⑦；运行性故障（超时/生成失败）按 fail-open
         // 放行+留痕。None=未配置零开销直通（既有路径零变化）。
-        // o77 观测去重：缓存命中臂（precomputed=Some）是同一逻辑调用的第二次
+        //  观测去重：缓存命中臂（precomputed=Some）是同一逻辑调用的第二次
         // 管道穿越——执行侧观测（hooks/轨迹/指标）归属预执行臂（其已完整穿越含
         // hooks），命中臂跳过以消除 hooks 双发（副作用面）与轨迹/指标双记；
         // 裁决信号与 journal 账面双提交保守保留（fail-closed 方向，每次穿越照常）。
@@ -2156,7 +2156,7 @@ mod tests {
         }
     }
 
-    // ── 批B o68：hooks rewrite 回炉（改写产物重过治理通道+审批漂移防线）──
+    // ── 批B ：hooks rewrite 回炉（改写产物重过治理通道+审批漂移防线）──
 
     #[tokio::test]
     async fn user_hook_rewrite_out_of_sandbox_path_is_re_adjudicated_and_blocked() {
@@ -2416,7 +2416,7 @@ mod tests {
         let exec = out.ledger.execution.as_ref().expect("执行结局必须入账");
         assert!(exec.ok);
     }
-    // ── 批 G o77：缓存命中臂观测去重（hooks/轨迹归属执行臂）──
+    // ── 批 G ：缓存命中臂观测去重（hooks/轨迹归属执行臂）──
 
     #[tokio::test]
     async fn cache_hit_skips_hooks_and_trace_replay() {

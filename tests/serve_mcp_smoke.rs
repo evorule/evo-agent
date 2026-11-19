@@ -75,7 +75,7 @@ const AGENT_JSON: &str = r#"{
 /// `Command::new("taskkill")` 必 Err（被忽略），fallback 变成
 /// `self.0.wait()` 等 serve 退出，而 serve 是健康运行的服务器永不退出：
 /// 任何失败路径都被放大为整相位永久挂死（ubuntu CI 实证：测试超 60s
-/// 警告后零输出零 CPU 35 分钟，timeout 才收尾；即 o22 死亡史 hang 期
+/// 警告后零输出零 CPU 35 分钟，timeout 才收尾；即  死亡史 hang 期
 /// 「孤儿 evo_agent serve + 5 连挂 6 小时」的机制本体）。Unix 改用
 /// kill -9 单杀 serve；python mock 的 stdin 管道随 serve 亡而 EOF 自行
 /// 退出。两平台都随后 wait 回收，杜绝「等服务器退出」的语义颠倒。
@@ -274,12 +274,12 @@ fn smoke_serve_with_stdio_mcp_reaches_listening_and_client_face_works() {
         port,
         3,
         "tools/call",
-        serde_json::json!({"name": "mcp_mock_echo", "arguments": {"msg": "o513-smoke"}}),
+        serde_json::json!({"name": "mcp_mock_echo", "arguments": {"msg": "-smoke"}}),
     );
     assert_eq!(call["isError"], false, "tools/call failed: {call}");
     let text = call["content"][0]["text"].as_str().unwrap_or("");
     assert!(
-        text.contains("o513-smoke"),
+        text.contains("-smoke"),
         "echo must round-trip through the stdio MCP client face, got: {text}"
     );
 

@@ -349,7 +349,7 @@ impl MemoryRecord {
     }
 }
 
-/// 召回期变体聚簇（D2-一期，B-369）：按路径首段聚簇，簇内仅保留 ranking
+/// 召回期变体聚簇（D2-一期）：按路径首段聚簇，簇内仅保留 ranking
 /// 最高一条，其余退出本轮注入——直接消解「同首段异 path 变体挤占召回配额」
 /// （登记册 mf-001 观测形态：engine.location/true_location/locations 平行）。
 ///
@@ -438,7 +438,7 @@ pub(crate) fn dedupe_recall_variants(records: &mut Vec<MemoryRecord>, ns: &str) 
 /// **状态忠实口径**：本函数保留 Tombstoned/Superseded 生命态条目——状态复检面
 /// （如 `flush_usage` 服务端墓碑防御，须「看见」墓碑态本身才能跳过回写）依赖
 /// 此语义。召回/目录等**视图面**一律走 [`latest_view_entries_by_path`] 薄封装
-/// （B-411 P1 生命态视图过滤单源点），渲染面 `audit_recall_section` 另有末闸纵深。
+/// （ P1 生命态视图过滤单源点），渲染面 `audit_recall_section` 另有末闸纵深。
 pub(crate) fn latest_entries_by_path(
     facts: Vec<crate::api::evorule_client::SharedFactEntry>,
 ) -> Vec<(
@@ -486,7 +486,7 @@ pub(crate) fn latest_entries_by_path(
         .collect()
 }
 
-/// 视图面薄封装（B-411 P1 生命态视图过滤单源点）：在 [`latest_entries_by_path`]
+/// 视图面薄封装（ P1 生命态视图过滤单源点）：在 [`latest_entries_by_path`]
 /// 状态原语之上按生命态过滤——最新版本 `Tombstoned`/`Superseded` 不入视图
 /// （append-only 原值永在账；裁决败者落账后次轮召回即消失，recipe 关裁决也不
 /// 复活）。召回/目录/索引面一律走此封装；状态复检面（`flush_usage` 服务端
@@ -3110,7 +3110,7 @@ impl MemoryManager {
             // (败者退出本词 prompt;落链 best-effort)。门控=Recipe.adjudication
             // (缺省关=既有 agent 零影响)
             self.adjudicate_stable(&mut ctx).await;
-            // D2-一期(B-369):召回期变体聚簇——同首段异 path 变体仅存活
+            // D2-一期:召回期变体聚簇——同首段异 path 变体仅存活
             // ranking 最高一条(读侧 only,usage 不计)。门控=
             // Recipe.retrieval.variant_dedupe(缺省关=既有行为零影响)
             if self
@@ -3378,7 +3378,7 @@ impl MemoryManager {
             })?;
         // 版本裁决单源化：同 path 取最新版本 + null 墓碑抑制 + 生命态抑制
         // （Tombstoned/Superseded 在 latest_view_entries_by_path 单源过滤,
-        // B-411 P1 起 notes 族同享）——目录=最新版且未被遗忘/未被取代的
+        //  P1 起 notes 族同享）——目录=最新版且未被遗忘/未被取代的
         // 条目（修复前全版本直收，旧版本重复进选取、已遗忘条目占
         // NOTES_RECALL_LIMIT 名额）。
         let mut out = Vec::with_capacity(facts.len());
@@ -3521,7 +3521,7 @@ impl MemoryManager {
         Ok(out)
     }
 
-    /// Recipe 指纹(资产化/LM-2:版本+内容 blake3;无 Recipe= None)
+    /// Recipe 指纹(资产化/:版本+内容 blake3;无 Recipe= None)
     pub(crate) fn recipe_fingerprint(&self) -> Option<(String, String)> {
         let recipe = self.recipe.as_ref()?;
         let version = recipe.recipe_version.clone();
@@ -3546,7 +3546,7 @@ impl MemoryManager {
         }))
     }
 
-    /// Recipe 热重载（LM-2 可热重载属性;运行体重解析+指纹审计留痕——
+    /// Recipe 热重载（ 可热重载属性;运行体重解析+指纹审计留痕——
     /// 新指纹随下一轮 effective_params 落链,回放可锚定实际生效版本）
     pub fn reload_recipe(&mut self, recipe_json: &str) -> Result<(String, String), String> {
         let recipe: crate::agent::recipe::MemoryRecipe = serde_json::from_str(recipe_json)
@@ -3680,7 +3680,7 @@ impl MemoryManager {
     /// 阶段 3(F-612):召回期矛盾裁决(记忆设计档 §5.2)。
     ///
     /// 检测(确定性)双规=①词面相似≥阈值 且 极性相反(否定词表);②同主题
-    /// 异值(B-411 P2:Recipe 独占槽位 key 词形命中 + 值词形集不相交)——
+    /// 异值(P2:Recipe 独占槽位 key 词形命中 + 值词形集不相交)——
     /// 两规对并按 (i,j) 去重;裁决=维度序(authority>confidence>freshness,
     /// Recipe 声明),胜者为 wire 视图呈现项;败者=同 path 新版本标
     /// Superseded(append-only 不删除,RL-A1)+裁决记录落链(确定性 pair-hash
@@ -3934,15 +3934,15 @@ impl MemoryManager {
         };
         let fact_ids: Vec<u64> = pending.iter().map(|(f, _)| *f).collect();
         let paths = store.paths_by_fact_ids(&fact_ids);
-        // 状态防御(记忆审计 2026-11-13;登记册 o30 收紧):回写前服务端状态复检
+        // 状态防御(记忆审计 2026-11-13;登记册  收紧):回写前服务端状态复检
         // ——forget 墓碑=同 path 新版本 Tombstoned 记录,旧镜像回写会覆盖墓碑使
         // 已遗忘记忆复活。一次批量拉家族前缀,构建 path→最新版 lifecycle 映射;
-        // 复检不可达=fail-closed(o30 收紧:原 fail-open 在墓碑覆盖复活风险不可
+        // 复检不可达=fail-closed(收紧:原 fail-open 在墓碑覆盖复活风险不可
         // 排除的窗口裸写——增量归还 pending 下轮重试,cache 镜像仍如实累加,
         // 与 batch 失败路径同口径)。
         let mut server_states: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        // 复检不可达=fail-closed(o30 收紧):原 fail-open 在墓碑覆盖复活风险
+        // 复检不可达=fail-closed(收紧):原 fail-open 在墓碑覆盖复活风险
         // 不可排除的窗口裸写服务端——收紧为「本轮不落服务端」,但本地镜像
         // 语义(usage/Reinforced/置信演化)与增量归还 pending 均保持,与
         // batch 失败路径同口径(漂移归 B3 对账)。
@@ -3954,7 +3954,7 @@ impl MemoryManager {
             .await
         {
             Ok(facts) => {
-                // null 墓碑补录(o30):latest_entries_by_path 滤 null 值形态,
+                // null 墓碑补录:latest_entries_by_path 滤 null 值形态,
                 // tombstone 工具写的 null 墓碑路径需单列入守卫——否则守卫对
                 // 该形态失明,回写复活 ghost(E20 同型)。判据复用
                 // latest_values_by_path 的 tombstoned 返回列(同 latest-wins)。
@@ -3994,7 +3994,7 @@ impl MemoryManager {
                 continue;
             };
             // 状态防御:服务端 latest 已是保护态(Tombstoned/Promoted/Archived,
-            // o30 补 Superseded——裁决败者同样不可被 usage 回写覆盖)
+            //  补 Superseded——裁决败者同样不可被 usage 回写覆盖)
             // → 跳过回写,增量弃置(墓碑后 usage 无意义;归还 pending 会无限重试)。
             // 判据与渲染层墓碑过滤(memory.rs audit_recall_section)同源。
             if let Some(st) = server_states.get(path) {
@@ -4042,7 +4042,7 @@ impl MemoryManager {
             return;
         }
         if !server_reachable {
-            // fail-closed(o30):无守卫窗口不落服务端——全量增量归还 pending
+            // fail-closed:无守卫窗口不落服务端——全量增量归还 pending
             // (下轮复检通过后重试);cache 镜像已如实累加,漂移归 B3 对账
             tracing::warn!(
                 session_id = %session_id,
@@ -4629,7 +4629,7 @@ impl MemoryManager {
                 let result = self.safety_auditor.audit(line);
                 match result.text {
                     Some(clean) if !clean.trim().is_empty() => {
-                        // G11(B-316):回喂行过标题中和(trim_start 后同样不得构成行首标题)
+                        // G11:回喂行过标题中和(trim_start 后同样不得构成行首标题)
                         prompt.push_str(&Self::neutralize_partition_headings(clean.trim_start()));
                         prompt.push('\n');
                     }
@@ -4645,7 +4645,7 @@ impl MemoryManager {
         prompt
     }
 
-    /// G11(B-316):分区条目标题行中和(确定性纯函数)——条目内容中 '#'
+    /// G11:分区条目标题行中和(确定性纯函数)——条目内容中 '#'
     /// 开头的行拼进 prompt 分区后会冒充下一个机制分区标题(行首锚定
     /// 切分的伪造面)。'#' 开头的行前置一个空格,使其不再构成行首标题;
     /// 其余字节保真(split_inclusive 保换行原样)。
@@ -4664,11 +4664,11 @@ impl MemoryManager {
     ///
     /// 命中时 warn 留痕（P5-A3 要求"拒绝不能连日志都没有"）：
     /// 规则名 + 截断片段，供运营侧回查污染数据源。
-    /// G11(B-316):条目行在收口面统一过标题中和。
+    /// G11:条目行在收口面统一过标题中和。
     fn audit_recall_section(&self, section: &str, records: &[MemoryRecord]) -> Vec<String> {
         let mut lines = Vec::with_capacity(records.len());
         for record in records {
-            // 墓碑过滤(F-614/I9;B-411 P1 补 Superseded):Tombstoned/Superseded
+            // 墓碑过滤(F-614/I9;P1 补 Superseded):Tombstoned/Superseded
             // =视图不可见化,不进 prompt(账面仍可查询——append-only 原始数据
             // 永在;投影层已单源抑制,此处为渲染末闸纵深防线——recipe 关裁决
             // 后败者也不复活)
@@ -4696,7 +4696,7 @@ impl MemoryManager {
             if record.fact_id.is_none() || record.fact_id == Some(0) {
                 display_key = format!("[unanchored] {display_key}");
             }
-            // 时效标注（o12 L3③/B-411 P3）：带锚条目注入 as_of epoch——模型侧
+            // 时效标注（ L3③/ P3）：带锚条目注入 as_of epoch——模型侧
             // 可分辨环境快照与永真事实（token 成本每条 ~6）；无锚（ts=0）省略
             let as_of = if record.timestamp > 0 {
                 format!(" (as_of:{})", record.timestamp)
@@ -4717,7 +4717,7 @@ impl MemoryManager {
             }
             match result.text {
                 Some(clean) if !clean.trim().is_empty() => {
-                    // G11(B-316):条目行过标题中和(key/value 含 '#' 行不再冒充分区)
+                    // G11:条目行过标题中和(key/value 含 '#' 行不再冒充分区)
                     lines.push(Self::neutralize_partition_headings(&format!(
                         "- {}{}: {}\n",
                         display_key, as_of, clean
@@ -6669,7 +6669,7 @@ mod tests {
         );
         assert!(
             prompt.contains("- stable.user.prefs (as_of:2): prefer concise answers"),
-            "user 域无需域标注但带 as_of 时效标注(B-411 P3): {prompt}"
+            "user 域无需域标注但带 as_of 时效标注(P3): {prompt}"
         );
         assert!(
             prompt.contains("[unclassified] stable.legacy"),
@@ -7267,7 +7267,7 @@ mod tests {
         );
     }
 
-    /// G11(B-316):分区条目标题行中和——条目 value 中以 '#' 开头的行
+    /// G11:分区条目标题行中和——条目 value 中以 '#' 开头的行
     /// 拼进 prompt 后会冒充下一个机制分区标题(行首锚定切分的伪造面)。
     /// 条目行进分区前统一中和('#' 开头的行前置空格),真分区标题不受影响。
     #[test]
@@ -7408,7 +7408,7 @@ mod tests {
         assert!(out.is_empty(), "墓碑必须抑制");
     }
 
-    /// D2-一期（B-369）：召回期变体聚簇——同首段异 path 变体仅存活 ranking
+    /// D2-一期（）：召回期变体聚簇——同首段异 path 变体仅存活 ranking
     /// 最高一条；被剔除条目退出注入（读侧 only）。
     #[test]
     fn test_dedupe_recall_variants_head_cluster() {
@@ -7817,7 +7817,7 @@ mod tests {
 
     #[test]
     fn test_latest_entries_superseded_projection_filter() {
-        // B-411 P1:最新版本 Superseded → 视图封装整条 path 抑制(append-only
+        //  P1:最新版本 Superseded → 视图封装整条 path 抑制(append-only
         // 原值永在账;recipe 关裁决也不复活);状态原语保持忠实(状态复检面如
         // flush_usage 墓碑防御须看见墓碑态);未标记生命态 → 视图正常存活
         let mk = |path: &str, ver: u64, val: serde_json::Value| {
@@ -7874,7 +7874,7 @@ mod tests {
 
     #[test]
     fn test_audit_recall_section_superseded_and_as_of() {
-        // B-411 P1/P3:渲染末闸 Superseded 滤网 + as_of 时效标注(无锚 ts=0 省略)
+        //  P1/P3:渲染末闸 Superseded 滤网 + as_of 时效标注(无锚 ts=0 省略)
         let mgr = MemoryManager::new("ns", make_test_client());
         let mut alive = MemoryRecord::new("stable.user.k", "正常事实", 1_700_000_000);
         alive.fact_id = Some(7);
@@ -7896,7 +7896,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_adjudication_dual_rule_single_adjudication() {
-        // B-411 P2:同对既极性又槽位值冲突 → 对并去重单裁决(不去重则同下标
+        //  P2:同对既极性又槽位值冲突 → 对并去重单裁决(不去重则同下标
         // 双重 remove 会 panic=本测试的隐式回归面)
         let mut mgr = MemoryManager::new("ns", make_test_client());
         let mut recipe = crate::agent::recipe::MemoryRecipe::default();
@@ -8878,7 +8878,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_flush_usage_skips_null_tombstoned_path() {
-        // o30:memory_tombstone 工具写 null 墓碑形态(latest 值=null,latest-wins
+        // :memory_tombstone 工具写 null 墓碑形态(latest 值=null,latest-wins
         // 语义下整条 path 视图抑制)——latest_entries_by_path 滤 null 形态,
         // 修复前守卫对该形态失明(回写复活 ghost);修复后经
         // latest_values_by_path 的 tombstoned 列补录守卫。
@@ -9052,7 +9052,7 @@ mod tests {
 
     #[test]
     fn recipe_fingerprint_asset_and_reload() {
-        // LM-2 资产化三面:指纹稳定/资产载荷含治理字段/热重载刷新+门控随动
+        //  资产化三面:指纹稳定/资产载荷含治理字段/热重载刷新+门控随动
         let mut mgr = MemoryManager::new("ns", make_test_client());
         assert!(mgr.recipe_fingerprint().is_none(), "无 Recipe=无指纹");
         let recipe = crate::agent::recipe::MemoryRecipe {

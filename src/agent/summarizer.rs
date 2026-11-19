@@ -170,7 +170,7 @@ pub struct ContextSummarizer {
 #[derive(Debug, Clone)]
 struct RollingCache {
     frozen_len: usize,
-    /// 四轮审计 G9(B-291):生成时 dropped 集合的内容指纹——命中判据从
+    /// 四轮审计 G9:生成时 dropped 集合的内容指纹——命中判据从
     /// "只比长度"升级为"长度+指纹",防内容变而长度巧合相等时复用陈旧摘要。
     /// 回读种子面无原文,置空串(只可作增量基底,不可整段命中)。
     content_digest: String,
@@ -178,7 +178,7 @@ struct RollingCache {
     gen: u64,
 }
 
-/// 四轮审计 G9(B-291):dropped 集合内容指纹。
+/// 四轮审计 G9:dropped 集合内容指纹。
 fn dropped_fingerprint(dropped: &[Message]) -> String {
     let mut buf = String::with_capacity(1024);
     for m in dropped {
@@ -1705,7 +1705,7 @@ mod tests {
         assert_eq!(c.gen, 3);
     }
 
-    // ===== B-291 四轮审计缝缺陷红测(G9) =====
+    // =====  四轮审计缝缺陷红测(G9) =====
 
     /// G9: dropped 集合内容指纹——缓存命中判据从"只比长度"升级为
     /// "长度+指纹";内容变而长度巧合相等必须区分。

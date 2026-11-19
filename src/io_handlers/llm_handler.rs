@@ -120,7 +120,7 @@ fn stream_fallback_disabled_by_env(env_value: Option<String>) -> bool {
     env_value.as_deref() == Some("1")
 }
 
-/// 413 紧急裁剪（o19 治本面）：执行体体限拒绝时对请求体做有损裁剪后重试。
+/// 413 紧急裁剪（ 治本面）：执行体体限拒绝时对请求体做有损裁剪后重试。
 /// 策略=削内容峰值、不删消息条数（审计链完整性优先）：messages 内
 /// content/text 字符串超阈值截到首 8K+尾 2K 并插裁剪标记；有界轮次循环。
 pub(crate) fn emergency_trim_body(body: &mut serde_json::Value, target_bytes: usize) -> bool {
@@ -138,7 +138,7 @@ pub(crate) fn emergency_trim_body(body: &mut serde_json::Value, target_bytes: us
         let mut cut = false;
         if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
             for msg in msgs.iter_mut() {
-                // 四轮审计 G3(B-291):system role 豁免——system prompt 被
+                // 四轮审计 G3:system role 豁免——system prompt 被
                 // 砍头尾会破坏指令完整性与前缀缓存;仅削非 system 内容峰值。
                 // 代价:体限主因是 system 时裁剪失效(413 可能不可解),这是
                 // "削内容峰值、不删消息条数"纪律下的正确取舍。
@@ -754,357 +754,357 @@ impl LlmHandler {
         let script_params = params.clone();
 
         Box::pin(stream! {
-            // === 脚本式 mock(测试装置):按脚本次序吐错误或正常响应 ===
-            if let Some(script) = &mock_script {
-                // lock 收敛在同步块(guard 不跨 yield,保 stream Send)
-                let step = {
-                    let mut st = script.lock().unwrap();
-                    st.observed_params.push(script_params.clone());
-                    st.steps.pop_front()
-                };
-                match step {
-                    Some(Err(e)) => {
-                        yield Err::<StreamChunk, String>(e);
-                        return;
-                    }
-                    Some(Ok(content)) => {
-                        yield Ok(StreamChunk::Delta(content.clone()));
-                        yield Ok(StreamChunk::Done(LlmResponse {
-                            content,
-                            tool_calls: None,
-                            finish_reason: Some("stop".to_string()),
-                            token_usage: None,
-                        }));
-                        return;
-                    }
-                    None => {
-                        yield Err::<StreamChunk, String>("mock script exhausted".to_string());
-                        return;
-                    }
-                }
-            }
+                  // === 脚本式 mock(测试装置):按脚本次序吐错误或正常响应 ===
+                  if let Some(script) = &mock_script {
+                      // lock 收敛在同步块(guard 不跨 yield,保 stream Send)
+                      let step = {
+                          let mut st = script.lock().unwrap();
+                          st.observed_params.push(script_params.clone());
+                          st.steps.pop_front()
+                      };
+                      match step {
+                          Some(Err(e)) => {
+                              yield Err::<StreamChunk, String>(e);
+                              return;
+                          }
+                          Some(Ok(content)) => {
+                              yield Ok(StreamChunk::Delta(content.clone()));
+                              yield Ok(StreamChunk::Done(LlmResponse {
+                                  content,
+                                  tool_calls: None,
+                                  finish_reason: Some("stop".to_string()),
+                                  token_usage: None,
+                              }));
+                              return;
+                          }
+                          None => {
+                              yield Err::<StreamChunk, String>("mock script exhausted".to_string());
+                              return;
+                          }
+                      }
+                  }
 
-            // === Mock 短路 ===
-            if let Some(content) = &mock_content {
-                yield Ok(StreamChunk::Delta(content.clone()));
-                yield Ok(StreamChunk::Done(LlmResponse {
-                    content: content.clone(),
-                    tool_calls: None,
-                    finish_reason: Some("stop".to_string()),
-                    token_usage: None,
-                }));
-                return;
-            }
+                  // === Mock 短路 ===
+                  if let Some(content) = &mock_content {
+                      yield Ok(StreamChunk::Delta(content.clone()));
+                      yield Ok(StreamChunk::Done(LlmResponse {
+                          content: content.clone(),
+                          tool_calls: None,
+                          finish_reason: Some("stop".to_string()),
+                          token_usage: None,
+                      }));
+                      return;
+                  }
 
-            // === 构造请求体(加 stream: true——执行体按此走流式) ===
-            let mut body = match body_result {
-                Ok(b) => b,
-                Err(e) => {
-                    yield Err(e);
-                    return;
-                }
-            };
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert("stream".to_string(), serde_json::Value::Bool(true));
-            }
+                  // === 构造请求体(加 stream: true——执行体按此走流式) ===
+                  let mut body = match body_result {
+                      Ok(b) => b,
+                      Err(e) => {
+                          yield Err(e);
+                          return;
+                      }
+                  };
+                  if let Some(obj) = body.as_object_mut() {
+                      obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+                  }
 
-            // === HTTP 客户端(双超时;key 归边:仅携带执行体调用方令牌,
-            // provider 凭据不出执行体) ===
-            let client = reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(connect_secs))
-                .timeout(std::time::Duration::from_secs(request_secs))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new());
-            let build_request = |url: &str| {
-                let mut req = client.post(url).json(&body);
-                if let Some(tok) = &executor_token {
-                    req = req.header("Authorization", format!("Bearer {tok}"));
-                }
-                req
-            };
+                  // === HTTP 客户端(双超时;key 归边:仅携带执行体调用方令牌,
+                  // provider 凭据不出执行体) ===
+                  let client = reqwest::Client::builder()
+                      .connect_timeout(std::time::Duration::from_secs(connect_secs))
+                      .timeout(std::time::Duration::from_secs(request_secs))
+                      .build()
+                      .unwrap_or_else(|_| reqwest::Client::new());
+                  let build_request = |url: &str| {
+                      let mut req = client.post(url).json(&body);
+                      if let Some(tok) = &executor_token {
+                          req = req.header("Authorization", format!("Bearer {tok}"));
+                      }
+                      req
+                  };
 
-            // === 路径选择:env 显式停用 / 负缓存已记账 / URL 不可派生 → legacy ===
-            let stream_disabled = stream_disabled_by_env(std::env::var("EVORULE_LLM_STREAM_DISABLE").ok());
-            let fallback_disabled = stream_fallback_disabled_by_env(
-                std::env::var("EVORULE_LLM_STREAM_FALLBACK_DISABLE").ok(),
-            );
-            let stream_url = if stream_disabled {
-                None
-            } else {
-                stream_endpoint_of(&executor_url)
-                    .filter(|url| !stream_endpoint_missing(url))
-            };
+                  // === 路径选择:env 显式停用 / 负缓存已记账 / URL 不可派生 → legacy ===
+                  let stream_disabled = stream_disabled_by_env(std::env::var("EVORULE_LLM_STREAM_DISABLE").ok());
+                  let fallback_disabled = stream_fallback_disabled_by_env(
+                      std::env::var("EVORULE_LLM_STREAM_FALLBACK_DISABLE").ok(),
+                  );
+                  let stream_url = if stream_disabled {
+                      None
+                  } else {
+                      stream_endpoint_of(&executor_url)
+                          .filter(|url| !stream_endpoint_missing(url))
+                  };
 
-            // === 断链回落:流式路径传输类失败(未下行内容增量时)回落 legacy
-            // 整包重试一次。内容权威终态随 done 帧整体下行,重放不污染正文/
-            // 工具调用;思考增量允许重复(展示层为「重新生成」形态,持久化
-            // 留痕为部分+完整拼接)。业务类拒绝不回落(重试不会成功,保持
-            // fail-visible);内容增量已下行不回落(重放必然重复正文)。 ===
-            let mut streamed_content = false;
-            let mut fallback_reason: Option<String> = None;
-            // o19: 413 -> trim -> fallback to legacy with the trimmed body
-            let mut trim_fallback_body: Option<serde_json::Value> = None;
-            'stream_attempt: {
-                if let Some(stream_url) = stream_url {
-                    match build_request(&stream_url).send().await {
-                        Err(e) => {
-                            let msg = format!("LLM stream request failed: {}", e);
-                            if !fallback_disabled && is_transport_integrity_failure(&msg) {
-                                fallback_reason = Some(msg);
-                                break 'stream_attempt;
-                            }
-                            yield Err(msg);
-                            return;
-                        }
-                        // 端点不存在(旧执行体)→ 负缓存置位 + 回落 legacy(留痕可观测)
-                        Ok(resp)
-                            if matches!(
-                                resp.status(),
-                                reqwest::StatusCode::NOT_FOUND
-                                    | reqwest::StatusCode::METHOD_NOT_ALLOWED
-                            ) =>
-                        {
-                            mark_stream_endpoint_missing(&stream_url);
-                            info!(
-                                executor_url = %executor_url,
-                                status = %resp.status(),
-                                "执行体流式端点不可用,回落整包路径(负缓存记账,后续不再探测该端点)"
-                            );
-                        }
-                        Ok(resp) if resp.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE
-                            && !streamed_content =>
-                        {
-                            let mut trimmed = body.clone();
-                            if emergency_trim_body(&mut trimmed, 0) {
-                                trim_fallback_body = Some(trimmed);
-                                fallback_reason = Some(
-                                    "413 body limit: request trimmed, falling back to legacy"
-                                        .to_string(),
-                                );
-                                break 'stream_attempt;
-                            }
-                            let text = resp.text().await.unwrap_or_default();
-                            yield Err(format!(
-                                "LLM API error ({}): {}",
-                                reqwest::StatusCode::PAYLOAD_TOO_LARGE,
-                                text
-                            ));
-                            return;
-                        }
-                        Ok(resp) if !resp.status().is_success() => {
-                            let status = resp.status();
-                            let text = resp.text().await.unwrap_or_default();
-                            yield Err(format!("LLM API error ({}): {}", status, text));
-                            return;
-                        }
-                        Ok(resp) => {
-                            // === 真流式:bytes_stream 增量解析,逐帧下行(不经整包缓冲) ===
-                            // o10 根因修复:字节块经流式 UTF-8 安全解码器入缓冲——
-                            // 多字节字符跨网络块切分不再被 lossy 替换成 U+FFFD
-                            // (坏字①型根因封死);真损坏 fail-visible 走既有
-                            // fallback/报错链。
-                            let mut decoder = StreamTextDecoder::new();
-                            let mut buffer = String::new();
-                            let mut saw_reasoning = false;
-                            let mut saw_done = false;
-                            let mut sse = resp.bytes_stream();
-                            'frames: loop {
-                                // 先消费缓冲内完整帧(\n\n 切帧),再读下一字节块
-                                while let Some(pos) = buffer.find("\n\n") {
-                                    let frame: String = buffer.drain(..pos + 2).collect();
-                                    let (chunks, end) =
-                                        executor_sse_frame_outcome(&frame, &mut saw_reasoning, &mut saw_done);
-                                    for chunk in &chunks {
-                                        if matches!(
-                                            chunk,
-                                            StreamChunk::Delta(_) | StreamChunk::ToolCallDelta { .. }
-                                        ) {
-                                            streamed_content = true;
-                                        }
-                                    }
-                                    for chunk in chunks {
-                                        yield Ok(chunk);
-                                    }
-                                    match end {
-                                        FrameEnd::Continue => {}
-                                        FrameEnd::Stop => break 'frames,
-                                        FrameEnd::Fail(msg) => {
-                                            if !fallback_disabled
-                                                && !streamed_content
-                                                && is_transport_integrity_failure(&msg)
-                                            {
-                                                fallback_reason = Some(msg);
-                                                break 'stream_attempt;
-                                            }
-                                            yield Err(msg);
-                                            return;
-                                        }
-                                    }
-                                }
-                                match sse.next().await {
-                                    Some(Ok(chunk)) => match decoder.feed(&chunk) {
-                                        Ok(text) => buffer.push_str(&text),
-                                        Err(e) => {
-                                            let msg =
-                                                format!("LLM stream decode failed: {e}");
-                                            if !fallback_disabled && !streamed_content {
-                                                fallback_reason = Some(msg);
-                                                break 'stream_attempt;
-                                            }
-                                            yield Err(msg);
-                                            return;
-                                        }
-                                    },
-                                    Some(Err(e)) => {
-                                        let msg = format!("LLM stream read failed: {}", e);
-                                        if !fallback_disabled && !streamed_content {
-                                            fallback_reason = Some(msg);
-                                            break 'stream_attempt;
-                                        }
-                                        yield Err(msg);
-                                        return;
-                                    }
-                                    None => break 'frames,
-                                }
-                            }
-                            // 流收尾残留缓冲(末帧无尾随空行形态):与执行体切帧语义对齐
-                            let residual = std::mem::take(&mut buffer);
-                            if !residual.trim().is_empty() {
-                                let (chunks, end) = executor_sse_frame_outcome(
-                                    &residual,
-                                    &mut saw_reasoning,
-                                    &mut saw_done,
-                                );
-                                for chunk in &chunks {
-                                    if matches!(
-                                        chunk,
-                                        StreamChunk::Delta(_) | StreamChunk::ToolCallDelta { .. }
-                                    ) {
-                                        streamed_content = true;
-                                    }
-                                }
-                                for chunk in chunks {
-                                    yield Ok(chunk);
-                                }
-                                if let FrameEnd::Fail(msg) = end {
-                                    if !fallback_disabled
-                                        && !streamed_content
-                                        && is_transport_integrity_failure(&msg)
-                                    {
-                                        fallback_reason = Some(msg);
-                                        break 'stream_attempt;
-                                    }
-                                    yield Err(msg);
-                                    return;
-                                }
-                            }
-                            if !saw_done {
-                                let msg =
-                                    "执行体流式响应未含 done 终帧(连接提前关闭)".to_string();
-                                if !fallback_disabled && !streamed_content {
-                                    fallback_reason = Some(msg);
-                                    break 'stream_attempt;
-                                }
-                                yield Err(msg);
-                                return;
-                            }
-                            return;
-                        }
-                    }
-                }
-            }
-            if let Some(reason) = &fallback_reason {
-                warn!(
-                    reason = %reason,
-                    "执行体流式提前断链,回落整包路径重试(未下行内容增量,重放无重复)"
-                );
-            }
+                  // === 断链回落:流式路径传输类失败(未下行内容增量时)回落 legacy
+                  // 整包重试一次。内容权威终态随 done 帧整体下行,重放不污染正文/
+                  // 工具调用;思考增量允许重复(展示层为「重新生成」形态,持久化
+                  // 留痕为部分+完整拼接)。业务类拒绝不回落(重试不会成功,保持
+                  // fail-visible);内容增量已下行不回落(重放必然重复正文)。 ===
+                  let mut streamed_content = false;
+                  let mut fallback_reason: Option<String> = None;
+        // : 413 -> trim -> fallback to legacy with the trimmed body
+                  let mut trim_fallback_body: Option<serde_json::Value> = None;
+                  'stream_attempt: {
+                      if let Some(stream_url) = stream_url {
+                          match build_request(&stream_url).send().await {
+                              Err(e) => {
+                                  let msg = format!("LLM stream request failed: {}", e);
+                                  if !fallback_disabled && is_transport_integrity_failure(&msg) {
+                                      fallback_reason = Some(msg);
+                                      break 'stream_attempt;
+                                  }
+                                  yield Err(msg);
+                                  return;
+                              }
+                              // 端点不存在(旧执行体)→ 负缓存置位 + 回落 legacy(留痕可观测)
+                              Ok(resp)
+                                  if matches!(
+                                      resp.status(),
+                                      reqwest::StatusCode::NOT_FOUND
+                                          | reqwest::StatusCode::METHOD_NOT_ALLOWED
+                                  ) =>
+                              {
+                                  mark_stream_endpoint_missing(&stream_url);
+                                  info!(
+                                      executor_url = %executor_url,
+                                      status = %resp.status(),
+                                      "执行体流式端点不可用,回落整包路径(负缓存记账,后续不再探测该端点)"
+                                  );
+                              }
+                              Ok(resp) if resp.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+                                  && !streamed_content =>
+                              {
+                                  let mut trimmed = body.clone();
+                                  if emergency_trim_body(&mut trimmed, 0) {
+                                      trim_fallback_body = Some(trimmed);
+                                      fallback_reason = Some(
+                                          "413 body limit: request trimmed, falling back to legacy"
+                                              .to_string(),
+                                      );
+                                      break 'stream_attempt;
+                                  }
+                                  let text = resp.text().await.unwrap_or_default();
+                                  yield Err(format!(
+                                      "LLM API error ({}): {}",
+                                      reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+                                      text
+                                  ));
+                                  return;
+                              }
+                              Ok(resp) if !resp.status().is_success() => {
+                                  let status = resp.status();
+                                  let text = resp.text().await.unwrap_or_default();
+                                  yield Err(format!("LLM API error ({}): {}", status, text));
+                                  return;
+                              }
+                              Ok(resp) => {
+                                  // === 真流式:bytes_stream 增量解析,逐帧下行(不经整包缓冲) ===
+        //  根因修复:字节块经流式 UTF-8 安全解码器入缓冲——
+                                  // 多字节字符跨网络块切分不再被 lossy 替换成 U+FFFD
+                                  // (坏字①型根因封死);真损坏 fail-visible 走既有
+                                  // fallback/报错链。
+                                  let mut decoder = StreamTextDecoder::new();
+                                  let mut buffer = String::new();
+                                  let mut saw_reasoning = false;
+                                  let mut saw_done = false;
+                                  let mut sse = resp.bytes_stream();
+                                  'frames: loop {
+                                      // 先消费缓冲内完整帧(\n\n 切帧),再读下一字节块
+                                      while let Some(pos) = buffer.find("\n\n") {
+                                          let frame: String = buffer.drain(..pos + 2).collect();
+                                          let (chunks, end) =
+                                              executor_sse_frame_outcome(&frame, &mut saw_reasoning, &mut saw_done);
+                                          for chunk in &chunks {
+                                              if matches!(
+                                                  chunk,
+                                                  StreamChunk::Delta(_) | StreamChunk::ToolCallDelta { .. }
+                                              ) {
+                                                  streamed_content = true;
+                                              }
+                                          }
+                                          for chunk in chunks {
+                                              yield Ok(chunk);
+                                          }
+                                          match end {
+                                              FrameEnd::Continue => {}
+                                              FrameEnd::Stop => break 'frames,
+                                              FrameEnd::Fail(msg) => {
+                                                  if !fallback_disabled
+                                                      && !streamed_content
+                                                      && is_transport_integrity_failure(&msg)
+                                                  {
+                                                      fallback_reason = Some(msg);
+                                                      break 'stream_attempt;
+                                                  }
+                                                  yield Err(msg);
+                                                  return;
+                                              }
+                                          }
+                                      }
+                                      match sse.next().await {
+                                          Some(Ok(chunk)) => match decoder.feed(&chunk) {
+                                              Ok(text) => buffer.push_str(&text),
+                                              Err(e) => {
+                                                  let msg =
+                                                      format!("LLM stream decode failed: {e}");
+                                                  if !fallback_disabled && !streamed_content {
+                                                      fallback_reason = Some(msg);
+                                                      break 'stream_attempt;
+                                                  }
+                                                  yield Err(msg);
+                                                  return;
+                                              }
+                                          },
+                                          Some(Err(e)) => {
+                                              let msg = format!("LLM stream read failed: {}", e);
+                                              if !fallback_disabled && !streamed_content {
+                                                  fallback_reason = Some(msg);
+                                                  break 'stream_attempt;
+                                              }
+                                              yield Err(msg);
+                                              return;
+                                          }
+                                          None => break 'frames,
+                                      }
+                                  }
+                                  // 流收尾残留缓冲(末帧无尾随空行形态):与执行体切帧语义对齐
+                                  let residual = std::mem::take(&mut buffer);
+                                  if !residual.trim().is_empty() {
+                                      let (chunks, end) = executor_sse_frame_outcome(
+                                          &residual,
+                                          &mut saw_reasoning,
+                                          &mut saw_done,
+                                      );
+                                      for chunk in &chunks {
+                                          if matches!(
+                                              chunk,
+                                              StreamChunk::Delta(_) | StreamChunk::ToolCallDelta { .. }
+                                          ) {
+                                              streamed_content = true;
+                                          }
+                                      }
+                                      for chunk in chunks {
+                                          yield Ok(chunk);
+                                      }
+                                      if let FrameEnd::Fail(msg) = end {
+                                          if !fallback_disabled
+                                              && !streamed_content
+                                              && is_transport_integrity_failure(&msg)
+                                          {
+                                              fallback_reason = Some(msg);
+                                              break 'stream_attempt;
+                                          }
+                                          yield Err(msg);
+                                          return;
+                                      }
+                                  }
+                                  if !saw_done {
+                                      let msg =
+                                          "执行体流式响应未含 done 终帧(连接提前关闭)".to_string();
+                                      if !fallback_disabled && !streamed_content {
+                                          fallback_reason = Some(msg);
+                                          break 'stream_attempt;
+                                      }
+                                      yield Err(msg);
+                                      return;
+                                  }
+                                  return;
+                              }
+                          }
+                      }
+                  }
+                  if let Some(reason) = &fallback_reason {
+                      warn!(
+                          reason = %reason,
+                          "执行体流式提前断链,回落整包路径重试(未下行内容增量,重放无重复)"
+                      );
+                  }
 
-            // o19: the 413-trim fallback body flows into the legacy path here
-            let build_request = |url: &str| {
-                let payload = trim_fallback_body.as_ref().unwrap_or(&body);
-                let mut req = client.post(url).json(payload);
-                if let Some(tok) = &executor_token {
-                    req = req.header("Authorization", format!("Bearer {tok}"));
-                }
-                req
-            };
+        // : the 413-trim fallback body flows into the legacy path here
+                  let build_request = |url: &str| {
+                      let payload = trim_fallback_body.as_ref().unwrap_or(&body);
+                      let mut req = client.post(url).json(payload);
+                      if let Some(tok) = &executor_token {
+                          req = req.header("Authorization", format!("Bearer {tok}"));
+                      }
+                      req
+                  };
 
-            // === legacy 整包路径(执行体聚合结果,四/五键 JSON) ===
-            let mut resp = match build_request(&executor_url).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    yield Err(format!("LLM stream request failed: {}", e));
-                    return;
-                }
-            };
-            if resp.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
-                let mut trimmed = body.clone();
-                if emergency_trim_body(&mut trimmed, 0) {
-                    warn!("executor 413: request body trimmed, retrying once");
-                    let mut req = client.post(&executor_url).json(&trimmed);
-                    if let Some(tok) = &executor_token {
-                        req = req.header("Authorization", format!("Bearer {tok}"));
-                    }
-                    resp = match req.send().await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            yield Err(format!("LLM stream request failed: {}", e));
-                            return;
-                        }
-                    };
-                }
-            }
+                  // === legacy 整包路径(执行体聚合结果,四/五键 JSON) ===
+                  let mut resp = match build_request(&executor_url).send().await {
+                      Ok(r) => r,
+                      Err(e) => {
+                          yield Err(format!("LLM stream request failed: {}", e));
+                          return;
+                      }
+                  };
+                  if resp.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+                      let mut trimmed = body.clone();
+                      if emergency_trim_body(&mut trimmed, 0) {
+                          warn!("executor 413: request body trimmed, retrying once");
+                          let mut req = client.post(&executor_url).json(&trimmed);
+                          if let Some(tok) = &executor_token {
+                              req = req.header("Authorization", format!("Bearer {tok}"));
+                          }
+                          resp = match req.send().await {
+                              Ok(r) => r,
+                              Err(e) => {
+                                  yield Err(format!("LLM stream request failed: {}", e));
+                                  return;
+                              }
+                          };
+                      }
+                  }
 
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                yield Err(format!("LLM API error ({}): {}", status, text));
-                return;
-            }
+                  if !resp.status().is_success() {
+                      let status = resp.status();
+                      let text = resp.text().await.unwrap_or_default();
+                      yield Err(format!("LLM API error ({}): {}", status, text));
+                      return;
+                  }
 
-            let json: serde_json::Value = match resp.json().await {
-                Ok(v) => v,
-                Err(e) => {
-                    yield Err(format!("LLM API response parse error: {}", e));
-                    return;
-                }
-            };
-            let normalized = match normalize_executor_response(json) {
-                Ok(v) => v,
-                Err(e) => {
-                    yield Err(e);
-                    return;
-                }
-            };
+                  let json: serde_json::Value = match resp.json().await {
+                      Ok(v) => v,
+                      Err(e) => {
+                          yield Err(format!("LLM API response parse error: {}", e));
+                          return;
+                      }
+                  };
+                  let normalized = match normalize_executor_response(json) {
+                      Ok(v) => v,
+                      Err(e) => {
+                          yield Err(e);
+                          return;
+                      }
+                  };
 
-            // === 整包合成:ThinkingDelta(思考非空,整块) →
-            // Delta(content 非空) → Done ===
-            let reasoning = normalized
-                .get("reasoning")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !reasoning.is_empty() {
-                yield Ok(StreamChunk::ThinkingDelta(reasoning));
-            }
-            let content = normalized
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !content.is_empty() {
-                yield Ok(StreamChunk::Delta(content.clone()));
-            }
-            let llm_response: LlmResponse = serde_json::from_value(normalized)
-                .unwrap_or_else(|_| LlmResponse {
-                    content,
-                    tool_calls: None,
-                    finish_reason: Some("stop".to_string()),
-                    token_usage: None,
-                });
-            yield Ok(StreamChunk::Done(llm_response));
-        })
+                  // === 整包合成:ThinkingDelta(思考非空,整块) →
+                  // Delta(content 非空) → Done ===
+                  let reasoning = normalized
+                      .get("reasoning")
+                      .and_then(|v| v.as_str())
+                      .unwrap_or("")
+                      .to_string();
+                  if !reasoning.is_empty() {
+                      yield Ok(StreamChunk::ThinkingDelta(reasoning));
+                  }
+                  let content = normalized
+                      .get("content")
+                      .and_then(|v| v.as_str())
+                      .unwrap_or("")
+                      .to_string();
+                  if !content.is_empty() {
+                      yield Ok(StreamChunk::Delta(content.clone()));
+                  }
+                  let llm_response: LlmResponse = serde_json::from_value(normalized)
+                      .unwrap_or_else(|_| LlmResponse {
+                          content,
+                          tool_calls: None,
+                          finish_reason: Some("stop".to_string()),
+                          token_usage: None,
+                      });
+                  yield Ok(StreamChunk::Done(llm_response));
+              })
     }
 }
 
@@ -1367,7 +1367,7 @@ fn to_openai_wire_messages(messages: serde_json::Value) -> serde_json::Value {
         };
         let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
         let mut converted = obj.clone();
-        // 四轮审计 G7(B-291):孤儿 tool 消息弃发标记(见 "tool" 臂)
+        // 四轮审计 G7:孤儿 tool 消息弃发标记(见 "tool" 臂)
         let mut skip = false;
         match role {
             "assistant" => {
@@ -1422,7 +1422,7 @@ fn to_openai_wire_messages(messages: serde_json::Value) -> serde_json::Value {
                             converted.remove("tool_name");
                         }
                         None => {
-                            // 四轮审计 G7(B-291):孤儿 tool 消息——无同名待配
+                            // 四轮审计 G7:孤儿 tool 消息——无同名待配
                             // 对 tool_calls。合成 call_{name} 静默上行必 400
                             // (tool 消息必须跟随对应 tool_calls),且同名牌孤
                             // 儿必撞 id。fail-visible:丢弃+warn 留痕,请求
@@ -1637,7 +1637,7 @@ impl IoHandler for LlmHandler {
                 Ok(resp) => {
                     let status = resp.status();
                     let error_text = resp.text().await.unwrap_or_default();
-                    // o19 治本面：413=体限拒绝 → 紧急裁剪请求体（削内容峰值不删
+                    //  治本面：413=体限拒绝 → 紧急裁剪请求体（削内容峰值不删
                     // 条数）→ 单次重试；仍 413 则 fail-visible（裁剪标记随重试
                     // 请求如实上行，审计可辨）。
                     if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
@@ -1868,7 +1868,7 @@ mod tests {
         assert_eq!(arr[2]["tool_call_id"], "call_x");
     }
 
-    /// 出站转换:tool 消息无前置 assistant tool_call 可配对时——B-291 G7
+    /// 出站转换:tool 消息无前置 assistant tool_call 可配对时—— G7
     /// 修正后不再合成 call_{tool_name} 静默上行(上游 400:tool 消息必须
     /// 跟随对应 tool_calls),改丢弃+warn 留痕(账面原文仍在)。
     #[test]
@@ -1939,7 +1939,7 @@ mod tests {
     /// 非 images 键形态不触碰
     #[test]
     fn test_wire_messages_images_empty_keeps_string_content() {
-        // B-291 G7 修正后配对前置:tool 消息必须有同名待配对 tool_calls 才
+        //  G7 修正后配对前置:tool 消息必须有同名待配对 tool_calls 才
         // 上行(原测钉了孤儿合成 id 的缺陷旧行为,补 assistant 前驱保测意)。
         let messages = serde_json::json!([
             {"role": "assistant", "tool_calls": [
@@ -3109,7 +3109,7 @@ mod sse_frame_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
-    /// o14 流式覆盖增强：executor_sse_frame_outcome 纯函数面边界锁。
+    ///  流式覆盖增强：executor_sse_frame_outcome 纯函数面边界锁。
     /// 覆盖八分支（content/reasoning/tool_call_delta/done/error/未知类型/
     /// [DONE] 哨兵/坏 JSON）+ 多行 join/空帧/安全网补发三边界。
     fn frame(data: &str) -> String {
@@ -3312,7 +3312,7 @@ mod config_max_tokens_tests {
         );
     }
 
-    // ========== o19 治本面：413 紧急裁剪 ==========
+    // ==========  治本面：413 紧急裁剪 ==========
 
     #[test]
     fn test_emergency_trim_body_cuts_large_content_and_keeps_count() {
@@ -3450,7 +3450,7 @@ mod config_max_tokens_tests {
         println!("trim returned {}", trimmed);
     }
 
-    // ===== B-291 四轮审计缝缺陷红测(G3/G7) =====
+    // =====  四轮审计缝缺陷红测(G3/G7) =====
 
     /// G3: system role 豁免紧急裁剪——system prompt 被字节级砍头尾会破坏
     /// 指令完整性与前缀缓存;大 system + 大 user 同场,只准裁 user。

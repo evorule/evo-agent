@@ -468,7 +468,7 @@ impl ToolFunction for ReadBackTool {
         let is_stale = !writes_after.is_empty();
 
         // 2. 现势内容：从盘上重读（workdir 沙箱校验，与 file_read 同口径；
-        //    10MB 上限同 file_read）。o108 修复：workdir 相对解析失败时回退
+        //  10MB 上限同 file_read）。 修复：workdir 相对解析失败时回退
         //    按 writable_dir（默认 workspace/）相对再解析一次——写面工具把
         //    相对路径落在 writable_dir 下，read_back 必须感知同一约定。
         let (content, content_bytes, note) = match &self.deps.workdir {

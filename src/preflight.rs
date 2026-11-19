@@ -27,7 +27,7 @@
 //!    缺席时受信内部通道(sediment→stable.llm)回落 user 身份,server 开
 //!    鉴权则受保护域写入被 403 拒、降级 cache-only。姿态检查零网络动作,
 //!    实际成败计数看运行面 `GET /admin/memory-health`)
-//! ⑨ 摘要两源一致性(Full;B-359,L-2 案 a):最近 session 的压缩视图摘要块
+//! ⑨ 摘要两源一致性(Full;,L-2 案 a):最近 session 的压缩视图摘要块
 //!    现算 evorule_digest vs rolling_summary.content_digest 比对——不一致
 //!    Fail(fail-visible,不自动修复);占位块/缺源 Warn/Pass(非 mismatch)。
 //!    三源中的 region_summary_cache 源构造性同源豁免(种子自 view 恢复,

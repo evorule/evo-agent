@@ -153,7 +153,7 @@ impl PolicyReviewInvoker for AuditedReviewInvoker {
         // temperature=0 保证评审最大确定性；messages 形状与 core_eval 规则
         // 引用的 instruction.params.messages 契约一致。model 键必带（服务端
         // call_external 规则要求 instruction.params.model，缺失即 TCB 拒、
-        // 评审静默降级人工——o31 实录真因）。
+        // 评审静默降级人工—— 实录真因）。
         let params = serde_json::json!({
             "model": self.audited.review_model(),
             "messages": [

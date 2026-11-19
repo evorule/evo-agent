@@ -260,7 +260,7 @@ pub(crate) fn extract_criteria(raw: &str) -> String {
 mod tests {
     use super::*;
 
-    // ===== 验收命令整体预算与引号保真(o85) =====
+    // ===== 验收命令整体预算与引号保真 =====
 
     #[cfg(windows)]
     const HUNG_ACCEPTANCE_CMD: &str = "ping -n 120 127.0.0.1 >nul";

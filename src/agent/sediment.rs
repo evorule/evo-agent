@@ -152,7 +152,7 @@ pub struct SedimentResult {
     /// 仅本地 cache 的稳定事实 key 列表（持久化失败 CacheOnly，
     /// 不计入 stable_facts 防虚报成功；由 B3 对账补偿）
     pub stable_facts_cache_only: Vec<String>,
-    /// 写前归并冲突标记（D2-二期，B-370）：复用既有 path 但值不同的
+    /// 写前归并冲突标记（D2-二期）：复用既有 path 但值不同的
     /// (语义首段, 归一属性) 列表——同极性值不自动 supersede（多位置部署
     /// 两值可同真），落账进治理观察面
     pub merge_conflicts: Vec<String>,
@@ -224,7 +224,7 @@ fn tool_claim_rejected(key: &str, value: &str, registry: &[String]) -> bool {
     !registry_lower.iter().any(|t| value_lower.contains(t))
 }
 
-/// 属性词规范化（D2-二期，B-370）：从 fact.key 尾段提取归一属性词。
+/// 属性词规范化（D2-二期）：从 fact.key 尾段提取归一属性词。
 ///
 /// - 剥修饰前缀（true_/real_/current_/effective_/actual_，单遍）；
 /// - 单复数归一（仅复数→单数方向，len>3 防误伤）；
@@ -283,7 +283,7 @@ fn value_shape(v: &str) -> u8 {
     }
 }
 
-/// 写前归并裁决（D2-二期，B-370）：新事实 (fact_key, value) 对齐既有活跃
+/// 写前归并裁决（D2-二期）：新事实 (fact_key, value) 对齐既有活跃
 /// 事实——同语义首段 + 同归一属性 + 值形态相似 → 复用既有 path 新版本
 /// 覆写（同 path 裁定链自动生效）；值不同 → conflict 标记（不自动
 /// supersede）；任一条件不齐 → 新键原样写。
@@ -382,7 +382,7 @@ pub async fn sediment(
 
                 // 3. 稳定事实 → 共享空间（B5：写入 llm 域 `stable.llm.{model}.*`，
                 //    与用户/系统域隔离；source 由系统填充为 llm:{raw_model}）
-                // D2-二期（B-370）：写前归并查询——每批一次全前缀拉活跃事实
+                // D2-二期（）：写前归并查询——每批一次全前缀拉活跃事实
                 // （LexStore 缓存≈零网络；失败降级为不归并，行为=既有路径）。
                 // 门控=Recipe.retrieval.normalize_attributes（缺省关=既有行为
                 // 零影响）。
@@ -439,7 +439,7 @@ pub async fn sediment(
                         );
                         continue;
                     }
-                    // D2-二期（B-370）：写前归并裁决——命中即复用既有 path
+                    // D2-二期（）：写前归并裁决——命中即复用既有 path
                     // （新版本覆写走同 path 版本谱系，supersession 链跨模型
                     // 自然贯通）；同极性值差异 → conflict 标记落账（不自动
                     // supersede）；未命中/门控关 → 新键原样写（既有行为）。
@@ -2097,7 +2097,7 @@ async fn rollup_old_summaries(
 #[cfg(test)]
 mod tests {
 
-    /// D2-二期（B-370）：属性词规范化黄金样本——等价对 + 负例。
+    /// D2-二期（）：属性词规范化黄金样本——等价对 + 负例。
     #[test]
     fn test_normalize_attribute_golden_samples() {
         // 修饰前缀剥离
@@ -2127,7 +2127,7 @@ mod tests {
         assert_eq!(normalize_attribute("capability_summary"), None);
     }
 
-    /// D2-二期（B-370）：写前归并裁决——同 head+同归一属性+同值形态 →
+    /// D2-二期（）：写前归并裁决——同 head+同归一属性+同值形态 →
     /// 复用既有 path；值不同 → conflict；不齐 → New。
     #[test]
     fn test_merge_target_reuse_conflict_new() {

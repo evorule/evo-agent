@@ -703,7 +703,7 @@ mod tests {
     #[test]
     fn gov_session_state_file_roundtrip_and_corruption() {
         let tmp = std::env::temp_dir().join(format!(
-            "o482-el-{}",
+            "-el-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -733,7 +733,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_mcp_gov_session_fail_soft_with_dead_client() {
         let tmp = std::env::temp_dir().join(format!(
-            "o482-el-{}",
+            "-el-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())

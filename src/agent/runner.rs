@@ -243,7 +243,7 @@ fn build_tool_result_reference(
          digest: {digest}\n\
          path: {rel_path}\n\
          head:\n{head}\n...[head/tail elided {} chars]...\ntail:\n{tail}\n\
-         (G4/B-307:完整结果已落盘,本消息只含首尾片段——省略的 {} 字符不在上下文中,不取回即永久不可见。需要更多内容时调用 tool_result_fetch 工具,按 ref_id 与 chars 分页读取全部原文。)",
+  (G4/:完整结果已落盘,本消息只含首尾片段——省略的 {} 字符不在上下文中,不取回即永久不可见。需要更多内容时调用 tool_result_fetch 工具,按 ref_id 与 chars 分页读取全部原文。)",
         raw.len(),
         total_chars.saturating_sub(TOOL_RESULT_REF_HEAD_CHARS + TOOL_RESULT_REF_TAIL_CHARS),
         total_chars.saturating_sub(TOOL_RESULT_REF_HEAD_CHARS + TOOL_RESULT_REF_TAIL_CHARS)
@@ -1345,7 +1345,7 @@ fn context_signal_line(used: usize, budget: usize, window: usize, step: usize) -
     ))
 }
 
-/// G10/五轮裁定批(B-307):窗口信号行注入——发送视图末尾独立 User 提示行
+/// G10/五轮裁定批:窗口信号行注入——发送视图末尾独立 User 提示行
 /// (裁定 A 案;消息形态先例=steering `[steering note]` 同族)。信号是每轮
 /// 变化的瞬态内容,只动发送视图不进权威历史(与 H1 现注入面同纪律);
 /// 首条 System 从此字节级不受信号行影响——长会话最依赖前缀缓存时的
@@ -2359,7 +2359,7 @@ impl AgentRunner {
         self
     }
 
-    /// Recipe 热重载（LM-2 可热重载属性;运行体重解析+指纹审计）:
+    /// Recipe 热重载（ 可热重载属性;运行体重解析+指纹审计）:
     /// 重解析→memory.set_recipe→sediment 门控随新 Recipe 刷新;新指纹随
     /// 下一轮 effective_params 落链（回放可锚定）。
     pub fn reload_memory_recipe(&mut self, recipe_json: &str) -> Result<(String, String), String> {
@@ -2381,7 +2381,7 @@ impl AgentRunner {
         Ok((version, hash))
     }
 
-    /// Recipe 资产提案（LM-2 治理层接入:经治理写通路把当前 Recipe 作为
+    /// Recipe 资产提案（ 治理层接入:经治理写通路把当前 Recipe 作为
     /// KnowledgeEntry 入 evorule-rule 数据集——可版本/可审批/可包交换;
     /// offline/无 Recipe/无 dataset 如实报错,不静默）
     pub async fn propose_memory_recipe_asset(
@@ -2537,7 +2537,7 @@ impl AgentRunner {
         self.max_context_tokens = max_tokens;
     }
 
-    /// B-426 审计修复:WS/serve 路径补 assembly+降级链穿线(from_definition
+    ///  审计修复:WS/serve 路径补 assembly+降级链穿线(from_definition
     /// 同口径)——①AssemblyExecutor 沿 def.assembly 配方替换缺省执行器
     /// ②降级三件(stale/mech/fold)+tool_result_max_tokens 沿配方接线
     /// 此前 construct_runner 从不触碰这些字段,WS 会话的降级链全无效
@@ -2786,7 +2786,7 @@ impl AgentRunner {
         let Ok(raw) = std::fs::read_to_string(&canon) else {
             return serde_json::json!({"error": "ref unreadable", "ref_id": ref_id});
         };
-        // 四轮审计 G15(B-285):内容寻址 ref(stale-/mech- 前缀)的后缀即
+        // 四轮审计 G15:内容寻址 ref(stale-/mech- 前缀)的后缀即
         // 落盘时的原文指纹——取回必须复验;不一致=offload 文件被篡改/损坏,
         // fail-visible 拒绝,不得静默返回被改内容。出站 call-id 形 ref 不
         // 承载指纹契约,照旧放行(digest 仅作对账元数据返回)。
@@ -2915,7 +2915,7 @@ impl AgentRunner {
         out
     }
 
-    /// 陈旧机制消息发送视图降级(γ 批 B-268;β 同构接线形态):发送视图变换
+    /// 陈旧机制消息发送视图降级(γ 批;β 同构接线形态):发送视图变换
     /// ——权威历史不动,原文落盘 tool_results(mech- 前缀 ref_id)供
     /// tool_result_fetch 取回,禁写 journal。目录不可用/写失败 = fail-soft
     /// 原样返回(降级无收益也不损失上下文)。
@@ -3068,7 +3068,7 @@ impl AgentRunner {
         // C1:沉淀配置(总是构造,sediment_session 在 memory 为 None 时是 no-op)
         // C3/C4:从 MemoryConfig 读取 max_session_summaries/max_injected_events/
         //        summary_rollup_threshold/enable_event_extraction
-        // B-426 审计修复(P1-5):SedimentConfig 构造前移——先建基础配置,后由
+        //  审计修复(P1-5):SedimentConfig 构造前移——先建基础配置,后由
         // Recipe 穿线覆写(原顺序=Recipe 值先设,后被全量替换覆写=丢失)
         self.sediment_config = sediment::SedimentConfig {
             namespace: def.memory.namespace.clone(),
@@ -3368,7 +3368,7 @@ impl AgentRunner {
                 scan.summary_empty,
             );
         }
-        // 五轮裁定批 G8/G2(B-303):trim 丢弃面 offload("被裁内容必须可查
+        // 五轮裁定批 G8/G2:trim 丢弃面 offload("被裁内容必须可查
         // 可重建"全链闭合件)。落盘 {journal_dir}/tool_results/{trim-*.txt},
         // 与 stale-/mech- 同族内容寻址;fetch 侧 trim- 前缀 digest 复验同批。
         let trimmed_block = (|| {
@@ -3381,7 +3381,7 @@ impl AgentRunner {
         })();
         let Some(formatted) = summary_text else {
             tracing::debug!(%session_id, "R3: summary skipped (below threshold or empty)");
-            // 五轮裁定批 G8/G2(B-303):below-threshold/空摘要时 trim 丢弃面
+            // 五轮裁定批 G8/G2:below-threshold/空摘要时 trim 丢弃面
             // 引用块补位——hint 从"知道丢了但拿不回"升级为"可取回"。
             // 落盘 fail-soft:失败=维持 hint 现状,不阻塞主流程。
             if let Some(block) = &trimmed_block {
@@ -3423,7 +3423,7 @@ impl AgentRunner {
                 }
             }
         }
-        // 四轮审计 G13(B-285):摘要回填前按当前窗口预算收顶。trim 只为
+        // 四轮审计 G13:摘要回填前按当前窗口预算收顶。trim 只为
         // hint 预留 15 token,摘要不限长回填会把刚 fit 的发送视图重新撑爆。
         // base_view=摘除 hint 槽位后的视图;context_window 不在场(缺省)
         // 则不收顶(行为不变)。role 迁移(摘要降 User/机制消息)留后续批,
@@ -3450,7 +3450,7 @@ impl AgentRunner {
         for msg in trim_messages {
             if let Message::System { content } = msg {
                 if content.starts_with("[earlier") {
-                    // G8/B-303:摘要之后附 offload 引用块尾巴——摘要不覆盖
+                    // G8/:摘要之后附 offload 引用块尾巴——摘要不覆盖
                     // dropped 原文可取回入口(摘要+原文取回双通道)。尾巴
                     // ~250B 在 trim 预算 buffer(5%)余量内。
                     *content = match &trimmed_block {
@@ -4195,7 +4195,7 @@ impl AgentRunner {
         // 会话治理包坑账注入段与 serve 构造期治理段合并入同一槽位
         // (两者皆 None=槽位 None=与现行为逐字节一致)
         let governance_slot = self.governance_segment_with_pit();
-        // γ 批 B-268:动态区外移分叉(配方 mechanism_messages 开启时,记忆分区/
+        // γ 批 :动态区外移分叉(配方 mechanism_messages 开启时,记忆分区/
         // Handoff Base/todo 渲染进独立机制消息,静态区跨轮字节级稳定;关闭态
         // 机制消息 None,system_prompt 与现行为逐字节一致)
         let (system_prompt, mechanism_message) = self
@@ -4360,7 +4360,7 @@ impl AgentRunner {
             )
             .await?;
         }
-        // γ 批 B-268:机制消息推送+持久化(机制消息为 System role;idx 口径与
+        // γ 批 :机制消息推送+持久化(机制消息为 System role;idx 口径与
         // user_idx 同族 = 推送前 messages.len()+persist_idx_delta。关闭态
         // 机制消息 None = 零行为变化)
         if let Some(mechanism) = mechanism_message {
@@ -5769,7 +5769,7 @@ impl AgentRunner {
             "assembly_recipe_version": recipe_version,
             "assembly_recipe_hash": recipe_hash,
         });
-        // LM-2 资产化:MemoryRecipe 指纹随首轮落链(有 Recipe 时)——回放可
+        //  资产化:MemoryRecipe 指纹随首轮落链(有 Recipe 时)——回放可
         // 锚定实际生效的记忆策略版本
         if let Some((m_version, m_hash)) = self.memory.as_ref().and_then(|m| m.recipe_fingerprint())
         {
@@ -5926,7 +5926,7 @@ impl AgentRunner {
             )
         };
 
-        // H1(自主交接设计)+G10(B-307):窗口余量信号行——每轮请求前按当前发送
+        // H1(自主交接设计)+G10:窗口余量信号行——每轮请求前按当前发送
         // 集计数,使用率>70% 才注入(以下静默);注入形态=发送视图末尾独立
         // User 提示行(裁定 A 案,见 push_context_signal 注记)。
         if let Some(ctx) = &self.context_window {
@@ -8469,3449 +8469,3449 @@ impl AgentRunner {
         frame_buffer: std::sync::Arc<crate::agent::self_audit::SelfAuditFrameBuffer>,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>> {
         Box::pin(stream! {
-                           let mut runner = self;
-                           let start_time = std::time::Instant::now();
-                       let wall_clock_budget_secs = runner.config.wall_clock_budget_secs;
+                                 let mut runner = self;
+                                 let start_time = std::time::Instant::now();
+                             let wall_clock_budget_secs = runner.config.wall_clock_budget_secs;
 
-                           // 1. 构造 system_prompt(与 run() 同源:组装执行器单一出口)
-                           // B3: 召回前按节流间隔校验 cache 与真相源漂移（server wins 对齐）
-                           if let Some(mem) = runner.memory.as_mut() {
-                               let drift = mem.verify_cache_if_due().await;
-                               if drift > 0 {
-                                   if let Some(m) = &runner.metrics {
-                                       m.inc_memory_cache_drift(drift as u64);
-                                   }
-                               }
-                           }
+                                 // 1. 构造 system_prompt(与 run() 同源:组装执行器单一出口)
+                                 // B3: 召回前按节流间隔校验 cache 与真相源漂移（server wins 对齐）
+                                 if let Some(mem) = runner.memory.as_mut() {
+                                     let drift = mem.verify_cache_if_due().await;
+                                     if drift > 0 {
+                                         if let Some(m) = &runner.metrics {
+                                             m.inc_memory_cache_drift(drift as u64);
+                                         }
+                                     }
+                                 }
 
-                           // C2: 召回顺序修复 —— recall 在组装之前
-                           // 会话治理包接线同步：antidote 校验随记忆预算裁剪生效
-                           // （幂等；未装载=零操作）
-                           if let (Some(mem), Some(pack)) =
-                               (runner.memory.as_mut(), runner.governance.clone())
-                           {
-                               mem.set_governance_if_absent(pack);
-                           }
-                           let mut recall = match runner.memory.as_ref() {
-                               Some(mem) => mem.recall_context(
-                                   &goal,
-                                   runner.sediment_config.max_session_summaries,
-                                   runner.sediment_config.max_injected_events,
-                               ).await,
-                               None => crate::agent::memory::RecallContext::default(),
-                           };
-                           // 笔记强制回喂 R-1 消费点:上一轮 R-2 触发闩在位=failure 教训/
-                           // 催写行注入本轮 S3(消费即复位;无记忆面时闩复位不回喂)
-                           if runner.pending_note_feed {
-                               runner.pending_note_feed = false;
-                               if let Some(mem) = runner.memory.as_ref() {
-                                   recall.note_feed = mem.build_failure_feed(&goal, 3).await;
-                               }
-                           }
-                           // 检索质量观测批(K-11 观测级)+ P2-1 LexStore 缓存三计数器:
-                           // 此处只计算暂存,落账延迟到 turn_guard 建立之后——本块执行时
-                           // journal 写者尚未绑定(runner.active_journal 在下方 B21 journal
-                           // open 处才赋值)、session_id 亦未定,原就地落账两门控恒空,
-                           // 观测事件在 serve 流永不落账(2026-10-07 agent 面活体验收发现,
-                           // 587/829/839 journal 实证:turn_started 在场而两事件恒缺)。
-                           let recall_hits = Self::build_recall_set_hits(&recall);
-                           let lex_stats = runner
-                               .memory
-                               .as_ref()
-                               .and_then(|mem| mem.lex_cache_stats());
-                           // 元层先行批:组装执行器单一出口(run/流式两组装点收敛为同一段
-                           // 代码,双路径一致性由代码结构保证;槽位序/预算比例/分隔符由配方声明)
-                           let boundary_segment = runner
-                               .config
-                               .capability_boundary
-                               .as_ref()
-                               .map(|b| b.awareness_segment());
-                           // 治理知识契约段(S2b 槽位内容物;同 run() 组装点口径——定义声明
-                           // 驱动+runner 内拉取+fail-soft,双路径一致性由代码结构保证)
-                           let knowledge_segment = match runner.config.knowledge_datasets.as_deref() {
-                               Some(datasets) if !datasets.is_empty() => {
-                                   crate::api::serve_tools::build_knowledge_segment(
-                                       &runner.evorule_client,
-                                       datasets,
-                                   )
-                                   .await
-                               }
-                               _ => None,
-                           };
-                           // S2d 服务目录段(同 run() 组装点口径)
-                           let service_catalog_segment = if runner.session_coding_profile {
-                               runner.coding_repo_map_segment.clone()
-                           } else {
-                               crate::service_tools::render_service_catalog()
-                           };
-                           // 会话治理包坑账注入段与 serve 构造期治理段合并同一槽位
-                           // (两者皆 None=槽位 None=与现行为逐字节一致)
-                           let governance_slot = runner.governance_segment_with_pit();
-                           // γ 批 B-268:动态区外移分叉(同 run() 组装点口径——
-                           // 配方 mechanism_messages 开启时动态区渲染进独立机制
-                           // 消息;关闭态机制消息 None,system_prompt 逐字节现行为)
-                           let (system_prompt, mechanism_message) =
-                               match runner.assembly.assemble_split(AssemblyInputs {
-                                   base_prompt: &runner.config.system_prompt,
-                                   identity_segment: runner.config.identity_segment.as_deref(),
-                                   north_star: runner.config.north_star.as_deref(),
-                                   memory: runner.memory.as_ref(),
-                                   recall: &recall,
-                                   total_window: runner.max_context_tokens,
-                                   boundary_segment: boundary_segment.as_deref(),
-                                   skills: runner.config.skills.as_deref(),
-                                   skills_notice: runner.config.skills_notice.as_deref(),
-                                   handoff: runner.config.handoff.as_ref(),
-                                   governance_segment: governance_slot.as_deref(),
-                                   knowledge_segment: knowledge_segment.as_deref(),
-                                   // 项目记忆段(AGENTS.md 层级)入静态区槽位——
-                                   // 与 run() 路径同口径,跨轮前缀稳定
-                                   agents_md: runner.agents_md_segment.as_deref(),
-                                   // 批K 段4:S3c_todo 槽位内容物(每轮装配重建——
-                                   // 状态锚定不靠消息历史;None=静默跳过)
-                                   todo_summary: runner.todo_summary_segment().as_deref(),
-                                   service_catalog: service_catalog_segment.as_deref(),
-                               }) {
-                               Ok((p, m)) => (p, m),
-                               Err(e) => {
-                                   yield Err(AgentError::Internal(e));
-                                   return;
-                               }
-                           };
+                                 // C2: 召回顺序修复 —— recall 在组装之前
+                                 // 会话治理包接线同步：antidote 校验随记忆预算裁剪生效
+                                 // （幂等；未装载=零操作）
+                                 if let (Some(mem), Some(pack)) =
+                                     (runner.memory.as_mut(), runner.governance.clone())
+                                 {
+                                     mem.set_governance_if_absent(pack);
+                                 }
+                                 let mut recall = match runner.memory.as_ref() {
+                                     Some(mem) => mem.recall_context(
+                                         &goal,
+                                         runner.sediment_config.max_session_summaries,
+                                         runner.sediment_config.max_injected_events,
+                                     ).await,
+                                     None => crate::agent::memory::RecallContext::default(),
+                                 };
+                                 // 笔记强制回喂 R-1 消费点:上一轮 R-2 触发闩在位=failure 教训/
+                                 // 催写行注入本轮 S3(消费即复位;无记忆面时闩复位不回喂)
+                                 if runner.pending_note_feed {
+                                     runner.pending_note_feed = false;
+                                     if let Some(mem) = runner.memory.as_ref() {
+                                         recall.note_feed = mem.build_failure_feed(&goal, 3).await;
+                                     }
+                                 }
+                                 // 检索质量观测批(K-11 观测级)+ P2-1 LexStore 缓存三计数器:
+                                 // 此处只计算暂存,落账延迟到 turn_guard 建立之后——本块执行时
+                                 // journal 写者尚未绑定(runner.active_journal 在下方 B21 journal
+                                 // open 处才赋值)、session_id 亦未定,原就地落账两门控恒空,
+                                 // 观测事件在 serve 流永不落账(2026-10-07 agent 面活体验收发现,
+                                 // 587/829/839 journal 实证:turn_started 在场而两事件恒缺)。
+                                 let recall_hits = Self::build_recall_set_hits(&recall);
+                                 let lex_stats = runner
+                                     .memory
+                                     .as_ref()
+                                     .and_then(|mem| mem.lex_cache_stats());
+                                 // 元层先行批:组装执行器单一出口(run/流式两组装点收敛为同一段
+                                 // 代码,双路径一致性由代码结构保证;槽位序/预算比例/分隔符由配方声明)
+                                 let boundary_segment = runner
+                                     .config
+                                     .capability_boundary
+                                     .as_ref()
+                                     .map(|b| b.awareness_segment());
+                                 // 治理知识契约段(S2b 槽位内容物;同 run() 组装点口径——定义声明
+                                 // 驱动+runner 内拉取+fail-soft,双路径一致性由代码结构保证)
+                                 let knowledge_segment = match runner.config.knowledge_datasets.as_deref() {
+                                     Some(datasets) if !datasets.is_empty() => {
+                                         crate::api::serve_tools::build_knowledge_segment(
+                                             &runner.evorule_client,
+                                             datasets,
+                                         )
+                                         .await
+                                     }
+                                     _ => None,
+                                 };
+                                 // S2d 服务目录段(同 run() 组装点口径)
+                                 let service_catalog_segment = if runner.session_coding_profile {
+                                     runner.coding_repo_map_segment.clone()
+                                 } else {
+                                     crate::service_tools::render_service_catalog()
+                                 };
+                                 // 会话治理包坑账注入段与 serve 构造期治理段合并同一槽位
+                                 // (两者皆 None=槽位 None=与现行为逐字节一致)
+                                 let governance_slot = runner.governance_segment_with_pit();
+        // γ 批 :动态区外移分叉(同 run 组装点口径——
+                                 // 配方 mechanism_messages 开启时动态区渲染进独立机制
+                                 // 消息;关闭态机制消息 None,system_prompt 逐字节现行为)
+                                 let (system_prompt, mechanism_message) =
+                                     match runner.assembly.assemble_split(AssemblyInputs {
+                                         base_prompt: &runner.config.system_prompt,
+                                         identity_segment: runner.config.identity_segment.as_deref(),
+                                         north_star: runner.config.north_star.as_deref(),
+                                         memory: runner.memory.as_ref(),
+                                         recall: &recall,
+                                         total_window: runner.max_context_tokens,
+                                         boundary_segment: boundary_segment.as_deref(),
+                                         skills: runner.config.skills.as_deref(),
+                                         skills_notice: runner.config.skills_notice.as_deref(),
+                                         handoff: runner.config.handoff.as_ref(),
+                                         governance_segment: governance_slot.as_deref(),
+                                         knowledge_segment: knowledge_segment.as_deref(),
+                                         // 项目记忆段(AGENTS.md 层级)入静态区槽位——
+                                         // 与 run() 路径同口径,跨轮前缀稳定
+                                         agents_md: runner.agents_md_segment.as_deref(),
+                                         // 批K 段4:S3c_todo 槽位内容物(每轮装配重建——
+                                         // 状态锚定不靠消息历史;None=静默跳过)
+                                         todo_summary: runner.todo_summary_segment().as_deref(),
+                                         service_catalog: service_catalog_segment.as_deref(),
+                                     }) {
+                                     Ok((p, m)) => (p, m),
+                                     Err(e) => {
+                                         yield Err(AgentError::Internal(e));
+                                         return;
+                                     }
+                                 };
 
-                           // 2. session:新建 或 复用(G15:continuation)
-                           let session_id = if let Some(id) = existing_session_id.clone() {
-                               // G15:continuation — 复用已有 session,不创建新 session
-                               // (session_active 守卫在下方统一创建,避免双重计数)
-                               runner.session_id = Some(id.clone());
-                               runner.sync_accounting_journal();
-                               info!(%id, "G15: continuing existing session");
-                               id
-                           } else {
-                               // 建会话前 IO 形状契约协商——同 run() 路径口径:
-                               // 404/连不通=旧 server warn 通过;版本不匹配=hard fail。
-                               // client clone 进闭包达 'static(共享 reqwest 连接池)。
-                               let io_client = runner.evorule_client.clone();
-                               if let Err(e) = crate::api::io_contract::negotiate_io_contract(move || {
-                                   Box::pin(async move { io_client.fetch_io_contract().await })
-                               })
-                               .await
-                               {
-                                   warn!(error = %e, "io-contract negotiation failed before session creation");
-                                   yield Err(AgentError::EvoruleError(format!(
-                                       "io-contract negotiation failed: {e}"
-                                   )));
-                                   return;
-                               }
-                               // 新建 session(原 run_streaming 逻辑)
-                               // M5-a:边界声明经 initial_content 既有载体进会话事实
-                               let boundary_json = runner.config.capability_boundary.as_ref().map(|b| b.to_json());
-                               match runner
-                                   .evorule_client
-                                   .create_session(boundary_json.as_ref(), Some("llm"))
-                                   .await
-                               {
-                                   Ok(id) => {
-                                       // 伴生缺陷修复:新建分支回填 runner.session_id
-                                       // (裁决通道已不依赖它,但审计一致性/messages 持久化
-                                       // 等消费方需要;与 continuation 分支对齐)
-                                       runner.session_id = Some(id.clone());
-                                       runner.sync_accounting_journal();
-                                       id
-                                   }
-                                   Err(e) => {
-                                       warn!(error = %e, "create_session failed in streaming path");
-                                       yield Err(AgentError::EvoruleError(e.to_string()));
-                                       return;
-                                   }
-                               }
-                           };
+                                 // 2. session:新建 或 复用(G15:continuation)
+                                 let session_id = if let Some(id) = existing_session_id.clone() {
+                                     // G15:continuation — 复用已有 session,不创建新 session
+                                     // (session_active 守卫在下方统一创建,避免双重计数)
+                                     runner.session_id = Some(id.clone());
+                                     runner.sync_accounting_journal();
+                                     info!(%id, "G15: continuing existing session");
+                                     id
+                                 } else {
+                                     // 建会话前 IO 形状契约协商——同 run() 路径口径:
+                                     // 404/连不通=旧 server warn 通过;版本不匹配=hard fail。
+                                     // client clone 进闭包达 'static(共享 reqwest 连接池)。
+                                     let io_client = runner.evorule_client.clone();
+                                     if let Err(e) = crate::api::io_contract::negotiate_io_contract(move || {
+                                         Box::pin(async move { io_client.fetch_io_contract().await })
+                                     })
+                                     .await
+                                     {
+                                         warn!(error = %e, "io-contract negotiation failed before session creation");
+                                         yield Err(AgentError::EvoruleError(format!(
+                                             "io-contract negotiation failed: {e}"
+                                         )));
+                                         return;
+                                     }
+                                     // 新建 session(原 run_streaming 逻辑)
+                                     // M5-a:边界声明经 initial_content 既有载体进会话事实
+                                     let boundary_json = runner.config.capability_boundary.as_ref().map(|b| b.to_json());
+                                     match runner
+                                         .evorule_client
+                                         .create_session(boundary_json.as_ref(), Some("llm"))
+                                         .await
+                                     {
+                                         Ok(id) => {
+                                             // 伴生缺陷修复:新建分支回填 runner.session_id
+                                             // (裁决通道已不依赖它,但审计一致性/messages 持久化
+                                             // 等消费方需要;与 continuation 分支对齐)
+                                             runner.session_id = Some(id.clone());
+                                             runner.sync_accounting_journal();
+                                             id
+                                         }
+                                         Err(e) => {
+                                             warn!(error = %e, "create_session failed in streaming path");
+                                             yield Err(AgentError::EvoruleError(e.to_string()));
+                                             return;
+                                         }
+                                     }
+                                 };
 
-                           // B2:健康声明拉取一次（协商+建会话后，fail-soft；与 run() 同钩位）
-                           runner.log_session_invariants_best_effort(&session_id).await;
-                           // 修复(2026-09-29 实测):MemoryManager.session_id 同步(与 run() 对齐),
-                           // sediment Shared 域写入依赖此绑定。
-                           if let Some(mem) = runner.memory.as_mut() {
-                               mem.set_session_id(&session_id);
-                           }
-                           // G14+B22 E2E 实测补齐:MemoryEventStore 与事件轨道 session_id
-                           // 同步(与 run() 同钩位)——serve 流面此前缺席,证据链写入
-                           // SessionNotSet、轨道 shared 面双写全败(warn 留痕实证)。
-                           if let Some(store) = runner.memory_event_store.as_mut() {
-                               store.set_session_id(&session_id);
-                               // best-effort 从 evorule 同步已有事件(HTTP 失败不阻塞)
-                               if let Err(e) = store.sync_from_evorule().await {
-                                   tracing::warn!(session_id = %session_id, error = %e, "sync_from_evorule failed; memory event store may be incomplete");
-                               }
-                           }
-                           if let Some(ledger) = &runner.event_ledger {
-                               ledger.set_session_id(&session_id).await;
-                           }
-                           // A2-2:memory_propose 会话锚绑定(与 run() 对齐;G15 continuation
-                           // 复用会话分支同样绑定,保证锚与 session 事实一致)
-                           runner.bind_propose_anchor(&session_id);
-                           // 双通道笔记批:note_write 会话期注册(与 run() 同钩位)
-                           runner.register_session_scoped_memory_tools(&session_id);
-                           // 跨源批 D:技能双层注册同步(与 run() 同钩位;Recipe
-                           // sources.skills_index 门控缺省关=no-op;best-effort 不阻塞会话)
-                           if runner.config.skills.is_some() {
-                               if let Some(mem) = runner.memory.as_mut() {
-                                   let empty_manifest = Vec::new();
-                                   let manifest = runner.config.skills.as_ref().unwrap_or(&empty_manifest);
-                                   let stats =
-                                       crate::agent::skills_mirror::sync_skills_mirror(mem, manifest).await;
-                                   if !stats.skipped {
-                                       info!(
-                                           written = stats.metadata_written,
-                                           tombstoned = stats.tombstoned,
-                                           sections = stats.body_sections,
-                                           degraded = stats.degraded,
-                                           "skills mirror synced"
-                                       );
-                                   }
-                               }
-                           }
+                                 // B2:健康声明拉取一次（协商+建会话后，fail-soft；与 run() 同钩位）
+                                 runner.log_session_invariants_best_effort(&session_id).await;
+                                 // 修复(2026-09-29 实测):MemoryManager.session_id 同步(与 run() 对齐),
+                                 // sediment Shared 域写入依赖此绑定。
+                                 if let Some(mem) = runner.memory.as_mut() {
+                                     mem.set_session_id(&session_id);
+                                 }
+                                 // G14+B22 E2E 实测补齐:MemoryEventStore 与事件轨道 session_id
+                                 // 同步(与 run() 同钩位)——serve 流面此前缺席,证据链写入
+                                 // SessionNotSet、轨道 shared 面双写全败(warn 留痕实证)。
+                                 if let Some(store) = runner.memory_event_store.as_mut() {
+                                     store.set_session_id(&session_id);
+                                     // best-effort 从 evorule 同步已有事件(HTTP 失败不阻塞)
+                                     if let Err(e) = store.sync_from_evorule().await {
+                                         tracing::warn!(session_id = %session_id, error = %e, "sync_from_evorule failed; memory event store may be incomplete");
+                                     }
+                                 }
+                                 if let Some(ledger) = &runner.event_ledger {
+                                     ledger.set_session_id(&session_id).await;
+                                 }
+                                 // A2-2:memory_propose 会话锚绑定(与 run() 对齐;G15 continuation
+                                 // 复用会话分支同样绑定,保证锚与 session 事实一致)
+                                 runner.bind_propose_anchor(&session_id);
+                                 // 双通道笔记批:note_write 会话期注册(与 run() 同钩位)
+                                 runner.register_session_scoped_memory_tools(&session_id);
+                                 // 跨源批 D:技能双层注册同步(与 run() 同钩位;Recipe
+                                 // sources.skills_index 门控缺省关=no-op;best-effort 不阻塞会话)
+                                 if runner.config.skills.is_some() {
+                                     if let Some(mem) = runner.memory.as_mut() {
+                                         let empty_manifest = Vec::new();
+                                         let manifest = runner.config.skills.as_ref().unwrap_or(&empty_manifest);
+                                         let stats =
+                                             crate::agent::skills_mirror::sync_skills_mirror(mem, manifest).await;
+                                         if !stats.skipped {
+                                             info!(
+                                                 written = stats.metadata_written,
+                                                 tombstoned = stats.tombstoned,
+                                                 sections = stats.body_sections,
+                                                 degraded = stats.degraded,
+                                                 "skills mirror synced"
+                                             );
+                                         }
+                                     }
+                                 }
 
-                           // B21 PR-1:journal 会话事件流(serve 注入 journal_dir 时启用)。
-                           // 打开失败 fail-soft 降级为无 journal 会话(warn 留痕,不阻塞主流程
-                           // ——与 metrics/tool_traces 同风格);读侧 seq 连续性校验 fail-visible。
-                           // B-172 分流:Fresh=新会话开新档(New 模式:撞号 fail-fast+身份锚);
-                           // Continuation/CrashResume=同会话续跑(Resume 模式:锚校验,旧档容忍)
-                           let journal: Option<std::sync::Arc<crate::agent::journal::JournalWriter>> =
-                               match &runner.journal_dir {
-                                   Some(dir) => {
-                                       let (mode, identity) = if recovery == RecoveryMode::Fresh {
-                                           (
-                                               crate::agent::journal::OpenMode::New,
-                                               crate::agent::journal::SessionIdentity {
-                                                   agent: Some("react".to_string()),
-                                                   model: Some(runner.config.model.clone()),
-                                                   temperature: Some(runner.config.temperature as f64),
-                                               },
-                                           )
-                                       } else {
-                                           (
-                                               crate::agent::journal::OpenMode::Resume,
-                                               crate::agent::journal::SessionIdentity::default(),
-                                           )
-                                       };
-                                       match crate::agent::journal::JournalWriter::open_with_mode(
-                                           dir, &session_id, mode, identity,
-                                       ) {
-                                           Ok(w) => Some(std::sync::Arc::new(w)),
-                                           // 同会话已有活跃写者=继续运行只会交错损坏账面,
-                                           // 此特定错误 fail-fast 上浮(其余 IO 错误保持 fail-soft 降级)
-                                           Err(crate::agent::journal::JournalError::WriterActive(sid)) => {
-                                               yield Err(AgentError::Internal(format!(
-                                                   "session '{sid}' already has an active journal writer (并发双写防护;等先前运行收尾后再续跑)"
-                                               )));
-                                               return;
-                                           }
-                                           // B-172:撞号/锚失配 = 续写只会混账,与 WriterActive
-                                           // 同级 fail-fast 上浮(报错信息含处置指引)
-                                           Err(crate::agent::journal::JournalError::ForeignSession {
-                                               session_id: sid,
-                                               path,
-                                           }) => {
-                                               yield Err(AgentError::Internal(format!(
-                                                   "session '{sid}' journal foreign session guard tripped (ledger at {}): \
-                                                    new-run on existing non-empty ledger or identity mismatch - \
-                                                    同会话续跑请用 resume 入口,异会话请人工归档旧账后重试",
-                                                   path.display()
-                                               )));
-                                               return;
-                                           }
-                                       Err(e) => {
-                                           warn!(
-                                               %session_id,
-                                               error = %e,
-                                               "B21: journal open failed, session runs without journal"
-                                           );
-                                           None
-                                       }
-                                       }
-                                   },
-                                   None => None,
-                               };
-                           // 摘要保真对照(交付物 B):journal 写者克隆挂 runner(摘要替换时落账)
-                           runner.active_journal = journal.clone();
-                           // 启动期事实落账(with_startup_event 注入;先于首轮,
-                           // 回放面从账首即可见本次运行的启动期环境事实)
-                           if !runner.startup_events.is_empty() {
-                               if let Some(j) = &journal {
-                                   for ev in runner.startup_events.iter() {
-                                       if let Err(e) = j.write_event(ev.clone()) {
-                                           warn!(error = %e, "startup event journal write failed");
-                                       }
-                                   }
-                               }
-                           }
-                           // 自主交接 PR-H2/H3:handover 双工具+session_spawn 会话期重绑
-                           // (与 run() 同钩位补挂——此前流式路径漏挂,handover 工具在 serve
-                           // 流式会话恒 unwired;journal 在手后透传,派生/停链语义事件可落账)
-                           runner.register_session_scoped_handover_tools(&session_id, journal.clone());
-                           // Z-B109-E01 选项①:底座包驱动侧生成(定义未声明时查表补位,零 LLM)
-                           runner.derive_handoff_package().await;
-                           // 批K 段4:todo 族会话期重绑(journal 在手——G15 续跑
-                           // 回放最新 todo_updated 重建清单;写侧 todo_updated
-                           // 语义事件经 journal 落账)
-                           runner.register_session_scoped_todo_tools(journal.clone());
-                           // 崩溃恢复 server 侧预检:崩溃早于首轮落账的会话在 server 无状态
-                           // 文档(get_state 404)——无进展可保,显式指引重发,而非裸 404。
-                           // 预检在 journal 开立之后:崩溃标记已补写,拒绝恢复的会话以
-                           // crashed 态自我排除出扫尾列表(账面诚实)
-                           if recovery == RecoveryMode::CrashResume {
-                               if let Err(e) = runner.evorule_client.get_state(&session_id).await {
-                                   yield Err(AgentError::Internal(format!(
-                                       "crash recovery: no server-side state for session '{session_id}'                          (crash before first round persist) - nothing to recover, start a                          fresh run: {e}"
-                                   )));
-                                   return;
-                               }
-                           }
+                                 // B21 PR-1:journal 会话事件流(serve 注入 journal_dir 时启用)。
+                                 // 打开失败 fail-soft 降级为无 journal 会话(warn 留痕,不阻塞主流程
+                                 // ——与 metrics/tool_traces 同风格);读侧 seq 连续性校验 fail-visible。
+        //  分流:Fresh=新会话开新档(New 模式:撞号 fail-fast+身份锚);
+                                 // Continuation/CrashResume=同会话续跑(Resume 模式:锚校验,旧档容忍)
+                                 let journal: Option<std::sync::Arc<crate::agent::journal::JournalWriter>> =
+                                     match &runner.journal_dir {
+                                         Some(dir) => {
+                                             let (mode, identity) = if recovery == RecoveryMode::Fresh {
+                                                 (
+                                                     crate::agent::journal::OpenMode::New,
+                                                     crate::agent::journal::SessionIdentity {
+                                                         agent: Some("react".to_string()),
+                                                         model: Some(runner.config.model.clone()),
+                                                         temperature: Some(runner.config.temperature as f64),
+                                                     },
+                                                 )
+                                             } else {
+                                                 (
+                                                     crate::agent::journal::OpenMode::Resume,
+                                                     crate::agent::journal::SessionIdentity::default(),
+                                                 )
+                                             };
+                                             match crate::agent::journal::JournalWriter::open_with_mode(
+                                                 dir, &session_id, mode, identity,
+                                             ) {
+                                                 Ok(w) => Some(std::sync::Arc::new(w)),
+                                                 // 同会话已有活跃写者=继续运行只会交错损坏账面,
+                                                 // 此特定错误 fail-fast 上浮(其余 IO 错误保持 fail-soft 降级)
+                                                 Err(crate::agent::journal::JournalError::WriterActive(sid)) => {
+                                                     yield Err(AgentError::Internal(format!(
+                                                         "session '{sid}' already has an active journal writer (并发双写防护;等先前运行收尾后再续跑)"
+                                                     )));
+                                                     return;
+                                                 }
+        // :撞号/锚失配 = 续写只会混账,与 WriterActive
+                                                 // 同级 fail-fast 上浮(报错信息含处置指引)
+                                                 Err(crate::agent::journal::JournalError::ForeignSession {
+                                                     session_id: sid,
+                                                     path,
+                                                 }) => {
+                                                     yield Err(AgentError::Internal(format!(
+                                                         "session '{sid}' journal foreign session guard tripped (ledger at {}): \
+                                                          new-run on existing non-empty ledger or identity mismatch - \
+                                                          同会话续跑请用 resume 入口,异会话请人工归档旧账后重试",
+                                                         path.display()
+                                                     )));
+                                                     return;
+                                                 }
+                                             Err(e) => {
+                                                 warn!(
+                                                     %session_id,
+                                                     error = %e,
+                                                     "B21: journal open failed, session runs without journal"
+                                                 );
+                                                 None
+                                             }
+                                             }
+                                         },
+                                         None => None,
+                                     };
+                                 // 摘要保真对照(交付物 B):journal 写者克隆挂 runner(摘要替换时落账)
+                                 runner.active_journal = journal.clone();
+                                 // 启动期事实落账(with_startup_event 注入;先于首轮,
+                                 // 回放面从账首即可见本次运行的启动期环境事实)
+                                 if !runner.startup_events.is_empty() {
+                                     if let Some(j) = &journal {
+                                         for ev in runner.startup_events.iter() {
+                                             if let Err(e) = j.write_event(ev.clone()) {
+                                                 warn!(error = %e, "startup event journal write failed");
+                                             }
+                                         }
+                                     }
+                                 }
+                                 // 自主交接 PR-H2/H3:handover 双工具+session_spawn 会话期重绑
+                                 // (与 run() 同钩位补挂——此前流式路径漏挂,handover 工具在 serve
+                                 // 流式会话恒 unwired;journal 在手后透传,派生/停链语义事件可落账)
+                                 runner.register_session_scoped_handover_tools(&session_id, journal.clone());
+                                 // Z-B109-E01 选项①:底座包驱动侧生成(定义未声明时查表补位,零 LLM)
+                                 runner.derive_handoff_package().await;
+                                 // 批K 段4:todo 族会话期重绑(journal 在手——G15 续跑
+                                 // 回放最新 todo_updated 重建清单;写侧 todo_updated
+                                 // 语义事件经 journal 落账)
+                                 runner.register_session_scoped_todo_tools(journal.clone());
+                                 // 崩溃恢复 server 侧预检:崩溃早于首轮落账的会话在 server 无状态
+                                 // 文档(get_state 404)——无进展可保,显式指引重发,而非裸 404。
+                                 // 预检在 journal 开立之后:崩溃标记已补写,拒绝恢复的会话以
+                                 // crashed 态自我排除出扫尾列表(账面诚实)
+                                 if recovery == RecoveryMode::CrashResume {
+                                     if let Err(e) = runner.evorule_client.get_state(&session_id).await {
+                                         yield Err(AgentError::Internal(format!(
+                                             "crash recovery: no server-side state for session '{session_id}'                          (crash before first round persist) - nothing to recover, start a                          fresh run: {e}"
+                                         )));
+                                         return;
+                                     }
+                                 }
 
-                           // turn_started(轮顶;turn_seq 按 journal 内既有轮数递增,G15 续跑同文件续轮)。
-                           // turn_guard 保证所有终止路径(优雅显式 end / 异常 drop 补写 aborted)轮界闭合。
-                           let mut turn_guard = match &journal {
-                               Some(j) => match j.begin_turn(&goal) {
-                                   Ok(g) => Some(g),
-                                   Err(e) => {
-                                       warn!(%session_id, error = %e, "B21: turn_started journal failed");
-                                       None
-                                   }
-                               },
-                               None => None,
-                           };
-                           // B22-C T2:轮顶里程碑+配额重置(首轮/每 N 轮 checkpoint;
-                           // runner 自有轮计数——journal 缺席的 CLI 纯路径照常成立)
-                           runner.session_turns = runner.session_turns.saturating_add(1);
-                           if let Some(ledger) = &runner.event_ledger {
-                               // 配额丢账持久记账:上一轮超配额丢弃数随 journal
-                               // 落账(观测面;与工具结果 elided 落账同口径——
-                               // 丢弃不再只是进程内 warn)。取走即清零,随后
-                               // begin_turn 重置配额
-                               let elided = ledger.take_turn_elided().await;
-                               if elided > 0 {
-                                   if let Some(j) = &journal {
-                                       if let Err(e) = j.write_event(
-                                           crate::agent::journal::JournalEvent::ToolEventsElided {
-                                               turn: runner.session_turns.saturating_sub(1),
-                                               count: elided,
-                                               quota: crate::agent::event_ledger::DEFAULT_TURN_QUOTA,
-                                           },
-                                       ) {
-                                           warn!(
-                                               %session_id,
-                                               error = %e,
-                                               "tool events elided journal failed"
-                                           );
-                                       }
-                                   }
-                               }
-                               ledger.begin_turn(runner.session_turns).await;
-                           }
-                           // 自主交接 PR-H3:链熔断观察窗挂接(仅派生子会话携带 chain_watch
-                           // ——组件快照沿链注入,根会话恒 None 不观察)。守卫按轮新建,
-                           // ChainWatch 随守卫 move(窗口判定=journal turn_seq,窗口外轮
-                           // 关闭;链态生命周期=发起方请求内的 v1 口径见接线段注释)
-                           if let Some(g) = turn_guard.as_mut() {
-                               if let Some(w) = runner.chain_watch.take() {
-                                   g.attach_chain_watch(w);
-                               }
-                           }
+                                 // turn_started(轮顶;turn_seq 按 journal 内既有轮数递增,G15 续跑同文件续轮)。
+                                 // turn_guard 保证所有终止路径(优雅显式 end / 异常 drop 补写 aborted)轮界闭合。
+                                 let mut turn_guard = match &journal {
+                                     Some(j) => match j.begin_turn(&goal) {
+                                         Ok(g) => Some(g),
+                                         Err(e) => {
+                                             warn!(%session_id, error = %e, "B21: turn_started journal failed");
+                                             None
+                                         }
+                                     },
+                                     None => None,
+                                 };
+                                 // B22-C T2:轮顶里程碑+配额重置(首轮/每 N 轮 checkpoint;
+                                 // runner 自有轮计数——journal 缺席的 CLI 纯路径照常成立)
+                                 runner.session_turns = runner.session_turns.saturating_add(1);
+                                 if let Some(ledger) = &runner.event_ledger {
+                                     // 配额丢账持久记账:上一轮超配额丢弃数随 journal
+                                     // 落账(观测面;与工具结果 elided 落账同口径——
+                                     // 丢弃不再只是进程内 warn)。取走即清零,随后
+                                     // begin_turn 重置配额
+                                     let elided = ledger.take_turn_elided().await;
+                                     if elided > 0 {
+                                         if let Some(j) = &journal {
+                                             if let Err(e) = j.write_event(
+                                                 crate::agent::journal::JournalEvent::ToolEventsElided {
+                                                     turn: runner.session_turns.saturating_sub(1),
+                                                     count: elided,
+                                                     quota: crate::agent::event_ledger::DEFAULT_TURN_QUOTA,
+                                                 },
+                                             ) {
+                                                 warn!(
+                                                     %session_id,
+                                                     error = %e,
+                                                     "tool events elided journal failed"
+                                                 );
+                                             }
+                                         }
+                                     }
+                                     ledger.begin_turn(runner.session_turns).await;
+                                 }
+                                 // 自主交接 PR-H3:链熔断观察窗挂接(仅派生子会话携带 chain_watch
+                                 // ——组件快照沿链注入,根会话恒 None 不观察)。守卫按轮新建,
+                                 // ChainWatch 随守卫 move(窗口判定=journal turn_seq,窗口外轮
+                                 // 关闭;链态生命周期=发起方请求内的 v1 口径见接线段注释)
+                                 if let Some(g) = turn_guard.as_mut() {
+                                     if let Some(w) = runner.chain_watch.take() {
+                                         g.attach_chain_watch(w);
+                                     }
+                                 }
 
-                           // G4 判据生成(先写后锁):仅 Fresh(新建会话=任务开工)生成一次;
-                           // continuation/crash-resume 属任务中段,重生成=判据漂移违背锁定
-                           // 语义——不生成,改从会话 journal 恢复已锁判据(判据事件
-                           // G4 生成时已落账,恢复+复检后重新锁定)。失败 fail-visible:
-                           // 显式开启=要求判据必须存在,不静默降级(指引改配静态判据)。
-                           if recovery == RecoveryMode::Fresh {
-                               if let Err(e) = runner.generate_acceptance_criteria(&goal).await {
-                                   yield Err(e);
-                                   return;
-                               }
-                           } else if runner.acceptance_generation {
-                               if runner.acceptance_command.is_some() {
-                                   // 静态判据最优先:门禁照常执行,无需恢复
-                               } else {
-                                   match runner.journal_dir.as_ref() {
-                                       Some(dir) => {
-                                           match AgentRunner::recover_acceptance_criteria(
-                                               dir,
-                                               &session_id,
-                                           ) {
-                                               Ok(cmd) => {
-                                                   info!(
-                                                       %session_id,
-                                                       criteria = %cmd,
-                                                       "acceptance criteria recovered from journal and LOCKED (运行期不可改)"
-                                                   );
-                                                   runner.acceptance_command = Some(cmd);
-                                               }
-                                               Err(e) => {
-                                                   yield Err(AgentError::Internal(format!(
-                                                       "{e} (fail-visible: acceptance_generation is \
-                                                        on but generated criteria cannot be restored \
-                                                        for this continuation turn)"
-                                                   )));
-                                                   return;
-                                               }
-                                           }
-                                       }
-                                       None => {
-                                           yield Err(AgentError::Internal(format!(
-                                               "acceptance criteria recovery impossible: journal \
-                                                not enabled for session '{session_id}' (generated \
-                                                criteria are per-run in-memory); configure static \
-                                                acceptance_command for continuation runs"
-                                           )));
-                                           return;
-                                       }
-                                   }
-                               }
-                           }
+                                 // G4 判据生成(先写后锁):仅 Fresh(新建会话=任务开工)生成一次;
+                                 // continuation/crash-resume 属任务中段,重生成=判据漂移违背锁定
+                                 // 语义——不生成,改从会话 journal 恢复已锁判据(判据事件
+                                 // G4 生成时已落账,恢复+复检后重新锁定)。失败 fail-visible:
+                                 // 显式开启=要求判据必须存在,不静默降级(指引改配静态判据)。
+                                 if recovery == RecoveryMode::Fresh {
+                                     if let Err(e) = runner.generate_acceptance_criteria(&goal).await {
+                                         yield Err(e);
+                                         return;
+                                     }
+                                 } else if runner.acceptance_generation {
+                                     if runner.acceptance_command.is_some() {
+                                         // 静态判据最优先:门禁照常执行,无需恢复
+                                     } else {
+                                         match runner.journal_dir.as_ref() {
+                                             Some(dir) => {
+                                                 match AgentRunner::recover_acceptance_criteria(
+                                                     dir,
+                                                     &session_id,
+                                                 ) {
+                                                     Ok(cmd) => {
+                                                         info!(
+                                                             %session_id,
+                                                             criteria = %cmd,
+                                                             "acceptance criteria recovered from journal and LOCKED (运行期不可改)"
+                                                         );
+                                                         runner.acceptance_command = Some(cmd);
+                                                     }
+                                                     Err(e) => {
+                                                         yield Err(AgentError::Internal(format!(
+                                                             "{e} (fail-visible: acceptance_generation is \
+                                                              on but generated criteria cannot be restored \
+                                                              for this continuation turn)"
+                                                         )));
+                                                         return;
+                                                     }
+                                                 }
+                                             }
+                                             None => {
+                                                 yield Err(AgentError::Internal(format!(
+                                                     "acceptance criteria recovery impossible: journal \
+                                                      not enabled for session '{session_id}' (generated \
+                                                      criteria are per-run in-memory); configure static \
+                                                      acceptance_command for continuation runs"
+                                                 )));
+                                                 return;
+                                             }
+                                         }
+                                     }
+                                 }
 
-                           // K-11/P2-1 观测落账(延迟点;recall 块已暂存 recall_hits/lex_stats,
-                           // 此处 journal 与 session_id 均已在位)。journal 序:turn_started →
-                           // recall_set → lex_cache_stats。fail-soft 与其它 journal 写入同风格。
-                           if let Some(j) = &journal {
-                               let _ = j.recall_set(&session_id, recall_hits);
-                               if let Some((hit, expired, fetch)) = lex_stats {
-                                   let _ = j.lex_cache_stats(&session_id, hit, expired, fetch);
-                               }
-                           }
+                                 // K-11/P2-1 观测落账(延迟点;recall 块已暂存 recall_hits/lex_stats,
+                                 // 此处 journal 与 session_id 均已在位)。journal 序:turn_started →
+                                 // recall_set → lex_cache_stats。fail-soft 与其它 journal 写入同风格。
+                                 if let Some(j) = &journal {
+                                     let _ = j.recall_set(&session_id, recall_hits);
+                                     if let Some((hit, expired, fetch)) = lex_stats {
+                                         let _ = j.lex_cache_stats(&session_id, hit, expired, fetch);
+                                     }
+                                 }
 
-                           // B-1:逐轮 wire 留痕(挂点=本轮 wire 组装完成+轮顶事件之后、首个 LLM
-                           // 调用之前;F-903 重建演示以此为逐字节比对基准)。失败 fail-soft
-                           // (warn 留痕,不阻塞主流程——与其它 journal 写入同风格)
-                           if let Some(j) = &journal {
-                               let round = turn_guard.as_ref().map(|g| g.turn_seq()).unwrap_or(0);
-                               if let Err(e) = j.wire_rendered(round, &system_prompt) {
-                                   warn!(%session_id, error = %e, "wire_rendered journal failed");
-                               }
-                           }
+                                 // B-1:逐轮 wire 留痕(挂点=本轮 wire 组装完成+轮顶事件之后、首个 LLM
+                                 // 调用之前;F-903 重建演示以此为逐字节比对基准)。失败 fail-soft
+                                 // (warn 留痕,不阻塞主流程——与其它 journal 写入同风格)
+                                 if let Some(j) = &journal {
+                                     let round = turn_guard.as_ref().map(|g| g.turn_seq()).unwrap_or(0);
+                                     if let Err(e) = j.wire_rendered(round, &system_prompt) {
+                                         warn!(%session_id, error = %e, "wire_rendered journal failed");
+                                     }
+                                 }
 
-                           // C-3/F-905 I2 检查器:组装后 system 分区间冲突扫描——两级通路:
-                           // 第一级词法召回(确定性,零成本),第二级语义精判(sidecar 审计链
-                           // 内裁决,候选触发+会话内缓存+短超时,失败→uncertain 兜底);
-                           // verdict 为观测注释不进控制流。输出=报告落账(仅检出时),
-                           // 不阻断会话。失败 fail-soft(与其它 journal 写入同风格)
-                           if let Some(j) = &journal {
-                               let round = turn_guard.as_ref().map(|g| g.turn_seq()).unwrap_or(0);
-                               let mut tokens: Vec<String> = runner.config.tool_names.clone();
-                               if let Some(skills) = &runner.config.skills {
-                                   tokens.extend(skills.iter().map(|s| s.name.clone()));
-                               }
-                               // I2 词表数据化:definition.i2_lexicon 声明覆盖,缺省内建 v2 双语表
-                               let lexicon = runner
-                                   .config
-                                   .i2_lexicon
-                                   .clone()
-                                   .unwrap_or_default();
-                               // γ 批 B-268:I2 扫描扩为跨消息口径——机制消息与
-                               // system 按序拼接扫描(关闭态机制消息空 = 现行为)
-                               let mechanism_for_scan: Vec<String> =
-                                   mechanism_message.iter().cloned().collect();
-                               let mut conflicts = crate::agent::context_inspector::inspect_system_sections_with(
-                                   &system_prompt,
-                                   &mechanism_for_scan,
-                                   &tokens,
-                                   &lexicon,
-                               );
-                               if !conflicts.is_empty() && runner.semantic_i2_enabled {
-                                   // 第二级:sidecar 审计链内裁决(purpose=i2_semantic;每候选
-                                   // 每会话至多一次,缓存命中零调用)
-                                   let auditor = crate::agent::audited_llm::AuditedLlm::new(
-                                       runner.evorule_client.clone(),
-                                       runner.llm_handler.clone(),
-                                   )
-                                   .with_timeout_secs(
-                                       crate::agent::context_inspector::I2_SEMANTIC_TIMEOUT_SECS,
-                                   );
-                                   let model = runner.config.model.clone();
-                                   conflicts =
-                                       crate::agent::context_inspector::adjudicate_candidates(
-                                           conflicts,
-                                           &runner.i2_verdict_cache,
-                                           &model,
-                                           |rec| {
-                                               let params = crate::agent::context_inspector::
-                                                   build_adjudication_params(&model, rec);
-                                               let auditor = auditor.clone();
-                                               async move {
-                                                   let resp =
-                                                       auditor.execute(crate::agent::context_inspector::
-                                                           I2_SEMANTIC_PURPOSE, &params).await?;
-                                                   let content = resp
-                                                       .get("content")
-                                                       .and_then(|v| v.as_str())
-                                                       .unwrap_or_default()
-                                                       .to_string();
-                                                   let tokens = resp
-                                                       .get("token_usage")
-                                                       .and_then(|v| {
-                                                           serde_json::from_value::<
-                                                               crate::agent::translator::TokenUsage,
-                                                           >(v.clone())
-                                                           .ok()
-                                                       })
-                                                       .map(|t| crate::agent::journal::TokenRecord {
-                                                           prompt: t.prompt_tokens as u64,
-                                                           completion: t.completion_tokens as u64,
-                                                           total: t.total_tokens as u64,
-                                                           cached: t.cached_tokens.map(|v| v as u64),
-                                                       });
-                                                   Ok((content, tokens))
-                                               }
-                                           },
-                                           journal.as_deref(),
-                                       )
-                                       .await;
-                               }
-                               if !conflicts.is_empty() {
-                                   if let Err(e) = j.i2_scan_report(round, conflicts) {
-                                       warn!(%session_id, error = %e, "i2_scan_report journal failed");
-                                   }
-                               }
-                           }
+                                 // C-3/F-905 I2 检查器:组装后 system 分区间冲突扫描——两级通路:
+                                 // 第一级词法召回(确定性,零成本),第二级语义精判(sidecar 审计链
+                                 // 内裁决,候选触发+会话内缓存+短超时,失败→uncertain 兜底);
+                                 // verdict 为观测注释不进控制流。输出=报告落账(仅检出时),
+                                 // 不阻断会话。失败 fail-soft(与其它 journal 写入同风格)
+                                 if let Some(j) = &journal {
+                                     let round = turn_guard.as_ref().map(|g| g.turn_seq()).unwrap_or(0);
+                                     let mut tokens: Vec<String> = runner.config.tool_names.clone();
+                                     if let Some(skills) = &runner.config.skills {
+                                         tokens.extend(skills.iter().map(|s| s.name.clone()));
+                                     }
+                                     // I2 词表数据化:definition.i2_lexicon 声明覆盖,缺省内建 v2 双语表
+                                     let lexicon = runner
+                                         .config
+                                         .i2_lexicon
+                                         .clone()
+                                         .unwrap_or_default();
+        // γ 批 :I2 扫描扩为跨消息口径——机制消息与
+                                     // system 按序拼接扫描(关闭态机制消息空 = 现行为)
+                                     let mechanism_for_scan: Vec<String> =
+                                         mechanism_message.iter().cloned().collect();
+                                     let mut conflicts = crate::agent::context_inspector::inspect_system_sections_with(
+                                         &system_prompt,
+                                         &mechanism_for_scan,
+                                         &tokens,
+                                         &lexicon,
+                                     );
+                                     if !conflicts.is_empty() && runner.semantic_i2_enabled {
+                                         // 第二级:sidecar 审计链内裁决(purpose=i2_semantic;每候选
+                                         // 每会话至多一次,缓存命中零调用)
+                                         let auditor = crate::agent::audited_llm::AuditedLlm::new(
+                                             runner.evorule_client.clone(),
+                                             runner.llm_handler.clone(),
+                                         )
+                                         .with_timeout_secs(
+                                             crate::agent::context_inspector::I2_SEMANTIC_TIMEOUT_SECS,
+                                         );
+                                         let model = runner.config.model.clone();
+                                         conflicts =
+                                             crate::agent::context_inspector::adjudicate_candidates(
+                                                 conflicts,
+                                                 &runner.i2_verdict_cache,
+                                                 &model,
+                                                 |rec| {
+                                                     let params = crate::agent::context_inspector::
+                                                         build_adjudication_params(&model, rec);
+                                                     let auditor = auditor.clone();
+                                                     async move {
+                                                         let resp =
+                                                             auditor.execute(crate::agent::context_inspector::
+                                                                 I2_SEMANTIC_PURPOSE, &params).await?;
+                                                         let content = resp
+                                                             .get("content")
+                                                             .and_then(|v| v.as_str())
+                                                             .unwrap_or_default()
+                                                             .to_string();
+                                                         let tokens = resp
+                                                             .get("token_usage")
+                                                             .and_then(|v| {
+                                                                 serde_json::from_value::<
+                                                                     crate::agent::translator::TokenUsage,
+                                                                 >(v.clone())
+                                                                 .ok()
+                                                             })
+                                                             .map(|t| crate::agent::journal::TokenRecord {
+                                                                 prompt: t.prompt_tokens as u64,
+                                                                 completion: t.completion_tokens as u64,
+                                                                 total: t.total_tokens as u64,
+                                                                 cached: t.cached_tokens.map(|v| v as u64),
+                                                             });
+                                                         Ok((content, tokens))
+                                                     }
+                                                 },
+                                                 journal.as_deref(),
+                                             )
+                                             .await;
+                                     }
+                                     if !conflicts.is_empty() {
+                                         if let Err(e) = j.i2_scan_report(round, conflicts) {
+                                             warn!(%session_id, error = %e, "i2_scan_report journal failed");
+                                         }
+                                     }
+                                 }
 
-                           // G17:session 活跃度守卫(新建 / 复用均持有,stream! 块结束时 dec)
-                           let _session_guard = SessionActiveGuard::new(runner.metrics.clone());
+                                 // G17:session 活跃度守卫(新建 / 复用均持有,stream! 块结束时 dec)
+                                 let _session_guard = SessionActiveGuard::new(runner.metrics.clone());
 
-                           if existing_session_id.is_none() {
-                               // 新建 session 才计 sessions_total + yield SessionCreated + auto_recall
-                               if let Some(m) = &runner.metrics {
-                                   m.inc_sessions_total();
-                               }
-                               yield Ok(AgentEvent::SessionCreated {
-                                   session_id: session_id.clone(),
-                                   // memory_config 存在(from_definition 已装 MemoryManager)即视为启用
-                                   memory_enabled: runner.memory.is_some(),
-                                   // 宪法审查过审凭据(加载期已把关,违反定义不会到达此处)
-                                   constitution: Some(
-                                       crate::agent::definition::AgentDefinition::constitution_pass_mark(),
-                                   ),
-                                   // 运行元数据锚:同输入不同温度不可复现,跨批对比
-                                   // 必须按 model×temperature 分桶(观测面缺陷修复)
-                                   model: Some(runner.config.model.clone()),
-                                   temperature: Some(runner.config.temperature as f64),
-                               });
+                                 if existing_session_id.is_none() {
+                                     // 新建 session 才计 sessions_total + yield SessionCreated + auto_recall
+                                     if let Some(m) = &runner.metrics {
+                                         m.inc_sessions_total();
+                                     }
+                                     yield Ok(AgentEvent::SessionCreated {
+                                         session_id: session_id.clone(),
+                                         // memory_config 存在(from_definition 已装 MemoryManager)即视为启用
+                                         memory_enabled: runner.memory.is_some(),
+                                         // 宪法审查过审凭据(加载期已把关,违反定义不会到达此处)
+                                         constitution: Some(
+                                             crate::agent::definition::AgentDefinition::constitution_pass_mark(),
+                                         ),
+                                         // 运行元数据锚:同输入不同温度不可复现,跨批对比
+                                         // 必须按 model×temperature 分桶(观测面缺陷修复)
+                                         model: Some(runner.config.model.clone()),
+                                         temperature: Some(runner.config.temperature as f64),
+                                     });
 
-                               // 3. auto_recall(best-effort,不阻塞流)
-                               if let Err(e) = runner.auto_recall(&session_id).await {
-                                   tracing::warn!(session_id = %session_id, error = %e, "auto_recall failed; session continues without recalled facts");
-                               }
-                           }
+                                     // 3. auto_recall(best-effort,不阻塞流)
+                                     if let Err(e) = runner.auto_recall(&session_id).await {
+                                         tracing::warn!(session_id = %session_id, error = %e, "auto_recall failed; session continues without recalled facts");
+                                     }
+                                 }
 
-                           // 7(前移). 初始化消息历史(崩溃恢复的本地修复须先于订阅/
-                           // 解析——修复后的 messages 是重放轮 LLM 请求的内容)
-                           let mut report_recovery = DanglingRepairReport::default();
-                           let mut messages: Vec<Message> = Vec::new();
-                           let mut step_count = 0;
-                           let mut tool_calls: Vec<String> = Vec::new();
-                           // H1 护栏跨重启连续:崩溃恢复分支重放回填的回退预算余额
-                           // (None=非恢复路径或无从回填,按满额起算)
-                           let mut resume_rewind_remaining: Option<u32> = None;
+                                 // 7(前移). 初始化消息历史(崩溃恢复的本地修复须先于订阅/
+                                 // 解析——修复后的 messages 是重放轮 LLM 请求的内容)
+                                 let mut report_recovery = DanglingRepairReport::default();
+                                 let mut messages: Vec<Message> = Vec::new();
+                                 let mut step_count = 0;
+                                 let mut tool_calls: Vec<String> = Vec::new();
+                                 // H1 护栏跨重启连续:崩溃恢复分支重放回填的回退预算余额
+                                 // (None=非恢复路径或无从回填,按满额起算)
+                                 let mut resume_rewind_remaining: Option<u32> = None;
 
-                           if existing_session_id.is_some() {
-                               // G15:continuation — 从 evorule payload 加载历史消息(best-effort)
-                               match Self::load_messages_from_payload(&runner, &session_id).await {
-                                   Ok(loaded) if !loaded.is_empty() => {
-                                       let mut loaded = loaded;
-                                       sanitize_tool_pairing(&mut loaded);
-                                       info!(%session_id, loaded_count = loaded.len(), "G15: loaded historical messages");
-                                       messages = loaded;
-                                   }
-                                   Ok(_) => {
-                                       info!(%session_id, "G15: no historical messages found, starting fresh");
-                                   }
-                                   Err(e) => {
-                                       warn!(%session_id, error = %e, "G15: failed to load historical messages, starting fresh");
-                                   }
-                               }
+                                 if existing_session_id.is_some() {
+                                     // G15:continuation — 从 evorule payload 加载历史消息(best-effort)
+                                     match Self::load_messages_from_payload(&runner, &session_id).await {
+                                         Ok(loaded) if !loaded.is_empty() => {
+                                             let mut loaded = loaded;
+                                             sanitize_tool_pairing(&mut loaded);
+                                             info!(%session_id, loaded_count = loaded.len(), "G15: loaded historical messages");
+                                             messages = loaded;
+                                         }
+                                         Ok(_) => {
+                                             info!(%session_id, "G15: no historical messages found, starting fresh");
+                                         }
+                                         Err(e) => {
+                                             warn!(%session_id, error = %e, "G15: failed to load historical messages, starting fresh");
+                                         }
+                                     }
 
-                               if recovery == RecoveryMode::CrashResume {
-                                   // 崩溃恢复:历史缺失=无可恢复对象(显式失败);悬挂工具处置
-                                   // (L1 分类路由)+恢复标记发射(崩溃标记已随 journal 重开补写,
-                                   // 账面序列=崩溃标记→恢复标记)
-                                   if messages.is_empty() {
-                                       yield Err(AgentError::Internal(format!(
-                                           "crash recovery: session '{session_id}' has no recoverable history"
-                                       )));
-                                       return;
-                                   }
-                                   match runner
-                                       .repair_dangling_tail(&session_id, &mut messages, journal.as_deref())
-                                       .await
-                                   {
-                                       Ok(report) => {
-                                           report_recovery = report;
-                                           info!(
-                                               %session_id,
-                                               dangling = report.dangling,
-                                               reexecuted = report.reexecuted,
-                                               observed = report.observed,
-                                               "crash recovery: dangling tool tail repaired"
-                                           );
-                                           if let Some(j) = journal.as_ref() {
-                                               let replay_seq = j
-                                                   .read_lines()
-                                                   .map(|ls| ls.last().map(|l| l.seq).unwrap_or(0))
-                                                   .unwrap_or(0);
-                                               // H1 护栏跨重启连续:重放回填回退预算余额
-                                               // (替换旧 runaway_counters:reset 语义——护栏
-                                               // 计数不因进程边界清零,重启不可绕过护栏)
-                                               let rewind_remaining = j.replay_rewind_budget_remaining();
-                                               resume_rewind_remaining = Some(rewind_remaining);
-                                               if let Err(e) = j.session_resumed(
-                                                   replay_seq,
-                                                   vec![
-                                                       format!("messages:{}", messages.len()),
-                                                       format!(
-                                                           "dangling_tools:{} reexecuted:{} observed:{}",
-                                                           report.dangling, report.reexecuted, report.observed
-                                                       ),
-                                                       "pending_approvals:lost".to_string(),
-                                                       format!("rewind_budget:remaining={rewind_remaining}"),
-                                                   ],
-                                               ) {
-                                                   warn!(%session_id, error = %e, "crash recovery: resumed marker write failed");
-                                               }
-                                           }
-                                       }
-                                       Err(e) => {
-                                           yield Err(AgentError::Internal(format!(
-                                               "crash recovery: dangling tail repair failed: {e}"
-                                           )));
-                                           return;
-                                       }
-                                   }
-                               }
-                           }
+                                     if recovery == RecoveryMode::CrashResume {
+                                         // 崩溃恢复:历史缺失=无可恢复对象(显式失败);悬挂工具处置
+                                         // (L1 分类路由)+恢复标记发射(崩溃标记已随 journal 重开补写,
+                                         // 账面序列=崩溃标记→恢复标记)
+                                         if messages.is_empty() {
+                                             yield Err(AgentError::Internal(format!(
+                                                 "crash recovery: session '{session_id}' has no recoverable history"
+                                             )));
+                                             return;
+                                         }
+                                         match runner
+                                             .repair_dangling_tail(&session_id, &mut messages, journal.as_deref())
+                                             .await
+                                         {
+                                             Ok(report) => {
+                                                 report_recovery = report;
+                                                 info!(
+                                                     %session_id,
+                                                     dangling = report.dangling,
+                                                     reexecuted = report.reexecuted,
+                                                     observed = report.observed,
+                                                     "crash recovery: dangling tool tail repaired"
+                                                 );
+                                                 if let Some(j) = journal.as_ref() {
+                                                     let replay_seq = j
+                                                         .read_lines()
+                                                         .map(|ls| ls.last().map(|l| l.seq).unwrap_or(0))
+                                                         .unwrap_or(0);
+                                                     // H1 护栏跨重启连续:重放回填回退预算余额
+                                                     // (替换旧 runaway_counters:reset 语义——护栏
+                                                     // 计数不因进程边界清零,重启不可绕过护栏)
+                                                     let rewind_remaining = j.replay_rewind_budget_remaining();
+                                                     resume_rewind_remaining = Some(rewind_remaining);
+                                                     if let Err(e) = j.session_resumed(
+                                                         replay_seq,
+                                                         vec![
+                                                             format!("messages:{}", messages.len()),
+                                                             format!(
+                                                                 "dangling_tools:{} reexecuted:{} observed:{}",
+                                                                 report.dangling, report.reexecuted, report.observed
+                                                             ),
+                                                             "pending_approvals:lost".to_string(),
+                                                             format!("rewind_budget:remaining={rewind_remaining}"),
+                                                         ],
+                                                     ) {
+                                                         warn!(%session_id, error = %e, "crash recovery: resumed marker write failed");
+                                                     }
+                                                 }
+                                             }
+                                             Err(e) => {
+                                                 yield Err(AgentError::Internal(format!(
+                                                     "crash recovery: dangling tail repair failed: {e}"
+                                                 )));
+                                                 return;
+                                             }
+                                         }
+                                     }
+                                 }
 
-                           if messages.is_empty() {
-                               // 新 session 或历史加载失败 — 用 system_prompt 初始化
-                               if !system_prompt.is_empty() {
-                                   messages.push(Message::System { content: system_prompt.clone() });
-                                   if let Err(e) = runner
-                                       .persist_message(&session_id, 0, Message::System { content: system_prompt.clone() })
-                                       .await
-                                   {
-                                       yield Err(e);
-                                       return;
-                                   }
-                               }
-                               // γ 批 B-268:机制消息推送+持久化(机制消息为 System role;
-                               // 仅新 session 初始化时注入,continuation 不重注入——
-                               // 与 system 同口径;idx 口径 = 推送前 messages.len()+
-                               // persist_idx_delta,与 run() 路径同族)
-                               if let Some(mechanism) = mechanism_message {
-                                   let mech_idx = messages.len()
-                                       + runner
-                                           .persist_idx_delta
-                                           .load(std::sync::atomic::Ordering::Relaxed);
-                                   messages.push(Message::System { content: mechanism.clone() });
-                                   if let Err(e) = runner
-                                       .persist_message(&session_id, mech_idx, Message::System { content: mechanism })
-                                       .await
-                                   {
-                                       yield Err(e);
-                                       return;
-                                   }
-                               }
-                           }
-                           // 崩溃恢复不注入新 user 输入:悬挂处置完毕后 LLM 自然续完当前 turn
-                           if recovery != RecoveryMode::CrashResume {
-                               let user_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
-                               // S4-b:用户轮图片旁路提取(fail-soft;空 refs 零行为变化)
-                               // ——内容 JSON 化带指纹留痕,回喂旁路带 base64(仅发送面)
-                               let (turn_content, turn_images) = build_user_turn_images(
-                                   &goal,
-                                   &user_images,
-                                   std::path::Path::new("."),
-                                   std::path::Path::new(B1_IMAGES_DIR),
-                               );
-                               messages.push(Message::User {
-                                   content: turn_content.clone(),
-                                   images: turn_images,
-                               });
-                               // 持久化仅存指纹内容(旁路 base64 不进审计链,与 B1 同口径)
-                               if let Err(e) = runner
-                                   .persist_message(
-                                       &session_id,
-                                       user_idx,
-                                       Message::User { content: turn_content, images: Vec::new() },
-                                   )
-                                   .await
-                               {
-                                   yield Err(e);
-                                   return;
-                               }
-                           }
+                                 if messages.is_empty() {
+                                     // 新 session 或历史加载失败 — 用 system_prompt 初始化
+                                     if !system_prompt.is_empty() {
+                                         messages.push(Message::System { content: system_prompt.clone() });
+                                         if let Err(e) = runner
+                                             .persist_message(&session_id, 0, Message::System { content: system_prompt.clone() })
+                                             .await
+                                         {
+                                             yield Err(e);
+                                             return;
+                                         }
+                                     }
+        // γ 批 :机制消息推送+持久化(机制消息为 System role;
+                                     // 仅新 session 初始化时注入,continuation 不重注入——
+                                     // 与 system 同口径;idx 口径 = 推送前 messages.len()+
+                                     // persist_idx_delta,与 run() 路径同族)
+                                     if let Some(mechanism) = mechanism_message {
+                                         let mech_idx = messages.len()
+                                             + runner
+                                                 .persist_idx_delta
+                                                 .load(std::sync::atomic::Ordering::Relaxed);
+                                         messages.push(Message::System { content: mechanism.clone() });
+                                         if let Err(e) = runner
+                                             .persist_message(&session_id, mech_idx, Message::System { content: mechanism })
+                                             .await
+                                         {
+                                             yield Err(e);
+                                             return;
+                                         }
+                                     }
+                                 }
+                                 // 崩溃恢复不注入新 user 输入:悬挂处置完毕后 LLM 自然续完当前 turn
+                                 if recovery != RecoveryMode::CrashResume {
+                                     let user_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
+                                     // S4-b:用户轮图片旁路提取(fail-soft;空 refs 零行为变化)
+                                     // ——内容 JSON 化带指纹留痕,回喂旁路带 base64(仅发送面)
+                                     let (turn_content, turn_images) = build_user_turn_images(
+                                         &goal,
+                                         &user_images,
+                                         std::path::Path::new("."),
+                                         std::path::Path::new(B1_IMAGES_DIR),
+                                     );
+                                     messages.push(Message::User {
+                                         content: turn_content.clone(),
+                                         images: turn_images,
+                                     });
+                                     // 持久化仅存指纹内容(旁路 base64 不进审计链,与 B1 同口径)
+                                     if let Err(e) = runner
+                                         .persist_message(
+                                             &session_id,
+                                             user_idx,
+                                             Message::User { content: turn_content, images: Vec::new() },
+                                         )
+                                         .await
+                                     {
+                                         yield Err(e);
+                                         return;
+                                     }
+                                 }
 
-                           // 5. 订阅 SSE(必须在 submit_command 之前,否则错过 io_request)
-                           let mut event_stream = match runner.evorule_client.subscribe_events(&session_id).await {
-                               Ok(s) => s,
-                               Err(e) => {
-                                   warn!(%session_id, error = %e, "subscribe_events failed");
-                                   yield Err(AgentError::EvoruleError(e.to_string()));
-                                   return;
-                               }
-                           };
+                                 // 5. 订阅 SSE(必须在 submit_command 之前,否则错过 io_request)
+                                 let mut event_stream = match runner.evorule_client.subscribe_events(&session_id).await {
+                                     Ok(s) => s,
+                                     Err(e) => {
+                                         warn!(%session_id, error = %e, "subscribe_events failed");
+                                         yield Err(AgentError::EvoruleError(e.to_string()));
+                                         return;
+                                     }
+                                 };
 
-                           // 挂起 io 对账+解析(崩溃恢复):订阅先行——解析触发的重放
-                           // IoRequest 经已开订阅送达。解析结果=恢复汇总(error=None
-                           // 保重放,server 重放缓存指令驱动续跑);无挂起(轮界崩溃)=
-                           // 重振指令,走下方 submit_command。幂等读已在本地修复段
-                           // 重执行,两本账(server 事实链/本地 transcript)记同一处置
-                           let mut pending_resolved = false;
-                           if recovery == RecoveryMode::CrashResume {
-                               match runner.evorule_client.get_session_history(&session_id).await {
-                                   Ok(history) => match Self::plan_pending_resolution(&history) {
-                                       Some((rid, io_type, _params)) => {
-                                           let summary = serde_json::json!({
-                                               "success": true,
-                                               "content": format!(
-                                                   "session recovered after crash: dangling tool call(s) resolved ({} re-executed, {} crash observations); turn resumes from repaired message state",
-                                                   report_recovery.reexecuted, report_recovery.observed
-                                               ),
-                                               "steps": 0,
-                                               "duration_ms": 0,
-                                               "tool_calls": [],
-                                               "error": null,
-                                               "cancelled": false,
-                                           });
-                                           if let Err(e) = runner
-                                               .evorule_client
-                                               .submit_io_response(&session_id, rid, &summary, None)
-                                               .await
-                                           {
-                                               yield Err(AgentError::Internal(format!(
-                                                   "crash recovery: pending io_response submit failed (request {rid}, {io_type}): {e}"
-                                               )));
-                                               return;
-                                           }
-                                           pending_resolved = true;
-                                           info!(%session_id, request_id = rid, io_type = %io_type, "crash recovery: pending io_request resolved, engine will replay instruction");
-                                       }
-                                       None => {
-                                           info!(%session_id, "crash recovery: no pending io_request (turn-boundary crash), re-arming with fresh command");
-                                       }
-                                   },
-                                   Err(e) => {
-                                       yield Err(AgentError::Internal(format!(
-                                           "crash recovery: pending io reconciliation failed: {e}"
-                                       )));
-                                       return;
-                                   }
-                               }
-                           }
+                                 // 挂起 io 对账+解析(崩溃恢复):订阅先行——解析触发的重放
+                                 // IoRequest 经已开订阅送达。解析结果=恢复汇总(error=None
+                                 // 保重放,server 重放缓存指令驱动续跑);无挂起(轮界崩溃)=
+                                 // 重振指令,走下方 submit_command。幂等读已在本地修复段
+                                 // 重执行,两本账(server 事实链/本地 transcript)记同一处置
+                                 let mut pending_resolved = false;
+                                 if recovery == RecoveryMode::CrashResume {
+                                     match runner.evorule_client.get_session_history(&session_id).await {
+                                         Ok(history) => match Self::plan_pending_resolution(&history) {
+                                             Some((rid, io_type, _params)) => {
+                                                 let summary = serde_json::json!({
+                                                     "success": true,
+                                                     "content": format!(
+                                                         "session recovered after crash: dangling tool call(s) resolved ({} re-executed, {} crash observations); turn resumes from repaired message state",
+                                                         report_recovery.reexecuted, report_recovery.observed
+                                                     ),
+                                                     "steps": 0,
+                                                     "duration_ms": 0,
+                                                     "tool_calls": [],
+                                                     "error": null,
+                                                     "cancelled": false,
+                                                 });
+                                                 if let Err(e) = runner
+                                                     .evorule_client
+                                                     .submit_io_response(&session_id, rid, &summary, None)
+                                                     .await
+                                                 {
+                                                     yield Err(AgentError::Internal(format!(
+                                                         "crash recovery: pending io_response submit failed (request {rid}, {io_type}): {e}"
+                                                     )));
+                                                     return;
+                                                 }
+                                                 pending_resolved = true;
+                                                 info!(%session_id, request_id = rid, io_type = %io_type, "crash recovery: pending io_request resolved, engine will replay instruction");
+                                             }
+                                             None => {
+                                                 info!(%session_id, "crash recovery: no pending io_request (turn-boundary crash), re-arming with fresh command");
+                                             }
+                                         },
+                                         Err(e) => {
+                                             yield Err(AgentError::Internal(format!(
+                                                 "crash recovery: pending io reconciliation failed: {e}"
+                                             )));
+                                             return;
+                                         }
+                                     }
+                                 }
 
-                           // 6. 提交 call_external 命令。挂起已解析时跳过——server
-                           // 重放缓存指令即驱动;挂起期间新命令只入队不执行(执行
-                           // 门控 pending_io_count==0)
-                           if !(recovery == RecoveryMode::CrashResume && pending_resolved) {
-                               let command = runner
-                                   .build_call_external_command(&system_prompt, &goal, runner.openai_tools_payload());
-                               if let Err(e) = runner.evorule_client.submit_command(&session_id, &command).await {
-                                   warn!(%session_id, error = %e, "submit_command (call_external) failed");
-                                   yield Err(AgentError::EvoruleError(e.to_string()));
-                                   return;
-                               }
-                           }
+                                 // 6. 提交 call_external 命令。挂起已解析时跳过——server
+                                 // 重放缓存指令即驱动;挂起期间新命令只入队不执行(执行
+                                 // 门控 pending_io_count==0)
+                                 if !(recovery == RecoveryMode::CrashResume && pending_resolved) {
+                                     let command = runner
+                                         .build_call_external_command(&system_prompt, &goal, runner.openai_tools_payload());
+                                     if let Err(e) = runner.evorule_client.submit_command(&session_id, &command).await {
+                                         warn!(%session_id, error = %e, "submit_command (call_external) failed");
+                                         yield Err(AgentError::EvoruleError(e.to_string()));
+                                         return;
+                                     }
+                                 }
 
-                           // 8. SSE 事件循环(同 run(),但 call_external 分支用 execute_stream)
-                           // G6:用 select! 监听取消,使等待 event 时也能即时响应
-                           let cancel_token = runner.cancel_token.clone();
-                           let mut last_llm_content = String::new(); // 追踪最近一次 LLM 输出(Stable 时 fallback)
-                           // 连续 Error→auto_rewind→continue 回退预算(非流式
-                           // run() 同款镜像)——rewind 不计步的无界回退循环在此封顶。重置语义:
-                           // 任意非 Error 事件(正常推进)即清零,只惩罚连续失败。
-                           // 崩溃恢复时按 journal 末次余额回填(H1 护栏跨重启连续)。
-                           let mut rewind_budget = match resume_rewind_remaining {
-                               Some(r) => RewindBudget::restored(r),
-                               None => RewindBudget::new(REWIND_BUDGET_LIMIT),
-                           };
-                           // 回退后等待续跑工作标志(非流式 run() 同款镜像)：rewind 成功
-                           // 即置位，仅真实工作恢复(IoRequest)清位。rewind 后引擎不会重新
-                           // 下发已消费的 call_external 命令——回退后若直接到达 Stable，
-                           // 即"无可续工作"死局信号。此终态必须 fail-visible 报错，严禁以
-                           // success+空 content 收尾（伪成功会让调用方误判整轮工作完成）。
-                           let mut rewound_awaiting_work = false;
-                           let mut last_rewind_version: Option<u64> = None;
-        // Runaway 护栏计数回填(跨重启连续)。
-                           // 计数与 journal ToolInvoked 同源同口径(挂点=两个写点),
-                           // 回填沿 replay_rewind_budget_remaining 的回填模式。
-                           // 无策略注入=u32::MAX 阈值空转(挂点代码统一,行为零变化)。
-                           let mut runaway_guard = match (&runner.runaway_policy, &journal) {
-                               (Some(p), Some(j)) => {
-                                   RunawayGuard::restored(j.replay_runaway_actions(), p.max_actions_per_run)
-                               }
-                               (Some(p), None) => RunawayGuard::new(p.max_actions_per_run),
-                               (None, _) => RunawayGuard::new(u32::MAX),
-                           };
-                           // 修订⑦心跳保活(event 等待点):60s 无引擎事件记一次失联,
-                           // 重试等待 1 次后仍失联(连续 2 次=120s)触发三级恢复:
-                           // ②通道重建(仅一次/流——订阅面静默失效时救活;broadcast
-                           // 不重放历史,重建窗内已发事件不可恢复,由后续心跳与
-                           // ③的对账兜底)→重建后仍连续 2 窗失联即判定引擎死锁,
-                           // 中止当前 turn 走弃轮收尾(③升级人工=fail-visible 终态,
-                           // 人可重试)。LLM 通道挂起由 HTTP 超时兜底,不在此处。
-                           let mut heartbeat_misses: u32 = 0;
-                           let mut stream_rebuilt = false;
-                           loop {
-                               let event = tokio::select! {
-                                   ev = event_stream.next() => match ev {
-                                       Some(e) => e,
-                                       None => break,
-                                   },
-                                   _ = tokio::time::sleep(Duration::from_secs(
-                                       heartbeat_timeout_secs(),
-                                   )) => {
-                                       heartbeat_misses += 1;
-                                       if heartbeat_misses >= 2 {
-                                           // ②通道重建(三级恢复第 2 级):仅一次/流。
-                                           warn!(%session_id, misses = heartbeat_misses,
-                                               "heartbeat lost (x2): rebuilding engine event stream (recovery step 2)");
-                                           yield Ok(AgentEvent::Info(format!(
-                                               "heartbeat lost: no engine event within {}s (x2); rebuilding engine event stream (recovery step 2)",
-                                               heartbeat_timeout_secs(),
-                                           )));
-                                           if stream_rebuilt {
-                                               warn!(%session_id,
-                                                   "event stream already rebuilt; proceeding to turn abort (recovery step 3)");
-                                           } else {
-                                               stream_rebuilt = true;
-                                               match runner
-                                                   .evorule_client
-                                                   .subscribe_events(&session_id)
-                                                   .await
-                                               {
-                                                   Ok(es) => {
-                                                       event_stream = es;
-                                                       heartbeat_misses = 0;
-                                                       continue;
-                                                   }
-                                                   Err(e) => {
-                                                       warn!(%session_id, error = %e,
-                                                           "event stream rebuild failed; proceeding to turn abort (recovery step 3)");
-                                                   }
-                                               }
-                                           }
-                                           // 悬挂 io_request 终结:引擎反应器对 pending io
-                                           // 门控(新命令只入队不执行),弃轮若不收敛,后续
-                                           // 每一轮都会以同样的心跳死法循环。发现路径与
-                                           // crash 复活对账同源(会话历史取无应答请求),
-                                           // 镜像取消路径的 error 终结先例;best-effort,
-                                           // 失败不阻断弃轮收尾。
-                                           match runner
-                                               .evorule_client
-                                               .get_session_history(&session_id)
-                                               .await
-                                           {
-                                               Ok(history) => {
-                                                   if let Some((rid, io_type, _params)) =
-                                                       Self::plan_pending_resolution(&history)
-                                                   {
-                                                       let reason = format!(
-                                                           "heartbeat lost: no engine event within {}s (x2); pending io_request terminally answered by turn abort",
-                                                           heartbeat_timeout_secs() * 2,
-                                                       );
-                                                       match runner
-                                                           .evorule_client
-                                                           .submit_io_response(
-                                                               &session_id,
-                                                               rid,
-                                                               &serde_json::json!({
-                                                                   "error": reason,
-                                                               }),
-                                                               Some(reason.as_str()),
-                                                           )
-                                                           .await
-                                                       {
-                                                           Ok(_) => {
-                                                               info!(%session_id, request_id = rid,
-                                                                   io_type = %io_type,
-                                                                   "heartbeat abort: pending io_request terminally answered");
-                                                           }
-                                                           Err(e) => {
-                                                               warn!(%session_id, request_id = rid,
-                                                                   error = %e,
-                                                                   "heartbeat abort: terminal io_response submit failed (best-effort)");
-                                                           }
-                                                       }
-                                                   }
-                                               }
-                                               Err(e) => {
-                                                   warn!(%session_id, error = %e,
-                                                       "heartbeat abort: session history fetch failed; cannot reconcile pending io");
-                                               }
-                                           }
-                                           yield Ok(AgentEvent::Error(AgentError::Internal(format!(
-                                               "heartbeat lost: no engine event within {}s (retried once); turn aborted, please retry",
-                                               heartbeat_timeout_secs() * 2,
-                                           ))));
-                                           let duration = start_time.elapsed().as_millis() as u64;
-                                           if let Some(g) = turn_guard.take() {
-                                               g.end_with_reason(
-                                               "heartbeat_lost",
-                                               step_count as u64,
-                                               duration,
-                                               Some(
-                                                   "engine heartbeat lost: no engine event within 120s (x2); turn aborted",
-                                               ),
-                                           );
-                                           }
-                                           if let Err(e) = runner.flush_messages(&session_id).await {
-                                               tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                           }
-                                           runner.submit_tool_traces(&session_id).await;
-                                           yield Ok(AgentEvent::Done(AgentResult::error(
-                                               "heartbeat lost: engine unresponsive, turn aborted".to_string(),
-                                               step_count,
-                                               duration,
-                                           )));
-                                           return;
-                                       }
-                                       // ①同等待重试 1 次:回到 select 再等一个心跳窗
-                                       info!(%session_id, misses = heartbeat_misses,
-                                           "no engine event within {}s, retrying wait (recovery step 1)",
-                                           heartbeat_timeout_secs());
-                                       continue;
-                                   },
-                                   _ = cancel_token.cancelled() => {
-                                       info!("Cancellation requested during streaming, cleaning up");
-                                       let duration = start_time.elapsed().as_millis() as u64;
-                                       yield Ok(AgentEvent::Error(AgentError::Internal(
-                                           "cancelled by user".to_string(),
-                                       )));
-                                       yield Ok(AgentEvent::Done(AgentResult::cancelled_result(
-                                           tool_calls.clone(),
-                                           step_count,
-                                           duration,
-                                       )));
-                                       if let Err(e) = runner.flush_messages(&session_id).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                       }
-                                       // 取消路径补 sediment(流式镜像)
-                                       if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
-                                       }
-                                       runner.submit_tool_traces(&session_id).await;
-                                       // B21:turn_ended(cancelled)
-                                       return;
-                                   }
-                               };
-                               // 心跳恢复:任一引擎事件到达即重置失联计数(修订⑦)
-                               heartbeat_misses = 0;
-                               match event.event_type.as_str() {
-                                   "IoRequest" => {
-                                       // 真实工作恢复——回退死局解除（rewind 等待标志清位）
-                                       rewound_awaiting_work = false;
-                                       step_count += 1;
-                                       // G17:步数指标
-                                       if let Some(m) = &runner.metrics {
-                                           m.inc_steps();
-                                       }
-                                       if step_count > runner.config.max_steps {
-                                           yield Ok(AgentEvent::Error(AgentError::MaxStepsExceeded(
-                                               runner.config.max_steps,
-                                           )));
-                                           let duration = start_time.elapsed().as_millis() as u64;
-                                           // B21:turn_ended(error)
-                                           if let Some(g) = turn_guard.take() {
-                                               g.end("error", step_count as u64, duration);
-                                           }
-                                           if let Err(e) = runner.flush_messages(&session_id).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                       }
-                                           runner.submit_tool_traces(&session_id).await;
-                                           yield Ok(AgentEvent::Done(AgentResult::error(
-                                               format!("Max steps exceeded: {}", runner.config.max_steps),
-                                               step_count,
-                                               duration,
-                                           )));
-                                           return;
-                                       }
-                                       yield Ok(AgentEvent::Step { step: step_count });
+                                 // 8. SSE 事件循环(同 run(),但 call_external 分支用 execute_stream)
+                                 // G6:用 select! 监听取消,使等待 event 时也能即时响应
+                                 let cancel_token = runner.cancel_token.clone();
+                                 let mut last_llm_content = String::new(); // 追踪最近一次 LLM 输出(Stable 时 fallback)
+                                 // 连续 Error→auto_rewind→continue 回退预算(非流式
+                                 // run() 同款镜像)——rewind 不计步的无界回退循环在此封顶。重置语义:
+                                 // 任意非 Error 事件(正常推进)即清零,只惩罚连续失败。
+                                 // 崩溃恢复时按 journal 末次余额回填(H1 护栏跨重启连续)。
+                                 let mut rewind_budget = match resume_rewind_remaining {
+                                     Some(r) => RewindBudget::restored(r),
+                                     None => RewindBudget::new(REWIND_BUDGET_LIMIT),
+                                 };
+                                 // 回退后等待续跑工作标志(非流式 run() 同款镜像)：rewind 成功
+                                 // 即置位，仅真实工作恢复(IoRequest)清位。rewind 后引擎不会重新
+                                 // 下发已消费的 call_external 命令——回退后若直接到达 Stable，
+                                 // 即"无可续工作"死局信号。此终态必须 fail-visible 报错，严禁以
+                                 // success+空 content 收尾（伪成功会让调用方误判整轮工作完成）。
+                                 let mut rewound_awaiting_work = false;
+                                 let mut last_rewind_version: Option<u64> = None;
+              // Runaway 护栏计数回填(跨重启连续)。
+                                 // 计数与 journal ToolInvoked 同源同口径(挂点=两个写点),
+                                 // 回填沿 replay_rewind_budget_remaining 的回填模式。
+                                 // 无策略注入=u32::MAX 阈值空转(挂点代码统一,行为零变化)。
+                                 let mut runaway_guard = match (&runner.runaway_policy, &journal) {
+                                     (Some(p), Some(j)) => {
+                                         RunawayGuard::restored(j.replay_runaway_actions(), p.max_actions_per_run)
+                                     }
+                                     (Some(p), None) => RunawayGuard::new(p.max_actions_per_run),
+                                     (None, _) => RunawayGuard::new(u32::MAX),
+                                 };
+                                 // 修订⑦心跳保活(event 等待点):60s 无引擎事件记一次失联,
+                                 // 重试等待 1 次后仍失联(连续 2 次=120s)触发三级恢复:
+                                 // ②通道重建(仅一次/流——订阅面静默失效时救活;broadcast
+                                 // 不重放历史,重建窗内已发事件不可恢复,由后续心跳与
+                                 // ③的对账兜底)→重建后仍连续 2 窗失联即判定引擎死锁,
+                                 // 中止当前 turn 走弃轮收尾(③升级人工=fail-visible 终态,
+                                 // 人可重试)。LLM 通道挂起由 HTTP 超时兜底,不在此处。
+                                 let mut heartbeat_misses: u32 = 0;
+                                 let mut stream_rebuilt = false;
+                                 loop {
+                                     let event = tokio::select! {
+                                         ev = event_stream.next() => match ev {
+                                             Some(e) => e,
+                                             None => break,
+                                         },
+                                         _ = tokio::time::sleep(Duration::from_secs(
+                                             heartbeat_timeout_secs(),
+                                         )) => {
+                                             heartbeat_misses += 1;
+                                             if heartbeat_misses >= 2 {
+                                                 // ②通道重建(三级恢复第 2 级):仅一次/流。
+                                                 warn!(%session_id, misses = heartbeat_misses,
+                                                     "heartbeat lost (x2): rebuilding engine event stream (recovery step 2)");
+                                                 yield Ok(AgentEvent::Info(format!(
+                                                     "heartbeat lost: no engine event within {}s (x2); rebuilding engine event stream (recovery step 2)",
+                                                     heartbeat_timeout_secs(),
+                                                 )));
+                                                 if stream_rebuilt {
+                                                     warn!(%session_id,
+                                                         "event stream already rebuilt; proceeding to turn abort (recovery step 3)");
+                                                 } else {
+                                                     stream_rebuilt = true;
+                                                     match runner
+                                                         .evorule_client
+                                                         .subscribe_events(&session_id)
+                                                         .await
+                                                     {
+                                                         Ok(es) => {
+                                                             event_stream = es;
+                                                             heartbeat_misses = 0;
+                                                             continue;
+                                                         }
+                                                         Err(e) => {
+                                                             warn!(%session_id, error = %e,
+                                                                 "event stream rebuild failed; proceeding to turn abort (recovery step 3)");
+                                                         }
+                                                     }
+                                                 }
+                                                 // 悬挂 io_request 终结:引擎反应器对 pending io
+                                                 // 门控(新命令只入队不执行),弃轮若不收敛,后续
+                                                 // 每一轮都会以同样的心跳死法循环。发现路径与
+                                                 // crash 复活对账同源(会话历史取无应答请求),
+                                                 // 镜像取消路径的 error 终结先例;best-effort,
+                                                 // 失败不阻断弃轮收尾。
+                                                 match runner
+                                                     .evorule_client
+                                                     .get_session_history(&session_id)
+                                                     .await
+                                                 {
+                                                     Ok(history) => {
+                                                         if let Some((rid, io_type, _params)) =
+                                                             Self::plan_pending_resolution(&history)
+                                                         {
+                                                             let reason = format!(
+                                                                 "heartbeat lost: no engine event within {}s (x2); pending io_request terminally answered by turn abort",
+                                                                 heartbeat_timeout_secs() * 2,
+                                                             );
+                                                             match runner
+                                                                 .evorule_client
+                                                                 .submit_io_response(
+                                                                     &session_id,
+                                                                     rid,
+                                                                     &serde_json::json!({
+                                                                         "error": reason,
+                                                                     }),
+                                                                     Some(reason.as_str()),
+                                                                 )
+                                                                 .await
+                                                             {
+                                                                 Ok(_) => {
+                                                                     info!(%session_id, request_id = rid,
+                                                                         io_type = %io_type,
+                                                                         "heartbeat abort: pending io_request terminally answered");
+                                                                 }
+                                                                 Err(e) => {
+                                                                     warn!(%session_id, request_id = rid,
+                                                                         error = %e,
+                                                                         "heartbeat abort: terminal io_response submit failed (best-effort)");
+                                                                 }
+                                                             }
+                                                         }
+                                                     }
+                                                     Err(e) => {
+                                                         warn!(%session_id, error = %e,
+                                                             "heartbeat abort: session history fetch failed; cannot reconcile pending io");
+                                                     }
+                                                 }
+                                                 yield Ok(AgentEvent::Error(AgentError::Internal(format!(
+                                                     "heartbeat lost: no engine event within {}s (retried once); turn aborted, please retry",
+                                                     heartbeat_timeout_secs() * 2,
+                                                 ))));
+                                                 let duration = start_time.elapsed().as_millis() as u64;
+                                                 if let Some(g) = turn_guard.take() {
+                                                     g.end_with_reason(
+                                                     "heartbeat_lost",
+                                                     step_count as u64,
+                                                     duration,
+                                                     Some(
+                                                         "engine heartbeat lost: no engine event within 120s (x2); turn aborted",
+                                                     ),
+                                                 );
+                                                 }
+                                                 if let Err(e) = runner.flush_messages(&session_id).await {
+                                                     tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                 }
+                                                 runner.submit_tool_traces(&session_id).await;
+                                                 yield Ok(AgentEvent::Done(AgentResult::error(
+                                                     "heartbeat lost: engine unresponsive, turn aborted".to_string(),
+                                                     step_count,
+                                                     duration,
+                                                 )));
+                                                 return;
+                                             }
+                                             // ①同等待重试 1 次:回到 select 再等一个心跳窗
+                                             info!(%session_id, misses = heartbeat_misses,
+                                                 "no engine event within {}s, retrying wait (recovery step 1)",
+                                                 heartbeat_timeout_secs());
+                                             continue;
+                                         },
+                                         _ = cancel_token.cancelled() => {
+                                             info!("Cancellation requested during streaming, cleaning up");
+                                             let duration = start_time.elapsed().as_millis() as u64;
+                                             yield Ok(AgentEvent::Error(AgentError::Internal(
+                                                 "cancelled by user".to_string(),
+                                             )));
+                                             yield Ok(AgentEvent::Done(AgentResult::cancelled_result(
+                                                 tool_calls.clone(),
+                                                 step_count,
+                                                 duration,
+                                             )));
+                                             if let Err(e) = runner.flush_messages(&session_id).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                             }
+                                             // 取消路径补 sediment(流式镜像)
+                                             if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                                             }
+                                             runner.submit_tool_traces(&session_id).await;
+                                             // B21:turn_ended(cancelled)
+                                             return;
+                                         }
+                                     };
+                                     // 心跳恢复:任一引擎事件到达即重置失联计数(修订⑦)
+                                     heartbeat_misses = 0;
+                                     match event.event_type.as_str() {
+                                         "IoRequest" => {
+                                             // 真实工作恢复——回退死局解除（rewind 等待标志清位）
+                                             rewound_awaiting_work = false;
+                                             step_count += 1;
+                                             // G17:步数指标
+                                             if let Some(m) = &runner.metrics {
+                                                 m.inc_steps();
+                                             }
+                                             if step_count > runner.config.max_steps {
+                                                 yield Ok(AgentEvent::Error(AgentError::MaxStepsExceeded(
+                                                     runner.config.max_steps,
+                                                 )));
+                                                 let duration = start_time.elapsed().as_millis() as u64;
+                                                 // B21:turn_ended(error)
+                                                 if let Some(g) = turn_guard.take() {
+                                                     g.end("error", step_count as u64, duration);
+                                                 }
+                                                 if let Err(e) = runner.flush_messages(&session_id).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                             }
+                                                 runner.submit_tool_traces(&session_id).await;
+                                                 yield Ok(AgentEvent::Done(AgentResult::error(
+                                                     format!("Max steps exceeded: {}", runner.config.max_steps),
+                                                     step_count,
+                                                     duration,
+                                                 )));
+                                                 return;
+                                             }
+                                             yield Ok(AgentEvent::Step { step: step_count });
 
-                                       // 跑中自审自检器（周期步界触发+服务调用）：步界
-                                       // 安全点统一检查点（引擎步界与本地 ReAct
-                                       // 回喂步界共用同一 helper；cfg None=零开销）。
-                                       crate::agent::self_audit::audit_checkpoint(
-                                           &runner.evorule_client,
-                                           &frame_buffer,
-                                           &mut messages,
-                                           &journal,
-                                           &session_id,
-                                           step_count,
-                                       )
-                                       .await;
+                                             // 跑中自审自检器（周期步界触发+服务调用）：步界
+                                             // 安全点统一检查点（引擎步界与本地 ReAct
+                                             // 回喂步界共用同一 helper；cfg None=零开销）。
+                                             crate::agent::self_audit::audit_checkpoint(
+                                                 &runner.evorule_client,
+                                                 &frame_buffer,
+                                                 &mut messages,
+                                                 &journal,
+                                                 &session_id,
+                                                 step_count,
+                                             )
+                                             .await;
 
-                                       // 交互式步间隙引导注记 drain(REPL 显式接线;None=零开销零差异):
-                                       // 当前工具步不被打断,排队输入在下一模型调用前并入权威历史
-                                       if let Some(src) = &runner.steering {
-                                           while let Some(note) = src.try_recv() {
-                                               messages.push(crate::agent::translator::Message::User {
-                                                   content: format!("[steering note] {note}"),
-                                                   images: Vec::new(),
-                                               });
-                                               if let Some(j) = &journal {
-                                                   if let Err(e) = j.steering_note(&note) {
-                                                       tracing::warn!(session_id = %session_id, error = %e, "steering note journal write failed");
-                                                   }
-                                               }
-                                               yield Ok(AgentEvent::Info(format!(
-                                                   "steering note injected: {note}"
-                                               )));
-                                           }
-                                       }
+                                             // 交互式步间隙引导注记 drain(REPL 显式接线;None=零开销零差异):
+                                             // 当前工具步不被打断,排队输入在下一模型调用前并入权威历史
+                                             if let Some(src) = &runner.steering {
+                                                 while let Some(note) = src.try_recv() {
+                                                     messages.push(crate::agent::translator::Message::User {
+                                                         content: format!("[steering note] {note}"),
+                                                         images: Vec::new(),
+                                                     });
+                                                     if let Some(j) = &journal {
+                                                         if let Err(e) = j.steering_note(&note) {
+                                                             tracing::warn!(session_id = %session_id, error = %e, "steering note journal write failed");
+                                                         }
+                                                     }
+                                                     yield Ok(AgentEvent::Info(format!(
+                                                         "steering note injected: {note}"
+                                                     )));
+                                                 }
+                                             }
 
-                                       // PerReactRound:处理前刷写上一轮缓冲的消息
-                                       if matches!(runner.message_persist_mode, MessagePersistMode::PerReactRound) {
-                                           if let Err(e) = runner.flush_messages(&session_id).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                       }
-                                       }
+                                             // PerReactRound:处理前刷写上一轮缓冲的消息
+                                             if matches!(runner.message_persist_mode, MessagePersistMode::PerReactRound) {
+                                                 if let Err(e) = runner.flush_messages(&session_id).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                             }
+                                             }
 
-                                       let io_type = event.payload.get("io_type").and_then(|v| v.as_str()).unwrap_or("");
-                                       let params = event.payload.get("params").cloned().unwrap_or(Value::Null);
-                                       let request_id = event.payload.get("id").and_then(|v| v.as_u64());
+                                             let io_type = event.payload.get("io_type").and_then(|v| v.as_str()).unwrap_or("");
+                                             let params = event.payload.get("params").cloned().unwrap_or(Value::Null);
+                                             let request_id = event.payload.get("id").and_then(|v| v.as_u64());
 
-                                       match io_type {
-                                           "call_external" => {
-                                               // ===== 本地 ReAct 循环(v0.5.0 后多轮编排回归应用层) =====
-                                               // server 的 collect/merge 元指令已随 v0.5.0 退役,call_external
-                                               // 指令的 io_response 提交后即 Stable,不会再有下一轮。工具结果
-                                               // 回喂 LLM 由本循环负责:LLM 返回 tool_calls → 本地执行(审批/
-                                               // 缓存经 execute_tool_stage + resolve_approval) → tool 消息追加 → 再调
-                                               // LLM;直到产出最终 content 才提交 io_response(中间态不提交,
-                                               // server 无感知,无 IoRequest 响应超时风险)。回喂轮计入
-                                               // step_count 受 max_steps 限流,防失控循环。
-                                               let react_model = params
-                                                   .get("model")
-                                                   .and_then(|v| v.as_str())
-                                                   .map(|s| s.to_string())
-                                                   .unwrap_or_else(|| runner.config.model.clone());
-                                               let react_temperature = params
-                                                   .get("temperature")
-                                                   .and_then(|v| v.as_f64())
-                                                   .unwrap_or(runner.config.temperature as f64);
-                                               let mut react_round: u32 = 0;
-                                               // 输出门禁（server io_guard）拒绝收尾的纠偏重试计数
-                                               let mut guard_rejections: u32 = 0;
-                                               // 轮级序列循环检测:Warning/Exhausted 待注入标记,
-                                               // 随本轮首个 tool_result 回喂(or_insert,per-tool 标记优先)
-                                               let mut seq_mark: Option<&'static str> = None;
-                                               'react: loop {
-                                                   // H3 预算看门狗:全局时限触达=合法停机
-                                                   // 面之三——不依赖 LLM 合作,镜像 max_steps 熔断全序列
-                                                   // (io_response 错误回写→Error 事件→turn_ended→flush
-                                                   // →tool_traces→Done[blocked 语义 error 结果])
-                                                   if let Some(budget_secs) = wall_clock_budget_secs {
-                                                       if start_time.elapsed().as_secs() >= budget_secs {
-                                                           let err = AgentError::Internal(format!(
-                                                               "全局时限预算耗尽({budget_secs}s)——H3 合法停机(诚实退出优于空转)"
-                                                           ));
-                                                           if let Some(rid) = request_id {
-                                                               let err_str = err.to_string();
-                                                               if let Err(e) = runner.evorule_client
-                                                                   .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
-                                                                   .await
-                                                               {
-                                                                   tracing::warn!(session_id = %session_id, request_id = rid, error = %e, "submit_io_response (budget_exhausted) failed; io_request may hang on engine side");
-                                                               }
-                                                           }
-                                                           yield Ok(AgentEvent::Error(err.clone()));
-                                                           let duration = start_time.elapsed().as_millis() as u64;
-                                                           if let Some(g) = turn_guard.take() {
-                                                               g.end("error", step_count as u64, duration);
-                                                           }
-                                                           if let Err(e) = runner.flush_messages(&session_id).await {
-                                                               tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                                           }
-                                                           runner.submit_tool_traces(&session_id).await;
-                                                           yield Ok(AgentEvent::Done(AgentResult::error(
-                                                               err.to_string(), step_count, duration,
-                                                           )));
-                                                           return;
-                                                       }
-                                                   }
-                                                   // 首轮 LLM 调用已随 IoRequest 到达计过 step(L2508),回喂轮补计
-                                                   if react_round > 0 {
-                                                       step_count += 1;
-                                                       if step_count > runner.config.max_steps {
-                                                           let err = AgentError::Internal(format!(
-                                                               "达到最大步数上限({}),工具结果回喂终止",
-                                                               runner.config.max_steps
-                                                           ));
-                                                           if let Some(rid) = request_id {
-                                                               let err_str = err.to_string();
-                                                               if let Err(e) = runner.evorule_client
-                                                                   .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
-                                                                   .await
-                                                               {
-                                                                   tracing::warn!(session_id = %session_id, request_id = rid, error = %e, "submit_io_response (max_steps) failed; io_request may hang on engine side");
-                                                               }
-                                                           }
-                                                           yield Ok(AgentEvent::Error(err.clone()));
-                                                           let duration = start_time.elapsed().as_millis() as u64;
-                                                           // B21:turn_ended(error)
-                                                           if let Some(g) = turn_guard.take() {
-                                                               g.end("error", step_count as u64, duration);
-                                                           }
-                                                           if let Err(e) = runner.flush_messages(&session_id).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                       }
-                                                           runner.submit_tool_traces(&session_id).await;
-                                                           yield Ok(AgentEvent::Done(AgentResult::error(
-                                                               err.to_string(), step_count, duration,
-                                                           )));
-                                                           return;
-                                                       }
-                                                       info!(
-                                                           %session_id,
-                                                           round = react_round,
-                                                           "本地 ReAct 回喂:工具结果已入列,发起下一轮 LLM 调用"
-                                                       );
-                                                       // 跑中自审自检器（react 回喂循环步界）：
-                                                       // 本地 ReAct 回喂步界安全点（CLI run
-                                                       // 主路径的每轮 LLM 前界；与引擎步界
-                                                       // 共用检查点）。
-                                                       crate::agent::self_audit::audit_checkpoint(
-                                                           &runner.evorule_client,
-                                                           &frame_buffer,
-                                                           &mut messages,
-                                                           &journal,
-                                                           &session_id,
-                                                           step_count,
-                                                       )
-                                                       .await;
-                                                   }
-                                                   react_round += 1;
-                                                   let model: &str = react_model.as_str();
-                                                   let temperature = react_temperature;
+                                             match io_type {
+                                                 "call_external" => {
+                                                     // ===== 本地 ReAct 循环(v0.5.0 后多轮编排回归应用层) =====
+                                                     // server 的 collect/merge 元指令已随 v0.5.0 退役,call_external
+                                                     // 指令的 io_response 提交后即 Stable,不会再有下一轮。工具结果
+                                                     // 回喂 LLM 由本循环负责:LLM 返回 tool_calls → 本地执行(审批/
+                                                     // 缓存经 execute_tool_stage + resolve_approval) → tool 消息追加 → 再调
+                                                     // LLM;直到产出最终 content 才提交 io_response(中间态不提交,
+                                                     // server 无感知,无 IoRequest 响应超时风险)。回喂轮计入
+                                                     // step_count 受 max_steps 限流,防失控循环。
+                                                     let react_model = params
+                                                         .get("model")
+                                                         .and_then(|v| v.as_str())
+                                                         .map(|s| s.to_string())
+                                                         .unwrap_or_else(|| runner.config.model.clone());
+                                                     let react_temperature = params
+                                                         .get("temperature")
+                                                         .and_then(|v| v.as_f64())
+                                                         .unwrap_or(runner.config.temperature as f64);
+                                                     let mut react_round: u32 = 0;
+                                                     // 输出门禁（server io_guard）拒绝收尾的纠偏重试计数
+                                                     let mut guard_rejections: u32 = 0;
+                                                     // 轮级序列循环检测:Warning/Exhausted 待注入标记,
+                                                     // 随本轮首个 tool_result 回喂(or_insert,per-tool 标记优先)
+                                                     let mut seq_mark: Option<&'static str> = None;
+                                                     'react: loop {
+                                                         // H3 预算看门狗:全局时限触达=合法停机
+                                                         // 面之三——不依赖 LLM 合作,镜像 max_steps 熔断全序列
+                                                         // (io_response 错误回写→Error 事件→turn_ended→flush
+                                                         // →tool_traces→Done[blocked 语义 error 结果])
+                                                         if let Some(budget_secs) = wall_clock_budget_secs {
+                                                             if start_time.elapsed().as_secs() >= budget_secs {
+                                                                 let err = AgentError::Internal(format!(
+                                                                     "全局时限预算耗尽({budget_secs}s)——H3 合法停机(诚实退出优于空转)"
+                                                                 ));
+                                                                 if let Some(rid) = request_id {
+                                                                     let err_str = err.to_string();
+                                                                     if let Err(e) = runner.evorule_client
+                                                                         .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
+                                                                         .await
+                                                                     {
+                                                                         tracing::warn!(session_id = %session_id, request_id = rid, error = %e, "submit_io_response (budget_exhausted) failed; io_request may hang on engine side");
+                                                                     }
+                                                                 }
+                                                                 yield Ok(AgentEvent::Error(err.clone()));
+                                                                 let duration = start_time.elapsed().as_millis() as u64;
+                                                                 if let Some(g) = turn_guard.take() {
+                                                                     g.end("error", step_count as u64, duration);
+                                                                 }
+                                                                 if let Err(e) = runner.flush_messages(&session_id).await {
+                                                                     tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                                 }
+                                                                 runner.submit_tool_traces(&session_id).await;
+                                                                 yield Ok(AgentEvent::Done(AgentResult::error(
+                                                                     err.to_string(), step_count, duration,
+                                                                 )));
+                                                                 return;
+                                                             }
+                                                         }
+                                                         // 首轮 LLM 调用已随 IoRequest 到达计过 step(L2508),回喂轮补计
+                                                         if react_round > 0 {
+                                                             step_count += 1;
+                                                             if step_count > runner.config.max_steps {
+                                                                 let err = AgentError::Internal(format!(
+                                                                     "达到最大步数上限({}),工具结果回喂终止",
+                                                                     runner.config.max_steps
+                                                                 ));
+                                                                 if let Some(rid) = request_id {
+                                                                     let err_str = err.to_string();
+                                                                     if let Err(e) = runner.evorule_client
+                                                                         .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
+                                                                         .await
+                                                                     {
+                                                                         tracing::warn!(session_id = %session_id, request_id = rid, error = %e, "submit_io_response (max_steps) failed; io_request may hang on engine side");
+                                                                     }
+                                                                 }
+                                                                 yield Ok(AgentEvent::Error(err.clone()));
+                                                                 let duration = start_time.elapsed().as_millis() as u64;
+                                                                 // B21:turn_ended(error)
+                                                                 if let Some(g) = turn_guard.take() {
+                                                                     g.end("error", step_count as u64, duration);
+                                                                 }
+                                                                 if let Err(e) = runner.flush_messages(&session_id).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                             }
+                                                                 runner.submit_tool_traces(&session_id).await;
+                                                                 yield Ok(AgentEvent::Done(AgentResult::error(
+                                                                     err.to_string(), step_count, duration,
+                                                                 )));
+                                                                 return;
+                                                             }
+                                                             info!(
+                                                                 %session_id,
+                                                                 round = react_round,
+                                                                 "本地 ReAct 回喂:工具结果已入列,发起下一轮 LLM 调用"
+                                                             );
+                                                             // 跑中自审自检器（react 回喂循环步界）：
+                                                             // 本地 ReAct 回喂步界安全点（CLI run
+                                                             // 主路径的每轮 LLM 前界；与引擎步界
+                                                             // 共用检查点）。
+                                                             crate::agent::self_audit::audit_checkpoint(
+                                                                 &runner.evorule_client,
+                                                                 &frame_buffer,
+                                                                 &mut messages,
+                                                                 &journal,
+                                                                 &session_id,
+                                                                 step_count,
+                                                             )
+                                                             .await;
+                                                         }
+                                                         react_round += 1;
+                                                         let model: &str = react_model.as_str();
+                                                         let temperature = react_temperature;
 
-                                               // G1:流式调用 LLM
-                                               // G2+G10:裁剪 messages(同 handle_call_external)
-                                               // G10:如果有 summarizer,裁剪掉的消息生成摘要替换 hint
-                                               // 压缩视图落账对齐守卫(流式):主动压缩换区或被动裁剪
-                                               // 使发送副本下标失真时不落账(等同现行为);发送副本与
-                                               // 权威历史一致时才允许紧急裁剪产物回写持久化
-                                               let mut send_view_pending;
-                                               let messages_to_send = if let Some(ctx) = &runner.context_window {
-                                                   // B21 D3:主动 compaction(阈值触发,先于被动 trim;
-                                                   // None=未启用/未触发/无 summarizer——原消息直接走被动 trim)
-                                                   // 发送视图降级链(β 陈旧工具结果 → γ 陈旧机制消息;
-                                                   // 发送视图变换;权威 messages 不动)
-                                                   let demoted_view = runner.apply_mechanism_demotion(
-                                                       &runner.apply_stale_demotion(&messages),
-                                                   );
-                                                   let mut compaction_note: Option<(usize, usize, bool)> = None;
-                                                   let mut trim_result = match runner
-                                                       .active_compaction(
-                                                           &session_id,
-                                                           &messages,
-                                                           &goal,
-                                                           journal.as_ref(),
-                                                       )
-                                                       .await
-                                                   {
-                                                       Some(outcome) => {
-                                                           compaction_note = Some((
-                                                               outcome.before_chars,
-                                                               outcome.after_chars,
-                                                               outcome.summary_generated,
-                                                           ));
-                                                           // 降级链同口径:β → γ(压缩产物同样两段变换)
-                                                           let demoted_compacted = runner.apply_mechanism_demotion(
-                                                               &runner.apply_stale_demotion(&outcome.compacted),
-                                                           );
-                                                           ctx.trim_detailed(&demoted_compacted)
-                                                       }
-                                                       None => ctx.trim_detailed(&demoted_view),
-                                                   };
-                                                   // 观测面:压缩发生即广播(前端一次性提示;与 journal
-                                                   // 落账同口径,批五 CompactionPerformed 观测件)
-                                                   if let Some((before, after, summary_generated)) = compaction_note {
-                                                       yield Ok(AgentEvent::CompactionPerformed {
-                                                           before_chars: before,
-                                                           after_chars: after,
-                                                           summary_generated,
-                                                       });
-                                                   }
-                                                   if !trim_result.dropped.is_empty() {
-                                                       info!(
-                                                           dropped = trim_result.dropped.len(),
-                                                           "trimmed history messages to fit context window"
-                                                       );
-                                                   }
-                                                   // G10:记忆压缩 + R3 摘要落链（helper 共用）
-                                                   if let Some(summarizer) = &runner.summarizer {
-                                                       if !trim_result.dropped.is_empty() {
-                                                           if let Err(e) = runner
-                                                               .handle_summary_outcome(
-                                                                   &session_id,
-                                                                   summarizer,
-                                                                   &trim_result.dropped,
-                                                                   &mut trim_result.messages,
-                                                                   &goal,
-                                                                   "summarize",
-                                                               )
-                                                               .await
-                                                           {
-                                                               warn!(
-                                                                   %session_id,
-                                                                   error = %e,
-                                                                   "R3: summary handling failed, keeping original hint"
-                                                               );
-                                                           }
-                                                       }
-                                                   }
-                                                   // F-902:压缩事件落 journal（G-6/G-7 账面收敛）
-                                                   if !trim_result.dropped.is_empty() {
-                                                       if let Some(j) = &journal {
-                                                           let before: usize = messages.iter().map(|m| m.content().len()).sum();
-                                                           let after: usize = trim_result.messages.iter().map(|m| m.content().len()).sum();
-                                                           if let Err(e) = j.compaction_performed(before, after, true) {
-                                                               warn!(%session_id, error = %e, "compaction_performed journal failed");
-                                                           }
-                                                       }
-                                                   }
-                                                   // 压缩视图落账对齐守卫:主动压缩换区/被动裁剪后的
-                                                   // 发送副本下标失真,不落账;发送副本≡权威历史时才落
-                                                   send_view_pending = compaction_note.is_none() && trim_result.dropped.is_empty();
-                                                   trim_result.messages
-                                               } else {
-                                                   send_view_pending = true;
-                                                   messages.clone()
-                                               };
+                                                     // G1:流式调用 LLM
+                                                     // G2+G10:裁剪 messages(同 handle_call_external)
+                                                     // G10:如果有 summarizer,裁剪掉的消息生成摘要替换 hint
+                                                     // 压缩视图落账对齐守卫(流式):主动压缩换区或被动裁剪
+                                                     // 使发送副本下标失真时不落账(等同现行为);发送副本与
+                                                     // 权威历史一致时才允许紧急裁剪产物回写持久化
+                                                     let mut send_view_pending;
+                                                     let messages_to_send = if let Some(ctx) = &runner.context_window {
+                                                         // B21 D3:主动 compaction(阈值触发,先于被动 trim;
+                                                         // None=未启用/未触发/无 summarizer——原消息直接走被动 trim)
+                                                         // 发送视图降级链(β 陈旧工具结果 → γ 陈旧机制消息;
+                                                         // 发送视图变换;权威 messages 不动)
+                                                         let demoted_view = runner.apply_mechanism_demotion(
+                                                             &runner.apply_stale_demotion(&messages),
+                                                         );
+                                                         let mut compaction_note: Option<(usize, usize, bool)> = None;
+                                                         let mut trim_result = match runner
+                                                             .active_compaction(
+                                                                 &session_id,
+                                                                 &messages,
+                                                                 &goal,
+                                                                 journal.as_ref(),
+                                                             )
+                                                             .await
+                                                         {
+                                                             Some(outcome) => {
+                                                                 compaction_note = Some((
+                                                                     outcome.before_chars,
+                                                                     outcome.after_chars,
+                                                                     outcome.summary_generated,
+                                                                 ));
+                                                                 // 降级链同口径:β → γ(压缩产物同样两段变换)
+                                                                 let demoted_compacted = runner.apply_mechanism_demotion(
+                                                                     &runner.apply_stale_demotion(&outcome.compacted),
+                                                                 );
+                                                                 ctx.trim_detailed(&demoted_compacted)
+                                                             }
+                                                             None => ctx.trim_detailed(&demoted_view),
+                                                         };
+                                                         // 观测面:压缩发生即广播(前端一次性提示;与 journal
+                                                         // 落账同口径,批五 CompactionPerformed 观测件)
+                                                         if let Some((before, after, summary_generated)) = compaction_note {
+                                                             yield Ok(AgentEvent::CompactionPerformed {
+                                                                 before_chars: before,
+                                                                 after_chars: after,
+                                                                 summary_generated,
+                                                             });
+                                                         }
+                                                         if !trim_result.dropped.is_empty() {
+                                                             info!(
+                                                                 dropped = trim_result.dropped.len(),
+                                                                 "trimmed history messages to fit context window"
+                                                             );
+                                                         }
+                                                         // G10:记忆压缩 + R3 摘要落链（helper 共用）
+                                                         if let Some(summarizer) = &runner.summarizer {
+                                                             if !trim_result.dropped.is_empty() {
+                                                                 if let Err(e) = runner
+                                                                     .handle_summary_outcome(
+                                                                         &session_id,
+                                                                         summarizer,
+                                                                         &trim_result.dropped,
+                                                                         &mut trim_result.messages,
+                                                                         &goal,
+                                                                         "summarize",
+                                                                     )
+                                                                     .await
+                                                                 {
+                                                                     warn!(
+                                                                         %session_id,
+                                                                         error = %e,
+                                                                         "R3: summary handling failed, keeping original hint"
+                                                                     );
+                                                                 }
+                                                             }
+                                                         }
+                                                         // F-902:压缩事件落 journal（G-6/G-7 账面收敛）
+                                                         if !trim_result.dropped.is_empty() {
+                                                             if let Some(j) = &journal {
+                                                                 let before: usize = messages.iter().map(|m| m.content().len()).sum();
+                                                                 let after: usize = trim_result.messages.iter().map(|m| m.content().len()).sum();
+                                                                 if let Err(e) = j.compaction_performed(before, after, true) {
+                                                                     warn!(%session_id, error = %e, "compaction_performed journal failed");
+                                                                 }
+                                                             }
+                                                         }
+                                                         // 压缩视图落账对齐守卫:主动压缩换区/被动裁剪后的
+                                                         // 发送副本下标失真,不落账;发送副本≡权威历史时才落
+                                                         send_view_pending = compaction_note.is_none() && trim_result.dropped.is_empty();
+                                                         trim_result.messages
+                                                     } else {
+                                                         send_view_pending = true;
+                                                         messages.clone()
+                                                     };
 
-                                               // G11(S1 双路径收敛):注入格式指令到 system prompt
-                                               // (只影响本次请求的 messages_to_send,不改原 messages)——
-                                               // 语义与非流式 run() :3282 一致;R3-b/G-7 指令落链
-                                               // (同指令去重,best-effort 留痕)
-                                               let mut messages_to_send = messages_to_send;
-                                               // 上游护栏:无 User 轮的 chat 请求会被 provider 以
-                                               // invalid params 拒绝(实测 base_resp 2013)——极端小窗下
-                                               // 压缩+trim 级联可能裁光非 system 消息,此时从原始
-                                               // 历史补最后一条 User 起的最小段保底
-                                               if !messages_to_send
-                                                   .iter()
-                                                   .any(|m| matches!(m, Message::User { .. }))
-                                               {
-                                                   if let Some(last_user) = messages
-                                                       .iter()
-                                                       .rposition(|m| matches!(m, Message::User { .. }))
-                                                   {
-                                                       debug!(
-                                                           restored_tail = messages.len() - last_user,
-                                                           "view lost all user rounds; restoring minimal tail"
-                                                       );
-                                                       messages_to_send
-                                                           .extend_from_slice(&messages[last_user..]);
-                                                   }
-                                               }
-                                               if let Some(validator) = &runner.output_validator {
-                                                   let instruction = validator.instruction();
-                                                   if !instruction.is_empty() {
-                                                       for msg in &mut messages_to_send {
-                                                           if let Message::System { content } = msg {
-                                                               content.push_str(instruction);
-                                                               break;
-                                                           }
-                                                       }
-                                                       let needs_land = {
-                                                           let landed = runner
-                                                               .landed_format_instruction
-                                                               .lock()
-                                                               .unwrap_or_else(|p| p.into_inner());
-                                                           landed.as_deref() != Some(instruction)
-                                                       };
-                                                       if needs_land {
-                                                           match runner
-                                                               .evorule_client
-                                                               .update_payload(
-                                                                   &session_id,
-                                                                   "__context__.format_instruction",
-                                                                   &serde_json::json!({ "format_instruction": instruction }),
-                                                               )
-                                                               .await
-                                                           {
-                                                               Ok(_fact_id) => {
-                                                                   let mut landed = runner
-                                                                       .landed_format_instruction
-                                                                       .lock()
-                                                                       .unwrap_or_else(|p| p.into_inner());
-                                                                   *landed = Some(instruction.to_owned());
-                                                                   info!(%session_id, "R3: format instruction landed (G-7 closed, streaming)");
-                                                               }
-                                                               Err(e) => warn!(
-                                                                   %session_id,
-                                                                   error = %e,
-                                                                   "R3: format instruction landing failed (best-effort)——G-7 divergence, doctor flags"
-                                                               ),
-                                                           }
-                                                       }
-                                                   }
-                                               }
-                                               // H1:窗口余量信号行(与引擎路径同款;G10/B-307
-                                               // 注入形态=末尾独立 User 行,见 push_context_signal)
-                                               if let Some(ctx) = &runner.context_window {
-                                                   push_context_signal(
-                                                       &mut messages_to_send,
-                                                       ctx,
-                                                       react_round as usize,
-                                                   );
-                                               }
+                                                     // G11(S1 双路径收敛):注入格式指令到 system prompt
+                                                     // (只影响本次请求的 messages_to_send,不改原 messages)——
+                                                     // 语义与非流式 run() :3282 一致;R3-b/G-7 指令落链
+                                                     // (同指令去重,best-effort 留痕)
+                                                     let mut messages_to_send = messages_to_send;
+                                                     // 上游护栏:无 User 轮的 chat 请求会被 provider 以
+                                                     // invalid params 拒绝(实测 base_resp 2013)——极端小窗下
+                                                     // 压缩+trim 级联可能裁光非 system 消息,此时从原始
+                                                     // 历史补最后一条 User 起的最小段保底
+                                                     if !messages_to_send
+                                                         .iter()
+                                                         .any(|m| matches!(m, Message::User { .. }))
+                                                     {
+                                                         if let Some(last_user) = messages
+                                                             .iter()
+                                                             .rposition(|m| matches!(m, Message::User { .. }))
+                                                         {
+                                                             debug!(
+                                                                 restored_tail = messages.len() - last_user,
+                                                                 "view lost all user rounds; restoring minimal tail"
+                                                             );
+                                                             messages_to_send
+                                                                 .extend_from_slice(&messages[last_user..]);
+                                                         }
+                                                     }
+                                                     if let Some(validator) = &runner.output_validator {
+                                                         let instruction = validator.instruction();
+                                                         if !instruction.is_empty() {
+                                                             for msg in &mut messages_to_send {
+                                                                 if let Message::System { content } = msg {
+                                                                     content.push_str(instruction);
+                                                                     break;
+                                                                 }
+                                                             }
+                                                             let needs_land = {
+                                                                 let landed = runner
+                                                                     .landed_format_instruction
+                                                                     .lock()
+                                                                     .unwrap_or_else(|p| p.into_inner());
+                                                                 landed.as_deref() != Some(instruction)
+                                                             };
+                                                             if needs_land {
+                                                                 match runner
+                                                                     .evorule_client
+                                                                     .update_payload(
+                                                                         &session_id,
+                                                                         "__context__.format_instruction",
+                                                                         &serde_json::json!({ "format_instruction": instruction }),
+                                                                     )
+                                                                     .await
+                                                                 {
+                                                                     Ok(_fact_id) => {
+                                                                         let mut landed = runner
+                                                                             .landed_format_instruction
+                                                                             .lock()
+                                                                             .unwrap_or_else(|p| p.into_inner());
+                                                                         *landed = Some(instruction.to_owned());
+                                                                         info!(%session_id, "R3: format instruction landed (G-7 closed, streaming)");
+                                                                     }
+                                                                     Err(e) => warn!(
+                                                                         %session_id,
+                                                                         error = %e,
+                                                                         "R3: format instruction landing failed (best-effort)——G-7 divergence, doctor flags"
+                                                                     ),
+                                                                 }
+                                                             }
+                                                         }
+                                                     }
+        // H1:窗口余量信号行(与引擎路径同款;G10/
+                                                     // 注入形态=末尾独立 User 行,见 push_context_signal)
+                                                     if let Some(ctx) = &runner.context_window {
+                                                         push_context_signal(
+                                                             &mut messages_to_send,
+                                                             ctx,
+                                                             react_round as usize,
+                                                         );
+                                                     }
 
-        // policy 档剩余条件复述块注入(每轮
-                                               // 上下文尾部,对抗长程目标漂移)。只影响本次请求
-                                               // 的 messages_to_send(临时消息列表,不入原 messages);
-                                               // Runaway 余量随计数器滚动更新。
-                                               if let Some(rp) = &runner.runaway_policy {
-                                                   let remaining = runaway_guard
-                                                       .threshold
-                                                       .saturating_sub(runaway_guard.actions);
-                                                   let block = runaway_restatement_block(
-                                                       &goal,
-                                                       &rp.restate_conditions,
-                                                       remaining,
-                                                   );
-                                                   messages_to_send.push(crate::agent::translator::Message::System { content: block });
-                                               }
+              // policy 档剩余条件复述块注入(每轮
+                                                     // 上下文尾部,对抗长程目标漂移)。只影响本次请求
+                                                     // 的 messages_to_send(临时消息列表,不入原 messages);
+                                                     // Runaway 余量随计数器滚动更新。
+                                                     if let Some(rp) = &runner.runaway_policy {
+                                                         let remaining = runaway_guard
+                                                             .threshold
+                                                             .saturating_sub(runaway_guard.actions);
+                                                         let block = runaway_restatement_block(
+                                                             &goal,
+                                                             &rp.restate_conditions,
+                                                             remaining,
+                                                         );
+                                                         messages_to_send.push(crate::agent::translator::Message::System { content: block });
+                                                     }
 
-                                               // B1:窗口图片总量预算(8MB base64 计)——超限从最旧图开始丢,
-                                               // 注记进发送副本(messages_to_send 为发送副本,不动权威面)
-                                               let dropped_images = enforce_window_image_budget(
-                                                   &mut messages_to_send,
-                                                   B1_WINDOW_IMAGE_BUDGET_B64,
-                                               );
-                                               if dropped_images > 0 {
-                                                   info!(dropped = dropped_images, "B1: window image budget enforced");
-                                               }
+                                                     // B1:窗口图片总量预算(8MB base64 计)——超限从最旧图开始丢,
+                                                     // 注记进发送副本(messages_to_send 为发送副本,不动权威面)
+                                                     let dropped_images = enforce_window_image_budget(
+                                                         &mut messages_to_send,
+                                                         B1_WINDOW_IMAGE_BUDGET_B64,
+                                                     );
+                                                     if dropped_images > 0 {
+                                                         info!(dropped = dropped_images, "B1: window image budget enforced");
+                                                     }
 
-                                               // 流式累积量(声明在重试编排外,每圈发起前重置):
-                                               // 思考留痕:流式所有 reasoning(真流式帧/legacy 整包
-                                               // 合成/终帧安全网补发)统一经 ThinkingDelta 下行,
-                                               // 此处随步累积,随 assistant 消息持久化(仅展示链路)
-                                               let mut full_content = String::new();
-                                               let mut full_reasoning = String::new();
-                                               // 以下三项跨圈存活(重试终局后仍需读取),圈首重置;
-                                               // 延迟初始化,首圈圈首赋值先于一切读取
-                                               let mut full_tool_calls: Option<Vec<crate::agent::translator::ToolCall>>;
-                                               let mut finish_reason: Option<String>;
-                                               // B21:provider token 真值(Done chunk 采集,llm_called 埋点消费)
-                                               let mut react_tokens: Option<crate::agent::translator::TokenUsage>;
-                                               // G17:LLM 流式调用计时(每圈新鲜计时,成功/失败指标均在出圈后/Err 臂读取)
-                                               let mut llm_start;
+                                                     // 流式累积量(声明在重试编排外,每圈发起前重置):
+                                                     // 思考留痕:流式所有 reasoning(真流式帧/legacy 整包
+                                                     // 合成/终帧安全网补发)统一经 ThinkingDelta 下行,
+                                                     // 此处随步累积,随 assistant 消息持久化(仅展示链路)
+                                                     let mut full_content = String::new();
+                                                     let mut full_reasoning = String::new();
+                                                     // 以下三项跨圈存活(重试终局后仍需读取),圈首重置;
+                                                     // 延迟初始化,首圈圈首赋值先于一切读取
+                                                     let mut full_tool_calls: Option<Vec<crate::agent::translator::ToolCall>>;
+                                                     let mut finish_reason: Option<String>;
+                                                     // B21:provider token 真值(Done chunk 采集,llm_called 埋点消费)
+                                                     let mut react_tokens: Option<crate::agent::translator::TokenUsage>;
+                                                     // G17:LLM 流式调用计时(每圈新鲜计时,成功/失败指标均在出圈后/Err 臂读取)
+                                                     let mut llm_start;
 
-                                               // 请求体超限恢复编排(只加不改):首发被承载方以 413 类
-                                               // 拒绝时,对发送副本紧急裁剪后重试一次;仍超限 fail-visible
-                                               // (错误面附新开会话指引,轮终止形态与现行一致)。
-                                               // 非 413 错误与成功路径行为零变化。
-                                               let mut payload_retry_used = false;
-                                               'payload_attempt: loop {
-                                                   // 发送前字节门(每圈实测):1.5MB 预警、2MB 主动紧急
-                                                   // 裁剪——裁剪与 413 恢复路径同口径落账;主动裁剪后
-                                                   // 仍超限由下方 413 恢复路径兜底
-                                                   let gate = enforce_payload_byte_gate(&mut messages_to_send);
-                                                   if gate.warned {
-                                                       warn!(session_id = %session_id, bytes = gate.bytes_before, "payload byte gate: warn threshold reached (1.5MB)");
-                                                   }
-                                                   if gate.trimmed {
-                                                       if let Some(tr) = &gate.trim_report {
-                                                           if let Some(j) = &journal {
-                                                               if let Err(je) = j.emergency_trim_performed(
-                                                                   tr.before_chars,
-                                                                   tr.after_chars,
-                                                                   tr.elided_tool_results,
-                                                                   tr.folded_approvals,
-                                                                   tr.history_compacted,
-                                                                   tr.removed_by_role.clone(),
-                                                                   tr.region,
-                                                               ) {
-                                                                   tracing::warn!(session_id = %session_id, error = %je, "emergency_trim_performed journal failed (best-effort)");
-                                                               }
-                                                           }
-                                                           info!(
-                                                               session_id = %session_id,
-                                                               bytes_before = gate.bytes_before,
-                                                               bytes_after = gate.bytes_after,
-                                                               elided_tool_results = tr.elided_tool_results,
-                                                               folded_approvals = tr.folded_approvals,
-                                                               elided_images = tr.elided_images,
-                                                               "payload byte gate: proactive emergency trim applied (2MB)"
-                                                           );
-                                                           // 紧急裁剪产物回写持久化(压缩视图):对齐守卫成立且本轮未落过账
-                                                           // (二次裁剪作用在已裁副本上,下标失真不落);失败仅 warn
-                                                           if send_view_pending {
-                                                               send_view_pending = false;
-                                                               runner.persist_emergency_trim_view(&session_id, tr).await;
-                                                           }
-                                                       }
-                                                   }
-                                               let serde_messages = match serde_json::to_value(&messages_to_send) {
-                                                   Ok(v) => v,
-                                                   Err(e) => {
-                                                       let err = AgentError::Internal(format!("serialize messages: {}", e));
-                                                       yield Ok(AgentEvent::Error(err.clone()));
-                                                       let duration = start_time.elapsed().as_millis() as u64;
-                                                       runner.submit_tool_traces(&session_id).await;
-                                                       yield Ok(AgentEvent::Done(AgentResult::error(
-                                                           err.to_string(), step_count, duration,
-                                                       )));
-                                                       return;
-                                                   }
-                                               };
-                                               let tcb_messages = serde_messages.clone();
+                                                     // 请求体超限恢复编排(只加不改):首发被承载方以 413 类
+                                                     // 拒绝时,对发送副本紧急裁剪后重试一次;仍超限 fail-visible
+                                                     // (错误面附新开会话指引,轮终止形态与现行一致)。
+                                                     // 非 413 错误与成功路径行为零变化。
+                                                     let mut payload_retry_used = false;
+                                                     'payload_attempt: loop {
+                                                         // 发送前字节门(每圈实测):1.5MB 预警、2MB 主动紧急
+                                                         // 裁剪——裁剪与 413 恢复路径同口径落账;主动裁剪后
+                                                         // 仍超限由下方 413 恢复路径兜底
+                                                         let gate = enforce_payload_byte_gate(&mut messages_to_send);
+                                                         if gate.warned {
+                                                             warn!(session_id = %session_id, bytes = gate.bytes_before, "payload byte gate: warn threshold reached (1.5MB)");
+                                                         }
+                                                         if gate.trimmed {
+                                                             if let Some(tr) = &gate.trim_report {
+                                                                 if let Some(j) = &journal {
+                                                                     if let Err(je) = j.emergency_trim_performed(
+                                                                         tr.before_chars,
+                                                                         tr.after_chars,
+                                                                         tr.elided_tool_results,
+                                                                         tr.folded_approvals,
+                                                                         tr.history_compacted,
+                                                                         tr.removed_by_role.clone(),
+                                                                         tr.region,
+                                                                     ) {
+                                                                         tracing::warn!(session_id = %session_id, error = %je, "emergency_trim_performed journal failed (best-effort)");
+                                                                     }
+                                                                 }
+                                                                 info!(
+                                                                     session_id = %session_id,
+                                                                     bytes_before = gate.bytes_before,
+                                                                     bytes_after = gate.bytes_after,
+                                                                     elided_tool_results = tr.elided_tool_results,
+                                                                     folded_approvals = tr.folded_approvals,
+                                                                     elided_images = tr.elided_images,
+                                                                     "payload byte gate: proactive emergency trim applied (2MB)"
+                                                                 );
+                                                                 // 紧急裁剪产物回写持久化(压缩视图):对齐守卫成立且本轮未落过账
+                                                                 // (二次裁剪作用在已裁副本上,下标失真不落);失败仅 warn
+                                                                 if send_view_pending {
+                                                                     send_view_pending = false;
+                                                                     runner.persist_emergency_trim_view(&session_id, tr).await;
+                                                                 }
+                                                             }
+                                                         }
+                                                     let serde_messages = match serde_json::to_value(&messages_to_send) {
+                                                         Ok(v) => v,
+                                                         Err(e) => {
+                                                             let err = AgentError::Internal(format!("serialize messages: {}", e));
+                                                             yield Ok(AgentEvent::Error(err.clone()));
+                                                             let duration = start_time.elapsed().as_millis() as u64;
+                                                             runner.submit_tool_traces(&session_id).await;
+                                                             yield Ok(AgentEvent::Done(AgentResult::error(
+                                                                 err.to_string(), step_count, duration,
+                                                             )));
+                                                             return;
+                                                         }
+                                                     };
+                                                     let tcb_messages = serde_messages.clone();
 
-                                               // D6 字节级存证：发送时刻哈希入链（fail-soft）
-                                               runner
-                                                   .attest_wire(
-                                                       &session_id,
-                                                       model,
-                                                       temperature,
-                                                       &serde_messages,
-                                                       messages_to_send.len(),
-                                                       "react-stream",
-                                                   )
-                                                   .await;
+                                                     // D6 字节级存证：发送时刻哈希入链（fail-soft）
+                                                     runner
+                                                         .attest_wire(
+                                                             &session_id,
+                                                             model,
+                                                             temperature,
+                                                             &serde_messages,
+                                                             messages_to_send.len(),
+                                                             "react-stream",
+                                                         )
+                                                         .await;
 
-                                               let mut call_params = serde_json::Map::new();
-                                               call_params.insert("model".to_string(), Value::from(model.to_string()));
-                                               call_params.insert("temperature".to_string(), Value::from(temperature.to_string()));
-                                               call_params.insert("messages".to_string(), tcb_messages);
-                                               // 转发 constitution 中继的 tools(同 handle_call_external 非流式路径);
-                                               // server 中继缺省时回 runner 本地 schema(见 resolve_llm_tools)
-                                               if let Some(tools) = runner.resolve_llm_tools(&params) {
-                                                   call_params.insert("tools".to_string(), tools);
-                                               }
-                                               let call_params_json = Value::Object(call_params);
+                                                     let mut call_params = serde_json::Map::new();
+                                                     call_params.insert("model".to_string(), Value::from(model.to_string()));
+                                                     call_params.insert("temperature".to_string(), Value::from(temperature.to_string()));
+                                                     call_params.insert("messages".to_string(), tcb_messages);
+                                                     // 转发 constitution 中继的 tools(同 handle_call_external 非流式路径);
+                                                     // server 中继缺省时回 runner 本地 schema(见 resolve_llm_tools)
+                                                     if let Some(tools) = runner.resolve_llm_tools(&params) {
+                                                         call_params.insert("tools".to_string(), tools);
+                                                     }
+                                                     let call_params_json = Value::Object(call_params);
 
-                                               // G1:启动流式 LLM 调用
-                                               // G17:LLM 流式调用计时(每圈新鲜计时,Err 分支单独记录)
-                                               llm_start = std::time::Instant::now();
-                                               let mut llm_stream = runner.llm_handler.execute_stream(&call_params_json);
-                                               full_content.clear();
-                                               full_reasoning.clear();
-                                               full_tool_calls = None;
-                                               finish_reason = None;
-                                               react_tokens = None;
+                                                     // G1:启动流式 LLM 调用
+                                                     // G17:LLM 流式调用计时(每圈新鲜计时,Err 分支单独记录)
+                                                     llm_start = std::time::Instant::now();
+                                                     let mut llm_stream = runner.llm_handler.execute_stream(&call_params_json);
+                                                     full_content.clear();
+                                                     full_reasoning.clear();
+                                                     full_tool_calls = None;
+                                                     finish_reason = None;
+                                                     react_tokens = None;
 
-                                               // G6:LLM 流式输出期间也监听取消(token-by-token 响应)
-                                               loop {
-                                                   let chunk = tokio::select! {
-                                                       c = llm_stream.next() => match c {
-                                                           Some(c) => c,
-                                                           None => break,
-                                                       },
-                                                       _ = cancel_token.cancelled() => {
-                                                           info!("Cancelled during LLM streaming, cleaning up");
-                                                           if let Some(rid) = request_id {
-                                                               if let Err(e) = runner.evorule_client
-                                                                   .submit_io_response(
-                                                                       &session_id, rid,
-                                                                       &serde_json::json!({"content": "", "error": "cancelled"}),
-                                                                       Some("cancelled"),
-                                                                   )
-                                                                   .await
-                                                               {
-                                                                   tracing::warn!(session_id = %session_id, request_id = rid, error = %e, "submit_io_response (cancel) failed; io_request may hang on engine side");
-                                                               }
-                                                           }
-                                                           let duration = start_time.elapsed().as_millis() as u64;
-                                                           yield Ok(AgentEvent::Error(AgentError::Internal(
-                                                               "cancelled by user".to_string(),
-                                                           )));
-                                                           yield Ok(AgentEvent::Done(AgentResult::cancelled_result(
-                                                               tool_calls.clone(),
-                                                               step_count,
-                                                               duration,
-                                                           )));
-                                                           if let Err(e) = runner.flush_messages(&session_id).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                       }
-                                                           runner.submit_tool_traces(&session_id).await;
-                                                           // B21:turn_ended(cancelled)
-                                                           return;
-                                                       }
-                                                   };
-                                                   match chunk {
-                                                       Ok(StreamChunk::Delta(text)) => {
-                                                           full_content.push_str(&text);
-                                                           yield Ok(AgentEvent::LlmDelta { text });
-                                                       }
-                                                       Ok(StreamChunk::ThinkingDelta(text)) => {
-                                                           // 思考增量:事件下行(展示链路)随步累积+
-                                                           // 随 assistant 消息持久化留痕;不入会话
-                                                           // 消息,续话回放/wire 组装不见(G15 剥离)
-                                                           full_reasoning.push_str(&text);
-                                                           yield Ok(AgentEvent::LlmThinkingDelta { text });
-                                                       }
-                                                       Ok(StreamChunk::ToolCallDelta { .. }) => {
-                                                           // 聚合在 execute_stream 内部完成,不 yield 半截 JSON
-                                                       }
-                                                       Ok(StreamChunk::Done(resp)) => {
-                                                           full_content = resp.content.clone();
-                                                           full_tool_calls = resp.tool_calls.clone();
-                                                           finish_reason = resp.finish_reason.clone();
-                                                           // 会话收尾幽灵 tool_call 过滤(噪音防御,
-                                                           // 见 filter_ghost_tool_calls 注释)
-                                                           let (filtered, dropped_ghosts) =
-                                                               filter_ghost_tool_calls(
-                                                                   finish_reason.as_deref(),
-                                                                   full_tool_calls.take(),
-                                                               );
-                                                           if dropped_ghosts > 0 {
-                                                               warn!(
-                                                                   %session_id,
-                                                                   dropped = dropped_ghosts,
-                                                                   finish = %finish_reason.clone().unwrap_or_default(),
-                                                                   "dropped trailing tool_call(s) with non-object arguments on stop-finish response (provider protocol noise)"
-                                                               );
-                                                           }
-                                                           full_tool_calls = filtered;
-                                                           last_llm_content = full_content.clone();
-                                                           // B21:采集 provider token 真值
-                                                           react_tokens = resp.token_usage.clone();
-                                                           // plan-execute tokens 埋点（流式路径等效累加点，
-                                                           // 对齐非流式 run() IoRequest 臂）：
-                                                           // delegate 改走流式运行，埋点随 token_counter 继续生效
-                                                           // （流式中间态不提交 io_response，无非流式的 result 侧通道）
-                                                           if let Some(counter) = &runner.token_counter {
-                                                               if let Some(usage) = &resp.token_usage {
-                                                                   counter.fetch_add(
-                                                                       usage.total_tokens as u64,
-                                                                       std::sync::atomic::Ordering::Relaxed,
-                                                                   );
-                                                               }
-                                                           }
-                                                           // Fallback: LLM 未走 function calling 协议时,
-                                                           // 尝试从文本内容中解析 JSON tool call
-                                                           if full_tool_calls.is_none() || full_tool_calls.as_ref().map(|t| t.is_empty()).unwrap_or(true) {
-                                                               if let Some(parsed) = try_parse_tool_call_from_text(&full_content) {
-                                                                   info!(
-                                                                       %session_id,
-                                                                       count = parsed.len(),
-                                                                       "Fallback: parsed tool call from LLM text content"
-                                                                   );
-                                                                   full_tool_calls = Some(parsed);
-                                                                   // 文本内容已被解析为 tool call,清空 content 避免重复展示
-                                                                   full_content = String::new();
-                                                                   last_llm_content = String::new();
-                                                               }
-                                                           }
-                                                           yield Ok(AgentEvent::LlmDone {
-                                                               content: full_content.clone(),
-                                                               finish_reason: resp.finish_reason.clone(),
-                                                           });
-                                                       }
-                                                       Ok(StreamChunk::Warn(msg)) => {
-                                                           yield Ok(AgentEvent::Info(msg));
-                                                       }
-                                                       Err(e) => {
-                                                           // G17:记录 LLM 流式调用失败指标
-                                                           if let Some(m) = &runner.metrics {
-                                                               m.observe_llm_call(model, llm_start.elapsed(), false);
-                                                           }
-                                                           // 请求体超限恢复:首发命中且未用过重试
-                                                           // → 发送副本紧急裁剪(journal 审计同权落账)后重试一次
-                                                           if is_payload_limit_error(&e) && !payload_retry_used {
-                                                               payload_retry_used = true;
-                                                               let report = emergency_trim_for_payload_limit(&mut messages_to_send);
-                                                               if let Some(j) = &journal {
-                                                                   if let Err(je) = j.emergency_trim_performed(
-                                                                       report.before_chars,
-                                                                       report.after_chars,
-                                                                       report.elided_tool_results,
-                                                                       report.folded_approvals,
-                                                                       report.history_compacted,
-                                                                       report.removed_by_role.clone(),
-                                                                       report.region,
-                                                                   ) {
-                                                                       tracing::warn!(session_id = %session_id, error = %je, "emergency_trim_performed journal failed (best-effort)");
-                                                                   }
-                                                               }
-                                                               info!(
-                                                                   session_id = %session_id,
-                                                                   before = report.before_chars,
-                                                                   after = report.after_chars,
-                                                                   elided_tool_results = report.elided_tool_results,
-                                                                   folded_approvals = report.folded_approvals,
-                                                                   history_compacted = report.history_compacted,
-                                                                   "payload limit hit: emergency trim applied, retrying once"
-                                                               );
-                                                               // 紧急裁剪产物回写持久化(压缩视图):对齐守卫成立且本轮未落过账
-                                                               // (若主动门已落账则 pending=false,此处跳过);失败仅 warn
-                                                               if send_view_pending {
-                                                                   send_view_pending = false;
-                                                                   runner.persist_emergency_trim_view(&session_id, &report).await;
-                                                               }
-                                                               if report.after_chars < report.before_chars {
-                                                                   continue 'payload_attempt;
-                                                               }
-                                                               // 裁剪无收益(无可折叠)→ 下方现行终局(fail-visible 文案兜住)
-                                                           }
-                                                           // 413 类终局错误面附新开会话指引(fail-visible);
-                                                           // 非 413 错误串零变化
-                                                           let e = if is_payload_limit_error(&e) {
-                                                               format!("{e}{}", PAYLOAD_LIMIT_FAIL_VISIBLE_HINT)
-                                                           } else {
-                                                               e
-                                                           };
-                                                           // 会话收尾降级兜底:上游 invalid params 拒绝且
-                                                           // 上一轮已有非空最终内容时——答案已产出(幽灵
-                                                           // tool_call 错误回喂是主要成因,噪音防御见 Done
-                                                           // 臂过滤),turn 按 success+warning 收口而非 error,
-                                                           // 不把已完成的回答埋进失败终态
-                                                           if is_invalid_params_rejection(&e)
-                                                               && !last_llm_content.is_empty()
-                                                           {
-                                                               warn!(
-                                                                   %session_id,
-                                                                   error = %e,
-                                                                   "upstream rejected the follow-up request (invalid params); finalizing with last LLM content (success + warning)"
-                                                               );
-                                                               let mut submit_ok = true;
-                                                               if let Some(rid) = request_id {
-                                                                   let resp = serde_json::json!({
-                                                                       "content": last_llm_content,
-                                                                       "tool_calls": serde_json::Value::Null,
-                                                                       "is_finished": true,
-                                                                   });
-                                                                   if let Err(ie) = runner
-                                                                       .evorule_client
-                                                                       .submit_io_response(
-                                                                           &session_id, rid, &resp, None,
-                                                                       )
-                                                                       .await
-                                                                   {
-                                                                       warn!(
-                                                                           %session_id,
-                                                                           request_id = rid,
-                                                                           error = %ie,
-                                                                           "io_response (downgraded finalize) submit failed; falling back to error terminal"
-                                                                       );
-                                                                       submit_ok = false;
-                                                                   }
-                                                               }
-                                                               if submit_ok {
-                                                                   yield Ok(AgentEvent::Info(
-                                                                       "warning: follow-up request was rejected by the provider; finalized with the last model response"
-                                                                           .to_string(),
-                                                                   ));
-                                                                   let duration =
-                                                                       start_time.elapsed().as_millis() as u64;
-                                                                   if let Some(g) = turn_guard.take() {
-                                                                       g.end("success", step_count as u64, duration);
-                                                                   }
-                                                                   if let Err(fe) = runner.flush_messages(&session_id).await {
-                                                                       warn!(%session_id, error = %fe, "flush_messages during downgraded wrap-up failed");
-                                                                   }
-                                                                   runner.submit_tool_traces(&session_id).await;
-                                                                   let mut result = AgentResult::success(
-                                                                       last_llm_content.clone(),
-                                                                       step_count,
-                                                                       duration,
-                                                                       tool_calls.clone(),
-                                                                   );
-                                                                   result.tokens = runner
-                                                                       .usage_counter
-                                                                       .as_ref()
-                                                                       .map(|c| c.snapshot());
-                                                                   yield Ok(AgentEvent::Done(result));
-                                                                   return;
-                                                               }
-                                                           }
-                                                           // 提交 error io_response 防止 evorule 卡死
-                                                           if let Some(rid) = request_id {
-                                                               let err_resp = serde_json::json!({"content": "", "error": &e});
-                                                               if let Err(ie) = runner.evorule_client
-                                                                   .submit_io_response(&session_id, rid, &err_resp, Some(e.as_str()))
-                                                                   .await
-                                                               {
-                                                                   tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (llm_error) failed; io_request may hang on engine side");
-                                                               }
-                                                           }
-                                                           let err = AgentError::LlmError(e);
-                                                           yield Ok(AgentEvent::Error(err.clone()));
-                                                           let duration = start_time.elapsed().as_millis() as u64;
-                                                           // B21:turn_ended(error)
-                                                           if let Some(g) = turn_guard.take() {
-                                                               g.end("error", step_count as u64, duration);
-                                                           }
-                                                           if let Err(e) = runner.flush_messages(&session_id).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                       }
-                                                           runner.submit_tool_traces(&session_id).await;
-                                                           yield Ok(AgentEvent::Done(AgentResult::error(
-                                                               err.to_string(), step_count, duration,
-                                                           )));
-                                                           return;
-                                                       }
-                                                   }
-                                               }
-                                               // 消费循环正常完成 → 出重试编排(除 fail-visible 终局
-                                               // return 外的唯一出口)
-                                               break 'payload_attempt;
-                                               }
+                                                     // G6:LLM 流式输出期间也监听取消(token-by-token 响应)
+                                                     loop {
+                                                         let chunk = tokio::select! {
+                                                             c = llm_stream.next() => match c {
+                                                                 Some(c) => c,
+                                                                 None => break,
+                                                             },
+                                                             _ = cancel_token.cancelled() => {
+                                                                 info!("Cancelled during LLM streaming, cleaning up");
+                                                                 if let Some(rid) = request_id {
+                                                                     if let Err(e) = runner.evorule_client
+                                                                         .submit_io_response(
+                                                                             &session_id, rid,
+                                                                             &serde_json::json!({"content": "", "error": "cancelled"}),
+                                                                             Some("cancelled"),
+                                                                         )
+                                                                         .await
+                                                                     {
+                                                                         tracing::warn!(session_id = %session_id, request_id = rid, error = %e, "submit_io_response (cancel) failed; io_request may hang on engine side");
+                                                                     }
+                                                                 }
+                                                                 let duration = start_time.elapsed().as_millis() as u64;
+                                                                 yield Ok(AgentEvent::Error(AgentError::Internal(
+                                                                     "cancelled by user".to_string(),
+                                                                 )));
+                                                                 yield Ok(AgentEvent::Done(AgentResult::cancelled_result(
+                                                                     tool_calls.clone(),
+                                                                     step_count,
+                                                                     duration,
+                                                                 )));
+                                                                 if let Err(e) = runner.flush_messages(&session_id).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                             }
+                                                                 runner.submit_tool_traces(&session_id).await;
+                                                                 // B21:turn_ended(cancelled)
+                                                                 return;
+                                                             }
+                                                         };
+                                                         match chunk {
+                                                             Ok(StreamChunk::Delta(text)) => {
+                                                                 full_content.push_str(&text);
+                                                                 yield Ok(AgentEvent::LlmDelta { text });
+                                                             }
+                                                             Ok(StreamChunk::ThinkingDelta(text)) => {
+                                                                 // 思考增量:事件下行(展示链路)随步累积+
+                                                                 // 随 assistant 消息持久化留痕;不入会话
+                                                                 // 消息,续话回放/wire 组装不见(G15 剥离)
+                                                                 full_reasoning.push_str(&text);
+                                                                 yield Ok(AgentEvent::LlmThinkingDelta { text });
+                                                             }
+                                                             Ok(StreamChunk::ToolCallDelta { .. }) => {
+                                                                 // 聚合在 execute_stream 内部完成,不 yield 半截 JSON
+                                                             }
+                                                             Ok(StreamChunk::Done(resp)) => {
+                                                                 full_content = resp.content.clone();
+                                                                 full_tool_calls = resp.tool_calls.clone();
+                                                                 finish_reason = resp.finish_reason.clone();
+                                                                 // 会话收尾幽灵 tool_call 过滤(噪音防御,
+                                                                 // 见 filter_ghost_tool_calls 注释)
+                                                                 let (filtered, dropped_ghosts) =
+                                                                     filter_ghost_tool_calls(
+                                                                         finish_reason.as_deref(),
+                                                                         full_tool_calls.take(),
+                                                                     );
+                                                                 if dropped_ghosts > 0 {
+                                                                     warn!(
+                                                                         %session_id,
+                                                                         dropped = dropped_ghosts,
+                                                                         finish = %finish_reason.clone().unwrap_or_default(),
+                                                                         "dropped trailing tool_call(s) with non-object arguments on stop-finish response (provider protocol noise)"
+                                                                     );
+                                                                 }
+                                                                 full_tool_calls = filtered;
+                                                                 last_llm_content = full_content.clone();
+                                                                 // B21:采集 provider token 真值
+                                                                 react_tokens = resp.token_usage.clone();
+                                                                 // plan-execute tokens 埋点（流式路径等效累加点，
+                                                                 // 对齐非流式 run() IoRequest 臂）：
+                                                                 // delegate 改走流式运行，埋点随 token_counter 继续生效
+                                                                 // （流式中间态不提交 io_response，无非流式的 result 侧通道）
+                                                                 if let Some(counter) = &runner.token_counter {
+                                                                     if let Some(usage) = &resp.token_usage {
+                                                                         counter.fetch_add(
+                                                                             usage.total_tokens as u64,
+                                                                             std::sync::atomic::Ordering::Relaxed,
+                                                                         );
+                                                                     }
+                                                                 }
+                                                                 // Fallback: LLM 未走 function calling 协议时,
+                                                                 // 尝试从文本内容中解析 JSON tool call
+                                                                 if full_tool_calls.is_none() || full_tool_calls.as_ref().map(|t| t.is_empty()).unwrap_or(true) {
+                                                                     if let Some(parsed) = try_parse_tool_call_from_text(&full_content) {
+                                                                         info!(
+                                                                             %session_id,
+                                                                             count = parsed.len(),
+                                                                             "Fallback: parsed tool call from LLM text content"
+                                                                         );
+                                                                         full_tool_calls = Some(parsed);
+                                                                         // 文本内容已被解析为 tool call,清空 content 避免重复展示
+                                                                         full_content = String::new();
+                                                                         last_llm_content = String::new();
+                                                                     }
+                                                                 }
+                                                                 yield Ok(AgentEvent::LlmDone {
+                                                                     content: full_content.clone(),
+                                                                     finish_reason: resp.finish_reason.clone(),
+                                                                 });
+                                                             }
+                                                             Ok(StreamChunk::Warn(msg)) => {
+                                                                 yield Ok(AgentEvent::Info(msg));
+                                                             }
+                                                             Err(e) => {
+                                                                 // G17:记录 LLM 流式调用失败指标
+                                                                 if let Some(m) = &runner.metrics {
+                                                                     m.observe_llm_call(model, llm_start.elapsed(), false);
+                                                                 }
+                                                                 // 请求体超限恢复:首发命中且未用过重试
+                                                                 // → 发送副本紧急裁剪(journal 审计同权落账)后重试一次
+                                                                 if is_payload_limit_error(&e) && !payload_retry_used {
+                                                                     payload_retry_used = true;
+                                                                     let report = emergency_trim_for_payload_limit(&mut messages_to_send);
+                                                                     if let Some(j) = &journal {
+                                                                         if let Err(je) = j.emergency_trim_performed(
+                                                                             report.before_chars,
+                                                                             report.after_chars,
+                                                                             report.elided_tool_results,
+                                                                             report.folded_approvals,
+                                                                             report.history_compacted,
+                                                                             report.removed_by_role.clone(),
+                                                                             report.region,
+                                                                         ) {
+                                                                             tracing::warn!(session_id = %session_id, error = %je, "emergency_trim_performed journal failed (best-effort)");
+                                                                         }
+                                                                     }
+                                                                     info!(
+                                                                         session_id = %session_id,
+                                                                         before = report.before_chars,
+                                                                         after = report.after_chars,
+                                                                         elided_tool_results = report.elided_tool_results,
+                                                                         folded_approvals = report.folded_approvals,
+                                                                         history_compacted = report.history_compacted,
+                                                                         "payload limit hit: emergency trim applied, retrying once"
+                                                                     );
+                                                                     // 紧急裁剪产物回写持久化(压缩视图):对齐守卫成立且本轮未落过账
+                                                                     // (若主动门已落账则 pending=false,此处跳过);失败仅 warn
+                                                                     if send_view_pending {
+                                                                         send_view_pending = false;
+                                                                         runner.persist_emergency_trim_view(&session_id, &report).await;
+                                                                     }
+                                                                     if report.after_chars < report.before_chars {
+                                                                         continue 'payload_attempt;
+                                                                     }
+                                                                     // 裁剪无收益(无可折叠)→ 下方现行终局(fail-visible 文案兜住)
+                                                                 }
+                                                                 // 413 类终局错误面附新开会话指引(fail-visible);
+                                                                 // 非 413 错误串零变化
+                                                                 let e = if is_payload_limit_error(&e) {
+                                                                     format!("{e}{}", PAYLOAD_LIMIT_FAIL_VISIBLE_HINT)
+                                                                 } else {
+                                                                     e
+                                                                 };
+                                                                 // 会话收尾降级兜底:上游 invalid params 拒绝且
+                                                                 // 上一轮已有非空最终内容时——答案已产出(幽灵
+                                                                 // tool_call 错误回喂是主要成因,噪音防御见 Done
+                                                                 // 臂过滤),turn 按 success+warning 收口而非 error,
+                                                                 // 不把已完成的回答埋进失败终态
+                                                                 if is_invalid_params_rejection(&e)
+                                                                     && !last_llm_content.is_empty()
+                                                                 {
+                                                                     warn!(
+                                                                         %session_id,
+                                                                         error = %e,
+                                                                         "upstream rejected the follow-up request (invalid params); finalizing with last LLM content (success + warning)"
+                                                                     );
+                                                                     let mut submit_ok = true;
+                                                                     if let Some(rid) = request_id {
+                                                                         let resp = serde_json::json!({
+                                                                             "content": last_llm_content,
+                                                                             "tool_calls": serde_json::Value::Null,
+                                                                             "is_finished": true,
+                                                                         });
+                                                                         if let Err(ie) = runner
+                                                                             .evorule_client
+                                                                             .submit_io_response(
+                                                                                 &session_id, rid, &resp, None,
+                                                                             )
+                                                                             .await
+                                                                         {
+                                                                             warn!(
+                                                                                 %session_id,
+                                                                                 request_id = rid,
+                                                                                 error = %ie,
+                                                                                 "io_response (downgraded finalize) submit failed; falling back to error terminal"
+                                                                             );
+                                                                             submit_ok = false;
+                                                                         }
+                                                                     }
+                                                                     if submit_ok {
+                                                                         yield Ok(AgentEvent::Info(
+                                                                             "warning: follow-up request was rejected by the provider; finalized with the last model response"
+                                                                                 .to_string(),
+                                                                         ));
+                                                                         let duration =
+                                                                             start_time.elapsed().as_millis() as u64;
+                                                                         if let Some(g) = turn_guard.take() {
+                                                                             g.end("success", step_count as u64, duration);
+                                                                         }
+                                                                         if let Err(fe) = runner.flush_messages(&session_id).await {
+                                                                             warn!(%session_id, error = %fe, "flush_messages during downgraded wrap-up failed");
+                                                                         }
+                                                                         runner.submit_tool_traces(&session_id).await;
+                                                                         let mut result = AgentResult::success(
+                                                                             last_llm_content.clone(),
+                                                                             step_count,
+                                                                             duration,
+                                                                             tool_calls.clone(),
+                                                                         );
+                                                                         result.tokens = runner
+                                                                             .usage_counter
+                                                                             .as_ref()
+                                                                             .map(|c| c.snapshot());
+                                                                         yield Ok(AgentEvent::Done(result));
+                                                                         return;
+                                                                     }
+                                                                 }
+                                                                 // 提交 error io_response 防止 evorule 卡死
+                                                                 if let Some(rid) = request_id {
+                                                                     let err_resp = serde_json::json!({"content": "", "error": &e});
+                                                                     if let Err(ie) = runner.evorule_client
+                                                                         .submit_io_response(&session_id, rid, &err_resp, Some(e.as_str()))
+                                                                         .await
+                                                                     {
+                                                                         tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (llm_error) failed; io_request may hang on engine side");
+                                                                     }
+                                                                 }
+                                                                 let err = AgentError::LlmError(e);
+                                                                 yield Ok(AgentEvent::Error(err.clone()));
+                                                                 let duration = start_time.elapsed().as_millis() as u64;
+                                                                 // B21:turn_ended(error)
+                                                                 if let Some(g) = turn_guard.take() {
+                                                                     g.end("error", step_count as u64, duration);
+                                                                 }
+                                                                 if let Err(e) = runner.flush_messages(&session_id).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                             }
+                                                                 runner.submit_tool_traces(&session_id).await;
+                                                                 yield Ok(AgentEvent::Done(AgentResult::error(
+                                                                     err.to_string(), step_count, duration,
+                                                                 )));
+                                                                 return;
+                                                             }
+                                                         }
+                                                     }
+                                                     // 消费循环正常完成 → 出重试编排(除 fail-visible 终局
+                                                     // return 外的唯一出口)
+                                                     break 'payload_attempt;
+                                                     }
 
-                                               // G17:记录 LLM 流式调用成功指标(正常完成)
-                                               if let Some(m) = &runner.metrics {
-                                                   m.observe_llm_call(model, llm_start.elapsed(), true);
-                                               }
+                                                     // G17:记录 LLM 流式调用成功指标(正常完成)
+                                                     if let Some(m) = &runner.metrics {
+                                                         m.observe_llm_call(model, llm_start.elapsed(), true);
+                                                     }
 
-                                               // 缓存命中观测:provider 回执的缓存命中输入 token
-                                               // 入指标面(未回执归零,防跨调用误读旧值)
-                                               if let Some(m) = &runner.metrics {
-                                                   if let Some(usage) = &react_tokens {
-                                                       m.set_llm_cached_tokens_last(
-                                                           usage.cached_tokens.unwrap_or(0) as u64,
-                                                       );
-                                                   }
-                                               }
+                                                     // 缓存命中观测:provider 回执的缓存命中输入 token
+                                                     // 入指标面(未回执归零,防跨调用误读旧值)
+                                                     if let Some(m) = &runner.metrics {
+                                                         if let Some(usage) = &react_tokens {
+                                                             m.set_llm_cached_tokens_last(
+                                                                 usage.cached_tokens.unwrap_or(0) as u64,
+                                                             );
+                                                         }
+                                                     }
 
-                                               // usage 真值喂入:provider 真值入滑动窗口 → 压缩
-                                               // 决策真值驱动 + 收尾三元组累计（流式路径）
-                                               if let Some(counter) = &runner.usage_counter {
-                                                   if let Some(usage) = &react_tokens {
-                                                       counter.observe(usage);
-                                                   }
-                                               }
+                                                     // usage 真值喂入:provider 真值入滑动窗口 → 压缩
+                                                     // 决策真值驱动 + 收尾三元组累计（流式路径）
+                                                     if let Some(counter) = &runner.usage_counter {
+                                                         if let Some(usage) = &react_tokens {
+                                                             counter.observe(usage);
+                                                         }
+                                                     }
 
-                                               // B21:llm_called 事件(provider 真值优先,tokens_est 兜底;
-                                               // purpose=react,One-LLM-per-step 映射依据)
-                                               if let Some(j) = &journal {
-                                                   let tokens = react_tokens.as_ref().map(|u| {
-                                                       crate::agent::journal::TokenRecord {
-                                                           prompt: u.prompt_tokens as u64,
-                                                           completion: u.completion_tokens as u64,
-                                                           total: u.total_tokens as u64,
-                                                           cached: u.cached_tokens.map(|v| v as u64),
-                                                       }
-                                                   });
-                                                   // tokens_est:近似计数器估算 prompt+completion 总量
-                                                   let tokens_est = {
-                                                       use crate::agent::context_window::TokenCounter as _;
-                                                       let counter = crate::agent::context_window::ApproxTokenCounter::new();
-                                                       (counter.count_messages(&messages_to_send)
-                                                           + counter.count_message(&crate::agent::translator::Message::Assistant {
-                                                               content: full_content.clone(),
-                                                               tool_calls: None,
-                                                           })) as u64
-                                                   };
-                                                   if let Err(e) = j.llm_called_react(
-                                                       model,
-                                                       request_id,
-                                                       tokens,
-                                                       Some(tokens_est),
-                                                       messages_to_send.len(),
-                                                       &full_content,
-                                                       Some(react_temperature),
-                                                   ) {
-                                                       warn!(%session_id, error = %e, "B21: llm_called journal failed");
-                                                   }
-                                               }
+                                                     // B21:llm_called 事件(provider 真值优先,tokens_est 兜底;
+                                                     // purpose=react,One-LLM-per-step 映射依据)
+                                                     if let Some(j) = &journal {
+                                                         let tokens = react_tokens.as_ref().map(|u| {
+                                                             crate::agent::journal::TokenRecord {
+                                                                 prompt: u.prompt_tokens as u64,
+                                                                 completion: u.completion_tokens as u64,
+                                                                 total: u.total_tokens as u64,
+                                                                 cached: u.cached_tokens.map(|v| v as u64),
+                                                             }
+                                                         });
+                                                         // tokens_est:近似计数器估算 prompt+completion 总量
+                                                         let tokens_est = {
+                                                             use crate::agent::context_window::TokenCounter as _;
+                                                             let counter = crate::agent::context_window::ApproxTokenCounter::new();
+                                                             (counter.count_messages(&messages_to_send)
+                                                                 + counter.count_message(&crate::agent::translator::Message::Assistant {
+                                                                     content: full_content.clone(),
+                                                                     tool_calls: None,
+                                                                 })) as u64
+                                                         };
+                                                         if let Err(e) = j.llm_called_react(
+                                                             model,
+                                                             request_id,
+                                                             tokens,
+                                                             Some(tokens_est),
+                                                             messages_to_send.len(),
+                                                             &full_content,
+                                                             Some(react_temperature),
+                                                         ) {
+                                                             warn!(%session_id, error = %e, "B21: llm_called journal failed");
+                                                         }
+                                                     }
 
-                                               // G13:并行预执行工具(max_parallel_tools > 1 且有多个 tool_calls 时)
-                                               // 预执行=管道并行实例(PR-3):产物=已过闸结果,存入 parallel_tool_cache,
-                                               // 后续 call_service 命中走缓存收口路径(①-⑤⑧照常仅⑦免重执行)
-                                               // candidate 工具(返回 proposal)不缓存,留给 call_service 走审批
-                                               if runner.config.max_parallel_tools > 1 {
-                                                   if let Some(tcs) = &full_tool_calls {
-                                                       // 缓存键无轮次语义——每轮无条件清空（同上）
-                                                       runner.parallel_cache_clear();
-                                                       if tcs.len() > 1 {
-                                                           let _results = runner.execute_tools_parallel(&session_id, tcs).await;
-                                                           info!(
-                                                               %session_id,
-                                                               count = tcs.len(),
-                                                               "G13: parallel tool pre-execution completed (results cached)"
-                                                           );
-                                                       }
-                                                   }
-                                               }
+                                                     // G13:并行预执行工具(max_parallel_tools > 1 且有多个 tool_calls 时)
+                                                     // 预执行=管道并行实例(PR-3):产物=已过闸结果,存入 parallel_tool_cache,
+                                                     // 后续 call_service 命中走缓存收口路径(①-⑤⑧照常仅⑦免重执行)
+                                                     // candidate 工具(返回 proposal)不缓存,留给 call_service 走审批
+                                                     if runner.config.max_parallel_tools > 1 {
+                                                         if let Some(tcs) = &full_tool_calls {
+                                                             // 缓存键无轮次语义——每轮无条件清空（同上）
+                                                             runner.parallel_cache_clear();
+                                                             if tcs.len() > 1 {
+                                                                 let _results = runner.execute_tools_parallel(&session_id, tcs).await;
+                                                                 info!(
+                                                                     %session_id,
+                                                                     count = tcs.len(),
+                                                                     "G13: parallel tool pre-execution completed (results cached)"
+                                                                 );
+                                                             }
+                                                         }
+                                                     }
 
-                                                                               // ===== ReAct 分叉:有 tool_calls → 本地执行回喂;无 → 提交收尾 =====
-                                               let has_tool_calls = full_tool_calls
-                                                   .as_ref()
-                                                   .map(|tcs| !tcs.is_empty())
-                                                   .unwrap_or(false);
+                                                                                     // ===== ReAct 分叉:有 tool_calls → 本地执行回喂;无 → 提交收尾 =====
+                                                     let has_tool_calls = full_tool_calls
+                                                         .as_ref()
+                                                         .map(|tcs| !tcs.is_empty())
+                                                         .unwrap_or(false);
 
-                                               // 轮级序列循环检测(执行前观察;指纹 result-free 免疫
-                                               // 结果抖动,滑动窗判立即重复与 ABA 交替;标记复用两级
-                                               // 软指引随本轮首个 tool_result 回喂——终止行为零变化,
-                                               // max_steps 仍为最终兜底)
-                                               if has_tool_calls {
-                                                   if let Some(tcs) = &full_tool_calls {
-                                                       let fp = crate::agent::stagnation::round_fingerprint(
-                                                           &tcs.iter()
-                                                               .map(|tc| (tc.name.clone(), tc.arguments.clone()))
-                                                               .collect::<Vec<_>>(),
-                                                       );
-                                                       match runner.sequence_loop.observe_round(&fp) {
-                                                           StagnationVerdict::Normal => {}
-                                                           StagnationVerdict::Warning { repeat_count } => {
-                                                               warn!(%session_id, repeat_count, "sequence loop warning (轮级序列重复)");
-                                                               runner.pending_note_feed = true;
-                                                               seq_mark = Some(STAGNATION_WARNING_MARK);
-                                                           }
-                                                           StagnationVerdict::Exhausted => {
-                                                               warn!(%session_id, "sequence loop EXHAUSTED (轮级序列重复)——按 H2 阻塞收尾指引");
-                                                               runner.pending_note_feed = true;
-                                                               seq_mark = Some(STAGNATION_EXHAUSTED_MARK);
-                                                           }
-                                                       }
-                                                   }
-                                               }
+                                                     // 轮级序列循环检测(执行前观察;指纹 result-free 免疫
+                                                     // 结果抖动,滑动窗判立即重复与 ABA 交替;标记复用两级
+                                                     // 软指引随本轮首个 tool_result 回喂——终止行为零变化,
+                                                     // max_steps 仍为最终兜底)
+                                                     if has_tool_calls {
+                                                         if let Some(tcs) = &full_tool_calls {
+                                                             let fp = crate::agent::stagnation::round_fingerprint(
+                                                                 &tcs.iter()
+                                                                     .map(|tc| (tc.name.clone(), tc.arguments.clone()))
+                                                                     .collect::<Vec<_>>(),
+                                                             );
+                                                             match runner.sequence_loop.observe_round(&fp) {
+                                                                 StagnationVerdict::Normal => {}
+                                                                 StagnationVerdict::Warning { repeat_count } => {
+                                                                     warn!(%session_id, repeat_count, "sequence loop warning (轮级序列重复)");
+                                                                     runner.pending_note_feed = true;
+                                                                     seq_mark = Some(STAGNATION_WARNING_MARK);
+                                                                 }
+                                                                 StagnationVerdict::Exhausted => {
+                                                                     warn!(%session_id, "sequence loop EXHAUSTED (轮级序列重复)——按 H2 阻塞收尾指引");
+                                                                     runner.pending_note_feed = true;
+                                                                     seq_mark = Some(STAGNATION_EXHAUSTED_MARK);
+                                                                 }
+                                                             }
+                                                         }
+                                                     }
 
-               // 持久化 assistant 消息(同 handle_call_external)
-                                                                               // G11(S1 双路径收敛):无 tool_calls 收尾前做结构化输出
-                                                                               // 校验——语义与非流式 run() :3365 完全一致:
-                                                                               // clean→validate→失败推原始 assistant+System 校正消息
-                                                                               // →continue 'react 重试;重试耗尽降级接受 cleaned
-                                                                               // (fail-visible,不毁回合)。注意:仅收尾轮校验;
-                                                                               // 中间轮(tool_calls 在场)不校验,同 run() 行为。
-                                                                               let g11_validated_content: String = if has_tool_calls {
-                                                                                   // 中间轮(工具调用在场):不校验,原样透传——同 run() 行为
-                                                                                   full_content.clone()
-                                                                               } else {
-                                                                                   let validation_outcome =
-                                                                                       if let Some(validator) = &runner.output_validator {
-                                                                                           let cleaned =
-                                                                                               validator.clean_output(&full_content);
-                                                                                           let max_retries = validator.max_retries();
-                                                                                           let result = validator.validate(&cleaned);
-                                                                                           Some((cleaned, result, max_retries))
-                                                                                       } else {
-                                                                                           None
-                                                                                       };
-                                                                                   match validation_outcome {
-                                                                                       None => full_content.clone(),
-                                                                                       Some((cleaned, Ok(()), _)) => {
-                                                                                           runner.output_format_retries = 0;
-                                                                                           cleaned
-                                                                                       }
-                                                                                       Some((cleaned, Err(err_msg), max_retries)) => {
-                                                                                           if runner.output_format_retries < max_retries {
-                                                                                               runner.output_format_retries += 1;
-                                                                                               let retry_count = runner.output_format_retries;
-                                                                                               // 推原始(未清洗) assistant 到审计链(带思考留痕)
-                                                                                               let a_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
-                                                                                               let a_msg = Message::Assistant {
-                                                                                                   content: full_content.clone(),
-                                                                                                   tool_calls: None,
-                                                                                               };
-                                                                                               messages.push(a_msg.clone());
-                                                                                               if let Err(pe) = runner
-                                                                                                   .persist_message_with_reasoning(
-                                                                                                       &session_id,
-                                                                                                       a_idx,
-                                                                                                       a_msg,
-                                                                                                       reasoning_opt(&full_reasoning),
-                                                                                                   )
-                                                                                                   .await
-                                                                                               {
-                                                                                                   if let Some(rid) = request_id {
-                                                                                                       let pe_str = pe.to_string();
-                                                                                                       let _ = runner.evorule_client
-                                                                                                           .submit_io_response(
-                                                                                                               &session_id,
-                                                                                                               rid,
-                                                                                                               &serde_json::json!({"error": &pe_str}),
-                                                                                                               Some(pe_str.as_str()),
-                                                                                                           )
-                                                                                                           .await;
-                                                                                                   }
-                                                                                                   yield Err(pe);
-                                                                                                   return;
-                                                                                               }
-                                                                                               // 推 System 校正消息(同 run() 模板)
-                                                                                               let c_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
-                                                                                               let c_msg = Message::System {
-                                                                                                   content: format!(
-                                                                                                       "你的上一次输出不符合要求的格式。校验错误:\n{}\n\n\
-                                                                                                        请重新输出,严格符合 JSON Schema 要求,不要包含 markdown 代码块标记。",
-                                                                                                       err_msg
-                                                                                                   ),
-                                                                                               };
-                                                                                               messages.push(c_msg.clone());
-                                                                                               if let Err(pe) = runner
-                                                                                                   .persist_message(&session_id, c_idx, c_msg)
-                                                                                                   .await
-                                                                                               {
-                                                                                                   if let Some(rid) = request_id {
-                                                                                                       let pe_str = pe.to_string();
-                                                                                                       let _ = runner.evorule_client
-                                                                                                           .submit_io_response(
-                                                                                                               &session_id,
-                                                                                                               rid,
-                                                                                                               &serde_json::json!({"error": &pe_str}),
-                                                                                                               Some(pe_str.as_str()),
-                                                                                                           )
-                                                                                                           .await;
-                                                                                                   }
-                                                                                                   yield Err(pe);
-                                                                                                   return;
-                                                                                               }
-                                                                                               info!(
-                                                                                                   %session_id,
-                                                                                                   retry = retry_count,
-                                                                                                   max_retries,
-                                                                                                   "G11(streaming): output validation failed, requesting LLM retry"
-                                                                                               );
-                                                                                               continue 'react;
-                                                                                           } else {
-                                                                                               info!(
-                                                                                                   %session_id,
-                                                                                                   max_retries,
-                                                                                                   "G11(streaming): max retries exhausted, accepting degraded output"
-                                                                                               );
-                                                                                               runner.output_format_retries = 0;
-                                                                                               cleaned
-                                                                                           }
-                                                                                       }
-                                                                                   }
-                                                                               };
-                                                                               let mut full_content = g11_validated_content;
+                     // 持久化 assistant 消息(同 handle_call_external)
+                                                                                     // G11(S1 双路径收敛):无 tool_calls 收尾前做结构化输出
+                                                                                     // 校验——语义与非流式 run() :3365 完全一致:
+                                                                                     // clean→validate→失败推原始 assistant+System 校正消息
+                                                                                     // →continue 'react 重试;重试耗尽降级接受 cleaned
+                                                                                     // (fail-visible,不毁回合)。注意:仅收尾轮校验;
+                                                                                     // 中间轮(tool_calls 在场)不校验,同 run() 行为。
+                                                                                     let g11_validated_content: String = if has_tool_calls {
+                                                                                         // 中间轮(工具调用在场):不校验,原样透传——同 run() 行为
+                                                                                         full_content.clone()
+                                                                                     } else {
+                                                                                         let validation_outcome =
+                                                                                             if let Some(validator) = &runner.output_validator {
+                                                                                                 let cleaned =
+                                                                                                     validator.clean_output(&full_content);
+                                                                                                 let max_retries = validator.max_retries();
+                                                                                                 let result = validator.validate(&cleaned);
+                                                                                                 Some((cleaned, result, max_retries))
+                                                                                             } else {
+                                                                                                 None
+                                                                                             };
+                                                                                         match validation_outcome {
+                                                                                             None => full_content.clone(),
+                                                                                             Some((cleaned, Ok(()), _)) => {
+                                                                                                 runner.output_format_retries = 0;
+                                                                                                 cleaned
+                                                                                             }
+                                                                                             Some((cleaned, Err(err_msg), max_retries)) => {
+                                                                                                 if runner.output_format_retries < max_retries {
+                                                                                                     runner.output_format_retries += 1;
+                                                                                                     let retry_count = runner.output_format_retries;
+                                                                                                     // 推原始(未清洗) assistant 到审计链(带思考留痕)
+                                                                                                     let a_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
+                                                                                                     let a_msg = Message::Assistant {
+                                                                                                         content: full_content.clone(),
+                                                                                                         tool_calls: None,
+                                                                                                     };
+                                                                                                     messages.push(a_msg.clone());
+                                                                                                     if let Err(pe) = runner
+                                                                                                         .persist_message_with_reasoning(
+                                                                                                             &session_id,
+                                                                                                             a_idx,
+                                                                                                             a_msg,
+                                                                                                             reasoning_opt(&full_reasoning),
+                                                                                                         )
+                                                                                                         .await
+                                                                                                     {
+                                                                                                         if let Some(rid) = request_id {
+                                                                                                             let pe_str = pe.to_string();
+                                                                                                             let _ = runner.evorule_client
+                                                                                                                 .submit_io_response(
+                                                                                                                     &session_id,
+                                                                                                                     rid,
+                                                                                                                     &serde_json::json!({"error": &pe_str}),
+                                                                                                                     Some(pe_str.as_str()),
+                                                                                                                 )
+                                                                                                                 .await;
+                                                                                                         }
+                                                                                                         yield Err(pe);
+                                                                                                         return;
+                                                                                                     }
+                                                                                                     // 推 System 校正消息(同 run() 模板)
+                                                                                                     let c_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
+                                                                                                     let c_msg = Message::System {
+                                                                                                         content: format!(
+                                                                                                             "你的上一次输出不符合要求的格式。校验错误:\n{}\n\n\
+                                                                                                              请重新输出,严格符合 JSON Schema 要求,不要包含 markdown 代码块标记。",
+                                                                                                             err_msg
+                                                                                                         ),
+                                                                                                     };
+                                                                                                     messages.push(c_msg.clone());
+                                                                                                     if let Err(pe) = runner
+                                                                                                         .persist_message(&session_id, c_idx, c_msg)
+                                                                                                         .await
+                                                                                                     {
+                                                                                                         if let Some(rid) = request_id {
+                                                                                                             let pe_str = pe.to_string();
+                                                                                                             let _ = runner.evorule_client
+                                                                                                                 .submit_io_response(
+                                                                                                                     &session_id,
+                                                                                                                     rid,
+                                                                                                                     &serde_json::json!({"error": &pe_str}),
+                                                                                                                     Some(pe_str.as_str()),
+                                                                                                                 )
+                                                                                                                 .await;
+                                                                                                         }
+                                                                                                         yield Err(pe);
+                                                                                                         return;
+                                                                                                     }
+                                                                                                     info!(
+                                                                                                         %session_id,
+                                                                                                         retry = retry_count,
+                                                                                                         max_retries,
+                                                                                                         "G11(streaming): output validation failed, requesting LLM retry"
+                                                                                                     );
+                                                                                                     continue 'react;
+                                                                                                 } else {
+                                                                                                     info!(
+                                                                                                         %session_id,
+                                                                                                         max_retries,
+                                                                                                         "G11(streaming): max retries exhausted, accepting degraded output"
+                                                                                                     );
+                                                                                                     runner.output_format_retries = 0;
+                                                                                                     cleaned
+                                                                                                 }
+                                                                                             }
+                                                                                         }
+                                                                                     };
+                                                                                     let mut full_content = g11_validated_content;
 
-                                                                               let assistant_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
-                                                                               let assistant_msg = Message::Assistant {
-                                                                                   content: full_content.clone(),
-                                                                                   tool_calls: full_tool_calls.clone(),
-                                                                               };
-                                                                               messages.push(assistant_msg.clone());
-                                               if let Err(e) = runner.persist_message_with_reasoning(&session_id, assistant_idx, assistant_msg, reasoning_opt(&full_reasoning)).await {
-                                                   // 持久化失败也不留悬挂在途 io_request(回写后终止)
-                                                   if let Some(rid) = request_id {
-                                                       let err_str = e.to_string();
-                                                       if let Err(ie) = runner.evorule_client
-                                                           .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
-                                                           .await
-                                                       {
-                                                           tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (persist_failed) failed; io_request may hang on engine side");
-                                                       }
-                                                   }
-                                                   yield Err(e);
-                                                   return;
-                                               }
+                                                                                     let assistant_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
+                                                                                     let assistant_msg = Message::Assistant {
+                                                                                         content: full_content.clone(),
+                                                                                         tool_calls: full_tool_calls.clone(),
+                                                                                     };
+                                                                                     messages.push(assistant_msg.clone());
+                                                     if let Err(e) = runner.persist_message_with_reasoning(&session_id, assistant_idx, assistant_msg, reasoning_opt(&full_reasoning)).await {
+                                                         // 持久化失败也不留悬挂在途 io_request(回写后终止)
+                                                         if let Some(rid) = request_id {
+                                                             let err_str = e.to_string();
+                                                             if let Err(ie) = runner.evorule_client
+                                                                 .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
+                                                                 .await
+                                                             {
+                                                                 tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (persist_failed) failed; io_request may hang on engine side");
+                                                             }
+                                                         }
+                                                         yield Err(e);
+                                                         return;
+                                                     }
 
-                                               // ===== ReAct 分叉:有 tool_calls → 本地执行回喂;无 → 提交收尾 =====
-                                               if has_tool_calls {
-                                                   // 有 tool_calls:本地执行每个工具(审批/缓存经 helper),
-                                                   // tool 消息入列后 continue 'react 发起回喂轮
-                                                   let tcs = full_tool_calls.unwrap();
-                                                   for tc in &tcs {
-        // Runaway 计数(连续自动操作上限)。
-                                                       // 触发即暂停等人:不执行当前操作,落账+摘要+
-                                                       // turn 以 runaway_paused 收尾(fail-visible)。
-                                                       if runaway_guard.bump() {
-                                                           if let Some(j) = &journal {
-                                                               if let Err(e) = j.runaway_guard_tripped(
-                                                                   runaway_guard.actions,
-                                                                   runaway_guard.threshold,
-                                                               ) {
-                                                                   warn!(%session_id, error = %e, "runaway_guard_tripped journal failed");
-                                                               }
-                                                           }
-                                                           let summary = format!(
-                                                               "Runaway guard tripped: {} automatic actions counted (limit {}); pending op '{}' was NOT executed. Task paused for human confirmation. Goal: {}",
-                                                               runaway_guard.actions,
-                                                               runaway_guard.threshold,
-                                                               tc.name,
-                                                               goal,
-                                                           );
-                                                           warn!(%session_id, actions = runaway_guard.actions, threshold = runaway_guard.threshold, "runaway guard tripped, pausing for human confirmation");
-                                                           yield Ok(AgentEvent::Error(
-                                                               AgentError::Internal(summary.clone()),
-                                                           ));
-                                                           let duration =
-                                                               start_time.elapsed().as_millis() as u64;
-                                                           if let Some(g) = turn_guard.take() {
-                                                               g.end(
-                                                                   "runaway_paused",
-                                                                   step_count as u64,
-                                                                   duration,
-                                                               );
-                                                           }
-                                                           if let Err(e) =
-                                                               runner.flush_messages(&session_id).await
-                                                           {
-                                                               tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                                           }
-                                                           runner.submit_tool_traces(&session_id).await;
-                                                           yield Ok(AgentEvent::Done(
-                                                               AgentResult::error(
-                                                                   summary,
-                                                                   step_count,
-                                                                   duration,
-                                                               ),
-                                                           ));
-                                                           return;
-                                                       }
-                                                       // B21:tool_invoked(本地 ReAct 路径不经 evorule
-                                                       // IoRequest,evorule_request_id=None,全文内容源=
-                                                       // transcript payload;call_id 由事件 seq 确定性合成)
-                                                       let j_call_id = journal.as_ref().and_then(|j| {
-                                                           j.tool_invoked(&tc.name, &tc.arguments, None).ok()
-                                                       });
-                                                       yield Ok(AgentEvent::ToolCall {
-                                                           name: tc.name.clone(),
-                                                           args: tc.arguments.clone(),
-                                                       });
-                                                       // 本地执行(含 G8 审批流 + G13 缓存命中)。
-                                                       // 工具执行 Err(参数错/后端 404 等)不终止回合:错误
-                                                       // 作为 tool 消息回喂,LLM 可重试/换路/放弃 —— 实测
-                                                       // 硬终止会让一次 knowledge_search 404 毁掉整个草稿回合
-                                                       // (两阶段:Pending 时先 yield ApprovalRequired 再等
-                                                       // 决策 —— 帧必须赶在 60s 审批窗口内到达前端)
-                                                       // 写前置查询(Q2 R-4):写族意图→路径历史 advisory(执行前计算,随结果回喂)
-                                                       let write_advisory = runner
-                                                           .write_intent_advisory(&tc.name, &tc.arguments)
-                                                           .await;
-                                                       // 运行中工具输出尾随(观察态,直跑+docker 后端与
-                                                       // python_exec 共用 tap):tap 安装→chunk 转发——
-                                                       // 不落 journal 不进账,权威结果仍以
-                                                       // ToolResult/journal 为准;环形缓冲截尾(丢最旧)
-                                                       // +合帧节流,慢消费者不反压执行。归属由 tap 绑定
-                                                       // 消息自带(tool_name),runner 不再组装。
-                                                       // stage_fut 收内层块:借用不跨后续 runner 可变操作;
-                                                       // tap 通道与节流状态提外层——Pending 臂的 resolve
-                                                       // 转发段共用同一通道(审批等待+批准后执行全覆盖)
-                                                       let (tap_tx, mut tap_rx) =
-                                                           tokio::sync::mpsc::unbounded_channel::<crate::builtin_tools::shell_exec::TapSeg>();
-                                                       crate::builtin_tools::shell_exec::push_pending_tap(&tc.name, tap_tx);
-                                                       let mut tap_open = true;
-                                                       // stdout/stderr 分色:双环各自截尾,帧带流别供前端分色渲染
-                                                       let mut tap_ring_out: Vec<u8> = Vec::new();
-                                                       let mut tap_ring_err: Vec<u8> = Vec::new();
-                                                       let mut tap_out_truncated = false;
-                                                       let mut tap_err_truncated = false;
-                                                       let mut tap_flush_at = std::time::Instant::now();
-                                                       const TAP_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
-                                                       const TAP_RING: usize = 16 * 1024;
-                                                       let outcome_res = {
-                                                           let mut stage_fut = std::pin::pin!(
-                                                               runner.execute_tool_stage(&session_id, &tc.name, &tc.arguments, journal.as_deref())
-                                                           );
-                                                           loop {
-                                                               tokio::select! {
-                                                                   biased;
-                                                                   _ = cancel_token.cancelled() => {
-                                                                       // 中断于工具执行/审批等待:break Err 哨兵,规范收尾在块外
-                                                                       // is_cancelled() 拦截(stage_fut/resolve_fut 借用未结束,禁 runner 可变操作)
-                                                                       break Err(AgentError::Internal("cancelled by user".to_string()))
-                                                                   }
+                                                     // ===== ReAct 分叉:有 tool_calls → 本地执行回喂;无 → 提交收尾 =====
+                                                     if has_tool_calls {
+                                                         // 有 tool_calls:本地执行每个工具(审批/缓存经 helper),
+                                                         // tool 消息入列后 continue 'react 发起回喂轮
+                                                         let tcs = full_tool_calls.unwrap();
+                                                         for tc in &tcs {
+              // Runaway 计数(连续自动操作上限)。
+                                                             // 触发即暂停等人:不执行当前操作,落账+摘要+
+                                                             // turn 以 runaway_paused 收尾(fail-visible)。
+                                                             if runaway_guard.bump() {
+                                                                 if let Some(j) = &journal {
+                                                                     if let Err(e) = j.runaway_guard_tripped(
+                                                                         runaway_guard.actions,
+                                                                         runaway_guard.threshold,
+                                                                     ) {
+                                                                         warn!(%session_id, error = %e, "runaway_guard_tripped journal failed");
+                                                                     }
+                                                                 }
+                                                                 let summary = format!(
+                                                                     "Runaway guard tripped: {} automatic actions counted (limit {}); pending op '{}' was NOT executed. Task paused for human confirmation. Goal: {}",
+                                                                     runaway_guard.actions,
+                                                                     runaway_guard.threshold,
+                                                                     tc.name,
+                                                                     goal,
+                                                                 );
+                                                                 warn!(%session_id, actions = runaway_guard.actions, threshold = runaway_guard.threshold, "runaway guard tripped, pausing for human confirmation");
+                                                                 yield Ok(AgentEvent::Error(
+                                                                     AgentError::Internal(summary.clone()),
+                                                                 ));
+                                                                 let duration =
+                                                                     start_time.elapsed().as_millis() as u64;
+                                                                 if let Some(g) = turn_guard.take() {
+                                                                     g.end(
+                                                                         "runaway_paused",
+                                                                         step_count as u64,
+                                                                         duration,
+                                                                     );
+                                                                 }
+                                                                 if let Err(e) =
+                                                                     runner.flush_messages(&session_id).await
+                                                                 {
+                                                                     tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                                 }
+                                                                 runner.submit_tool_traces(&session_id).await;
+                                                                 yield Ok(AgentEvent::Done(
+                                                                     AgentResult::error(
+                                                                         summary,
+                                                                         step_count,
+                                                                         duration,
+                                                                     ),
+                                                                 ));
+                                                                 return;
+                                                             }
+                                                             // B21:tool_invoked(本地 ReAct 路径不经 evorule
+                                                             // IoRequest,evorule_request_id=None,全文内容源=
+                                                             // transcript payload;call_id 由事件 seq 确定性合成)
+                                                             let j_call_id = journal.as_ref().and_then(|j| {
+                                                                 j.tool_invoked(&tc.name, &tc.arguments, None).ok()
+                                                             });
+                                                             yield Ok(AgentEvent::ToolCall {
+                                                                 name: tc.name.clone(),
+                                                                 args: tc.arguments.clone(),
+                                                             });
+                                                             // 本地执行(含 G8 审批流 + G13 缓存命中)。
+                                                             // 工具执行 Err(参数错/后端 404 等)不终止回合:错误
+                                                             // 作为 tool 消息回喂,LLM 可重试/换路/放弃 —— 实测
+                                                             // 硬终止会让一次 knowledge_search 404 毁掉整个草稿回合
+                                                             // (两阶段:Pending 时先 yield ApprovalRequired 再等
+                                                             // 决策 —— 帧必须赶在 60s 审批窗口内到达前端)
+                                                             // 写前置查询(Q2 R-4):写族意图→路径历史 advisory(执行前计算,随结果回喂)
+                                                             let write_advisory = runner
+                                                                 .write_intent_advisory(&tc.name, &tc.arguments)
+                                                                 .await;
+                                                             // 运行中工具输出尾随(观察态,直跑+docker 后端与
+                                                             // python_exec 共用 tap):tap 安装→chunk 转发——
+                                                             // 不落 journal 不进账,权威结果仍以
+                                                             // ToolResult/journal 为准;环形缓冲截尾(丢最旧)
+                                                             // +合帧节流,慢消费者不反压执行。归属由 tap 绑定
+                                                             // 消息自带(tool_name),runner 不再组装。
+                                                             // stage_fut 收内层块:借用不跨后续 runner 可变操作;
+                                                             // tap 通道与节流状态提外层——Pending 臂的 resolve
+                                                             // 转发段共用同一通道(审批等待+批准后执行全覆盖)
+                                                             let (tap_tx, mut tap_rx) =
+                                                                 tokio::sync::mpsc::unbounded_channel::<crate::builtin_tools::shell_exec::TapSeg>();
+                                                             crate::builtin_tools::shell_exec::push_pending_tap(&tc.name, tap_tx);
+                                                             let mut tap_open = true;
+                                                             // stdout/stderr 分色:双环各自截尾,帧带流别供前端分色渲染
+                                                             let mut tap_ring_out: Vec<u8> = Vec::new();
+                                                             let mut tap_ring_err: Vec<u8> = Vec::new();
+                                                             let mut tap_out_truncated = false;
+                                                             let mut tap_err_truncated = false;
+                                                             let mut tap_flush_at = std::time::Instant::now();
+                                                             const TAP_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+                                                             const TAP_RING: usize = 16 * 1024;
+                                                             let outcome_res = {
+                                                                 let mut stage_fut = std::pin::pin!(
+                                                                     runner.execute_tool_stage(&session_id, &tc.name, &tc.arguments, journal.as_deref())
+                                                                 );
+                                                                 loop {
+                                                                     tokio::select! {
+                                                                         biased;
+                                                                         _ = cancel_token.cancelled() => {
+                                                                             // 中断于工具执行/审批等待:break Err 哨兵,规范收尾在块外
+                                                                             // is_cancelled() 拦截(stage_fut/resolve_fut 借用未结束,禁 runner 可变操作)
+                                                                             break Err(AgentError::Internal("cancelled by user".to_string()))
+                                                                         }
 
-                                                                   res = &mut stage_fut => break res,
-                                                                   seg = tap_rx.recv(), if tap_open => {
-                                                                       match seg {
-                                                                           Some(tapseg) => {
-                                                                               let (ring, truncated) = if tapseg.stream == "err" {
-                                                                                   (&mut tap_ring_err, &mut tap_err_truncated)
-                                                                               } else {
-                                                                                   (&mut tap_ring_out, &mut tap_out_truncated)
-                                                                               };
-                                                                               ring.extend_from_slice(&tapseg.seg);
-                                                                               if ring.len() > TAP_RING {
-                                                                                   let drop_n = ring.len() - TAP_RING;
-                                                                                   ring.drain(..drop_n);
-                                                                                   *truncated = true;
-                                                                               }
-                                                                               if tap_flush_at.elapsed() >= TAP_WINDOW && !ring.is_empty() {
-                                                                                   let text = String::from_utf8_lossy(ring).into_owned();
-                                                                                   ring.clear();
-                                                                                   tap_flush_at = std::time::Instant::now();
-                                                                                   yield Ok(AgentEvent::ToolOutputChunk {
-                                                                                       tool_name: tapseg.tool_name,
-                                                                                       stream: tapseg.stream.to_string(),
-                                                                                       chunk: text,
-                                                                                       truncated: *truncated,
-                                                                                   });
-                                                                               }
-                                                                           }
-                                                                           None => { tap_open = false; }
-                                                                       }
-                                                                   }
-                                                               }
-                                                           }
-                                                       };
-                                                       // pending 绑定生命周期覆盖到执行真结束:Done 臂
-                                                       // 清理(未 spawn 路径)/Pending 臂按决策条件清理/
-                                                       // 批准执行由 spawn 消耗——select 返回点不清(否则
-                                                       // 审批后执行段失去尾随)
-                                                       // 尾随环形缓冲残余不发送:权威 ToolResult 即将
-                                                       // 到达并包含全量输出,残余段重发属重复信息
-                                                       let outcome_res = match outcome_res {
-                                                           Err(e) => Err(e),
-                                                           Ok(ToolExecStage::Done(o)) => {
-                                                               // 执行完成:非进程工具(未 spawn)或绑定已被
-                                                               // spawn 消耗,按名清理残留(幂等)
-                                                               crate::builtin_tools::shell_exec::unbind_pending(&tc.name);
-                                                               Ok(o)
-                                                           }
-                                                           Ok(ToolExecStage::Pending(req)) => {
-                                                               yield Ok(AgentEvent::ApprovalRequired {
-                                                                   tool_name: tc.name.clone(),
-                                                                   command: req.command.clone(),
-                                                                   risk: req.risk.clone(),
-                                                                   alternative: req.alternative.clone(),
-                                                                   proposal_id: req.proposal_id.clone(),
-                                                                   preview: crate::agent::approval::build_preview(&tc.name, &tc.arguments),
-                                                               });
-                                                               // B21:approval_requested(60s 审批窗开启)
-                                                               if let Some(j) = &journal {
-                                                                   if let Err(e) = j.approval_requested(
-                                                                       &req.proposal_id,
-                                                                       &tc.name,
-                                                                       &req.command,
-                                                                   ) {
-                                                                       warn!(%session_id, tool = %tc.name, error = %e, "approval_requested journal failed");
-                                                                   }
-                                                               }
-                                                               let res = {
-                                                                   // 审批等待+批准后执行都在 resolve 内——
-                                                                   // 尾随转发循环须包住整个 resolve 段
-                                                                   let mut resolve_fut = std::pin::pin!(
-                                                                       runner.resolve_approval(&session_id, &tc.name, &tc.arguments, req, journal.as_deref())
-                                                                   );
-                                                                   let mut resolve_ring_out: Vec<u8> = Vec::new();
-                                                                   let mut resolve_ring_err: Vec<u8> = Vec::new();
-                                                                   let mut resolve_out_truncated = false;
-                                                                   let mut resolve_err_truncated = false;
-                                                                   let mut resolve_flush_at = std::time::Instant::now();
-                                                                   loop {
-                                                                       tokio::select! {
-                                                                           biased;
-                                                                           _ = cancel_token.cancelled() => {
-                                                                               // 中断于工具执行/审批等待:break Err 哨兵,规范收尾在块外
-                                                                               // is_cancelled() 拦截(stage_fut/resolve_fut 借用未结束,禁 runner 可变操作)
-                                                                               break Err(AgentError::Internal("cancelled by user".to_string()))
-                                                                           }
+                                                                         res = &mut stage_fut => break res,
+                                                                         seg = tap_rx.recv(), if tap_open => {
+                                                                             match seg {
+                                                                                 Some(tapseg) => {
+                                                                                     let (ring, truncated) = if tapseg.stream == "err" {
+                                                                                         (&mut tap_ring_err, &mut tap_err_truncated)
+                                                                                     } else {
+                                                                                         (&mut tap_ring_out, &mut tap_out_truncated)
+                                                                                     };
+                                                                                     ring.extend_from_slice(&tapseg.seg);
+                                                                                     if ring.len() > TAP_RING {
+                                                                                         let drop_n = ring.len() - TAP_RING;
+                                                                                         ring.drain(..drop_n);
+                                                                                         *truncated = true;
+                                                                                     }
+                                                                                     if tap_flush_at.elapsed() >= TAP_WINDOW && !ring.is_empty() {
+                                                                                         let text = String::from_utf8_lossy(ring).into_owned();
+                                                                                         ring.clear();
+                                                                                         tap_flush_at = std::time::Instant::now();
+                                                                                         yield Ok(AgentEvent::ToolOutputChunk {
+                                                                                             tool_name: tapseg.tool_name,
+                                                                                             stream: tapseg.stream.to_string(),
+                                                                                             chunk: text,
+                                                                                             truncated: *truncated,
+                                                                                         });
+                                                                                     }
+                                                                                 }
+                                                                                 None => { tap_open = false; }
+                                                                             }
+                                                                         }
+                                                                     }
+                                                                 }
+                                                             };
+                                                             // pending 绑定生命周期覆盖到执行真结束:Done 臂
+                                                             // 清理(未 spawn 路径)/Pending 臂按决策条件清理/
+                                                             // 批准执行由 spawn 消耗——select 返回点不清(否则
+                                                             // 审批后执行段失去尾随)
+                                                             // 尾随环形缓冲残余不发送:权威 ToolResult 即将
+                                                             // 到达并包含全量输出,残余段重发属重复信息
+                                                             let outcome_res = match outcome_res {
+                                                                 Err(e) => Err(e),
+                                                                 Ok(ToolExecStage::Done(o)) => {
+                                                                     // 执行完成:非进程工具(未 spawn)或绑定已被
+                                                                     // spawn 消耗,按名清理残留(幂等)
+                                                                     crate::builtin_tools::shell_exec::unbind_pending(&tc.name);
+                                                                     Ok(o)
+                                                                 }
+                                                                 Ok(ToolExecStage::Pending(req)) => {
+                                                                     yield Ok(AgentEvent::ApprovalRequired {
+                                                                         tool_name: tc.name.clone(),
+                                                                         command: req.command.clone(),
+                                                                         risk: req.risk.clone(),
+                                                                         alternative: req.alternative.clone(),
+                                                                         proposal_id: req.proposal_id.clone(),
+                                                                         preview: crate::agent::approval::build_preview(&tc.name, &tc.arguments),
+                                                                     });
+                                                                     // B21:approval_requested(60s 审批窗开启)
+                                                                     if let Some(j) = &journal {
+                                                                         if let Err(e) = j.approval_requested(
+                                                                             &req.proposal_id,
+                                                                             &tc.name,
+                                                                             &req.command,
+                                                                         ) {
+                                                                             warn!(%session_id, tool = %tc.name, error = %e, "approval_requested journal failed");
+                                                                         }
+                                                                     }
+                                                                     let res = {
+                                                                         // 审批等待+批准后执行都在 resolve 内——
+                                                                         // 尾随转发循环须包住整个 resolve 段
+                                                                         let mut resolve_fut = std::pin::pin!(
+                                                                             runner.resolve_approval(&session_id, &tc.name, &tc.arguments, req, journal.as_deref())
+                                                                         );
+                                                                         let mut resolve_ring_out: Vec<u8> = Vec::new();
+                                                                         let mut resolve_ring_err: Vec<u8> = Vec::new();
+                                                                         let mut resolve_out_truncated = false;
+                                                                         let mut resolve_err_truncated = false;
+                                                                         let mut resolve_flush_at = std::time::Instant::now();
+                                                                         loop {
+                                                                             tokio::select! {
+                                                                                 biased;
+                                                                                 _ = cancel_token.cancelled() => {
+                                                                                     // 中断于工具执行/审批等待:break Err 哨兵,规范收尾在块外
+                                                                                     // is_cancelled() 拦截(stage_fut/resolve_fut 借用未结束,禁 runner 可变操作)
+                                                                                     break Err(AgentError::Internal("cancelled by user".to_string()))
+                                                                                 }
 
-                                                                           r = &mut resolve_fut => break r,
-                                                                           seg = tap_rx.recv(), if tap_open => {
-                                                                               match seg {
-                                                                                   Some(tapseg) => {
-                                                                                       let (ring, truncated) = if tapseg.stream == "err" {
-                                                                                           (&mut resolve_ring_err, &mut resolve_err_truncated)
-                                                                                       } else {
-                                                                                           (&mut resolve_ring_out, &mut resolve_out_truncated)
-                                                                                       };
-                                                                                       ring.extend_from_slice(&tapseg.seg);
-                                                                                       if ring.len() > TAP_RING {
-                                                                                           let drop_n = ring.len() - TAP_RING;
-                                                                                           ring.drain(..drop_n);
-                                                                                           *truncated = true;
-                                                                                       }
-                                                                                       if resolve_flush_at.elapsed() >= TAP_WINDOW && !ring.is_empty() {
-                                                                                           let text = String::from_utf8_lossy(ring).into_owned();
-                                                                                           ring.clear();
-                                                                                           resolve_flush_at = std::time::Instant::now();
-                                                                                           yield Ok(AgentEvent::ToolOutputChunk {
-                                                                                               tool_name: tapseg.tool_name,
-                                                                                               stream: tapseg.stream.to_string(),
-                                                                                               chunk: text,
-                                                                                               truncated: *truncated,
-                                                                                           });
-                                                                                       }
-                                                                                   }
-                                                                                   None => { tap_open = false; }
-                                                                               }
-                                                                           }
-                                                                       }
-                                                                   }
-                                                               };
-                                                               if let Ok(o) = &res {
-                                                                   if let Some((req0, decision)) = &o.approval_flow {
-                                                                       yield Ok(AgentEvent::ApprovalResult {
-                                                                           tool_name: tc.name.clone(),
-                                                                           approved: decision.approved,
-                                                                           approver: decision.approver.clone(),
-                                                                           auto_rejected: decision.auto_rejected,
-                                                                       });
-                                                                       // B21:approval_resolved(approval_id = proposal_id)
-                                                                       if let Some(j) = &journal {
-                                                                           if let Err(e) = j.approval_resolved_with_decision(&req0.proposal_id, decision) {
-                                                                               warn!(%session_id, error = %e, "approval_resolved journal failed");
-                                                                           }
-                                                                       }
-                                                                   }
-                                                               }
-                                                               // 审批拒绝:未发生 spawn,pending 绑定滞留队头须清
-                                                               //(批准路径的绑定已被执行段 spawn 消耗)
-                                                               if let Ok(o) = &res {
-                                                                   if let Some((_, decision)) = &o.approval_flow {
-                                                                       if !decision.approved {
-                                                                           crate::builtin_tools::shell_exec::unbind_pending(&tc.name);
-                                                                       }
-                                                                   }
-                                                               }
-                                                               res
-                                                           }
-                                                           Ok(ToolExecStage::PendingQuestion(query)) => {
-                                                               // 批K 段7:ask_user 两阶段(人在环澄清卡)。帧先到
-                                                               // 前端再进等待(时序同审批);等待在 runner 层不占
-                                                               // 轮次,与 ApprovalPending 同构;收场帧+journal 本臂落
-                                                               let question_id = query.question_id.clone();
-                                                               yield Ok(AgentEvent::AskUser {
-                                                                   question_id: query.question_id.clone(),
-                                                                   question: query.question.clone(),
-                                                                   options: query.options.clone(),
-                                                                   multi_select: query.multi_select,
-                                                                   timeout_secs: query.timeout_secs,
-                                                               });
-                                                               if let Some(j) = &journal {
-                                                                   if let Err(e) = j.question_requested(&question_id, &tc.name, &query.question) {
-                                                                       warn!(%session_id, error = %e, "question_requested journal failed");
-                                                                   }
-                                                               }
-                                                               let res = runner
-                                                                   .resolve_ask_user(&session_id, &tc.arguments, query, journal.as_deref())
-                                                                   .await;
-                                                               if let Ok((_, label)) = &res {
-                                                                   yield Ok(AgentEvent::AskUserResult {
-                                                                       answered: label == "answered",
-                                                                       timed_out: label == "timeout",
-                                                                       question_id: question_id.clone(),
-                                                                   });
-                                                                   if let Some(j) = &journal {
-                                                                       if let Err(e) = j.question_resolved(&question_id, label) {
-                                                                           warn!(%session_id, error = %e, "question_resolved journal failed");
-                                                                       }
-                                                                   }
-                                                               }
-                                                               res.map(|(o, _)| o)
-                                                           }
-                                                       };
-                                                       let mut outcome = match outcome_res {
-                                                           Ok(o) => o,
-                                                           Err(e) => {
-                                                               warn!(
-                                                                   %session_id,
-                                                                   tool = %tc.name,
-                                                                   error = %e,
-                                                                   "本地 ReAct:工具执行失败,错误作为 tool 消息回喂"
-                                                               );
-                                                               // 笔记强制回喂 R-2:错误触发
-                                                               runner.pending_note_feed = true;
-                                                               tool_calls.push(tc.name.clone());
-                                                               let err_content = serde_json::json!({
-                                                                   "error": e.to_string(),
-                                                                   "tool_name": tc.name,
-                                                               })
-                                                               .to_string();
-                                                               let err_tool_msg = Message::Tool {
-                                                                   content: err_content.clone(),
-                                                                   tool_name: tc.name.clone(),
-                                                                   images: Vec::new(),
-                                                               };
-                                                               messages.push(err_tool_msg.clone());
-                                                               if let Err(pe) = runner
-                                                                   .persist_message(&session_id, messages.len() - 1, err_tool_msg)
-                                                                   .await
-                                                               {
-                                                                   // 持久化失败也不留悬挂在途 io_request(回写后终止)
-                                                                   if let Some(rid) = request_id {
-                                                                       let pe_str = pe.to_string();
-                                                                       if let Err(ie) = runner.evorule_client
-                                                                           .submit_io_response(&session_id, rid, &serde_json::json!({"error": &pe_str}), Some(pe_str.as_str()))
-                                                                           .await
-                                                                       {
-                                                                           tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (persist_failed) failed; io_request may hang on engine side");
-                                                                       }
-                                                                   }
-                                                                   yield Err(pe);
-                                                                   return;
-                                                               }
-                                                               yield Ok(AgentEvent::ToolResult {
-                                                                   name: tc.name.clone(),
-                                                                   result: serde_json::json!({
-                                                                       "tool_name": tc.name,
-                                                                       "result": serde_json::json!({"error": e.to_string()}).to_string(),
-                                                                   }),
-                                                               });
-                                                               // 委托子会话锚落账(delegate 工具:spawn 账 drain,
-                                                               // 事件序 tool_invoked → delegate_spawned → tool_result)
-                                                               if tc.name == "delegate" {
-                                                                   runner.flush_delegate_spawns(journal.as_ref());
-                                                               }
-                                                               // B21:tool_result(error;内容与 transcript 回喂消息一致)
-                                                               if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                                                   if let Err(e) = j.tool_result(cid, "error", &err_content, runner.execution_profile_marker()) {
-                                                                       warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
-                                                                   }
-                                                               }
-                                                               continue;
-                                                           }
-                                                       };
-                                                                                                              // 逐调用停滞检测(F2 空转克星):汇聚点观察(工具,参数,结果);
-                                                       // 覆盖 Done 与两阶段审批两路,每调用恰一次;标记随 tool 消息回喂(fail-visible)
-                                                       let stagnation_verdict = runner.stagnation.observe(
-                                                           &tc.name,
-                                                           &tc.arguments.to_string(),
-                                                           &outcome.final_result.to_string(),
-                                                       );
-                                                       match stagnation_verdict {
-                                                           StagnationVerdict::Normal => {}
-                                                           StagnationVerdict::Warning { repeat_count } => {
-                                                               warn!(%session_id, tool = %tc.name, repeat_count, "stagnation warning (F2)");
-                                                               runner.pending_note_feed = true;
-                                                               if let Some(obj) = outcome.final_result.as_object_mut() {
-                                                                   obj.insert(
-                                                                       "stagnation".to_string(),
-                                                                       serde_json::json!(STAGNATION_WARNING_MARK),
-                                                                   );
-                                                               }
-                                                           }
-                                                           StagnationVerdict::Exhausted => {
-                                                               warn!(%session_id, tool = %tc.name, "stagnation EXHAUSTED (F2)——按 H2 阻塞收尾指引");
-                                                               runner.pending_note_feed = true;
-                                                               if let Some(obj) = outcome.final_result.as_object_mut() {
-                                                                   obj.insert(
-                                                                       "stagnation".to_string(),
-                                                                       serde_json::json!(STAGNATION_EXHAUSTED_MARK),
-                                                                   );
-                                                               }
-                                                           }
-                                                       }
-                                                       // 审批事件已在上面的两阶段流程中即时 yield
-                                                       // (ApprovalRequired 先于决策、ApprovalResult 随决定)
-                                                       // 记录 tool_calls(回合级汇总,Done/审计消费)+ tool 消息持久化
-                                                       // (回喂轮 LLM 需要它;tool_call_id 配对由 LlmHandler
-                                                       // 按 tool_name FIFO 匹配最近 assistant)
-                                                       tool_calls.push(tc.name.clone());
-                                                       let tool_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
-                                                       // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
-                                                       let mut raw_content = outcome.final_result.to_string();
-                                                       if let Some(adv) = write_advisory {
-                                                           raw_content.push('\n');
-                                                           raw_content.push_str(&adv);
-                                                       }
-                                                       // 轮级序列循环标记:随本轮首个 tool_result 回喂(fail-visible,
-                                                       // 终止行为零变化——max_steps 仍为最终兜底);
-                                                       // 结果体已含逐调用停滞标记时让位(避免同一 tool_result 叠两种标记)
-                                                       if let Some(mark) = seq_mark.take() {
-                                                           let dominated = outcome.final_result.get("stagnation").is_some();
-                                                           if !dominated {
-                                                               raw_content.push('\n');
-                                                               raw_content.push_str(mark);
-                                                           }
-                                                       }
-                                                       // B1:旁路图片提取+瘦身(指纹替换 base64),
-                                                       // journal/回喂/持久化三面统一用瘦身后文本
-                                                       let (tool_images, raw_content) =
-                                                           extract_images_from_raw(&raw_content, std::path::Path::new(B1_IMAGES_DIR));
-                                                       // 委托子会话锚落账(delegate 工具:spawn 账 drain,
-                                                       // 事件序 tool_invoked → delegate_spawned → tool_result)
-                                                       if tc.name == "delegate" {
-                                                           runner.flush_delegate_spawns(journal.as_ref());
-                                                       }
-                                                       // B21:tool_result(ok;content = 工具输出全文与 transcript 一致)
-                                                       if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                                           if let Err(e) = j.tool_result(cid, "ok", &raw_content, runner.execution_profile_marker()) {
-                                                               warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
-                                                           }
-                                                       }
-                                                       // 引用化出站门:超限结果原文落盘+引用块,
-                                                       // 回喂/持久化两面统一携带(原文在引用文件)
-                                                       let gated_content = runner.gate_tool_result(
-                                                           raw_content.clone(),
-                                                           &tc.name,
-                                                           j_call_id.as_deref(),
-                                                       );
-                                                       let tool_msg = Message::Tool {
-                                                           content: gated_content.clone(),
-                                                           tool_name: tc.name.clone(),
-                                                           images: tool_images,
-                                                       };
-                                                       messages.push(tool_msg);
-                                                       if cancel_token.is_cancelled() {
-                                                           // 中断于工具执行/审批等待:规范取消收尾(future 借用已随块结束释放)
-                                                           info!(%session_id, "Cancelled during tool execution, cleaning up");
-                                                           let duration = start_time.elapsed().as_millis() as u64;
-                                                           yield Ok(AgentEvent::Error(AgentError::Internal(
-                                                               "cancelled by user".to_string(),
-                                                           )));
-                                                           yield Ok(AgentEvent::Done(AgentResult::cancelled_result(
-                                                               tool_calls.clone(),
-                                                               step_count,
-                                                               duration,
-                                                           )));
-                                                           if let Err(e) = runner.flush_messages(&session_id).await {
-                                                               tracing::warn!(%session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                                           }
-                                                           runner.submit_tool_traces(&session_id).await;
-                                                           return;
-                                                       }
-                                                       if let Err(e) = runner
-                                                           .persist_message(
-                                                               &session_id,
-                                                               tool_idx,
-                                                               Message::Tool {
-                                                                   content: gated_content,
-                                                                   tool_name: tc.name.clone(),
-                                                                   images: Vec::new(),
-                                                               },
-                                                           )
-                                                           .await
-                                                       {
-                                                           // 持久化失败也不留悬挂在途 io_request(回写后终止)
-                                                           if let Some(rid) = request_id {
-                                                               let err_str = e.to_string();
-                                                               if let Err(ie) = runner.evorule_client
-                                                                   .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
-                                                                   .await
-                                                               {
-                                                                   tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (persist_failed) failed; io_request may hang on engine side");
-                                                               }
-                                                           }
-                                                           yield Err(e);
-                                                           return;
-                                                       }
-                                                       // ToolResult 事件(审批留痕内嵌)。
-                                                       // 帧面截断(交互批真机发现):事件此前带原始全文,
-                                                       // 大结果(grep 命中 89MB)直发前端=WS 帧爆炸/浏览器
-                                                       // 卡死;与回喂 LLM 同款上限截断+标记,全文仍随
-                                                       // journal 持久化(审计面不变)
-                                                       let mut result_value = serde_json::json!({
-                                                           "tool_name": tc.name,
-                                                           "result": truncate_tool_result(
-                                                               outcome.final_result.to_string(),
-                                                               runner.tool_result_max_tokens,
-                                                           ),
-                                                       });
-                                                       if let Some(record) = outcome.approval_record {
-                                                           result_value["approval"] = record;
-                                                       }
-                                                       yield Ok(AgentEvent::ToolResult {
-                                                           name: tc.name.clone(),
-                                                           result: result_value,
-                                                       });
-                                                       // 计划模式:plan_submit 校验通过即收束回合(交互批)。
-                                                       // 推 PlanSubmitted 帧后按收场序(turn_guard/flush/
-                                                       // traces)以 success Done 收场——计划文本已随
-                                                       // tool_invoked/tool_result 入账,批准记录随后续
-                                                       // 用户消息入账;重开会话历史可见(批账即持久化)。
-                                                       // 校验失败(真机实证:模型偶发 steps 字符串形态
-                                                       // 且超出宽容面)不收束——错误已按普通工具结果
-                                                       // 回喂,LLM 下一轮自行修正形态重提
-                                                       if runner.plan_mode
-                                                           && tc.name
-                                                               == crate::builtin_tools::plan_submit::PLAN_SUBMIT_TOOL
-                                                       {
-                                                           if let Ok(canonical) =
-                                                               crate::builtin_tools::plan_submit::validate_plan_args(&tc.arguments)
-                                                           {
-                                                               let plan_id =
-                                                                   crate::builtin_tools::plan_submit::plan_id_for(&canonical);
-                                                               yield Ok(AgentEvent::PlanSubmitted {
-                                                                   plan_id,
-                                                                   plan: canonical,
-                                                               });
-                                                               let duration =
-                                                                   start_time.elapsed().as_millis() as u64;
-                                                               if let Some(g) = turn_guard.take() {
-                                                                   g.end("plan_submitted", step_count as u64, duration);
-                                                               }
-                                                               if let Err(e) =
-                                                                   runner.flush_messages(&session_id).await
-                                                               {
-                                                                   tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                                               }
-                                                               runner.submit_tool_traces(&session_id).await;
-                                                               let mut plan_result = AgentResult::success(
-                                                                   "计划已提交,等待用户批准或拒绝。".to_string(),
-                                                                   step_count,
-                                                                   duration,
-                                                                   tool_calls.clone(),
-                                                               );
-                                                               plan_result.tokens = runner.usage_counter.as_ref().map(|c| c.snapshot());
-                                                               yield Ok(AgentEvent::Done(plan_result));
-                                                               return;
-                                                           }
-                                                       }
-                                                   }
-                                                   // M3 自验证门禁:轮末回喂前执行 pending verify(一轮 N 写
-                                                   // 只跑 1 次;verdict 作为结构化附加观察块拼进最后一条
-                                                   // tool 消息 content——write_advisory 同型回喂,零协议
-                                                   // 风险;VerifyRan 已在 run_pending 内全量入账)。
-                                                   if let Some(vorch) = runner.verify.as_ref() {
-                                                       if vorch.has_pending() {
-                                                           if let Some(report) =
-                                                               vorch.run_pending(journal.as_deref()).await
-                                                           {
-                                                               if !report.observation.is_empty() {
-                                                                   if let Some(Message::Tool { content, .. }) = messages.last_mut() {
-                                                                       content.push('\n');
-                                                                       content.push_str(&report.observation);
-                                                                   }
-                                                               }
-                                                               if report.escalate {
-                                                                   warn!(
-                                                                       %session_id,
-                                                                       verdict = %report.verdict,
-                                                                       "verify fix-loop limit reached; escalation surfaced to LLM"
-                                                                   );
-                                                               }
-                                                           }
-                                                       }
-                                                   }
-                                                   // 所有 tool 结果已入列 messages,回喂轮 LLM 将看到它们
-                                                   continue 'react;
-                                               }
+                                                                                 r = &mut resolve_fut => break r,
+                                                                                 seg = tap_rx.recv(), if tap_open => {
+                                                                                     match seg {
+                                                                                         Some(tapseg) => {
+                                                                                             let (ring, truncated) = if tapseg.stream == "err" {
+                                                                                                 (&mut resolve_ring_err, &mut resolve_err_truncated)
+                                                                                             } else {
+                                                                                                 (&mut resolve_ring_out, &mut resolve_out_truncated)
+                                                                                             };
+                                                                                             ring.extend_from_slice(&tapseg.seg);
+                                                                                             if ring.len() > TAP_RING {
+                                                                                                 let drop_n = ring.len() - TAP_RING;
+                                                                                                 ring.drain(..drop_n);
+                                                                                                 *truncated = true;
+                                                                                             }
+                                                                                             if resolve_flush_at.elapsed() >= TAP_WINDOW && !ring.is_empty() {
+                                                                                                 let text = String::from_utf8_lossy(ring).into_owned();
+                                                                                                 ring.clear();
+                                                                                                 resolve_flush_at = std::time::Instant::now();
+                                                                                                 yield Ok(AgentEvent::ToolOutputChunk {
+                                                                                                     tool_name: tapseg.tool_name,
+                                                                                                     stream: tapseg.stream.to_string(),
+                                                                                                     chunk: text,
+                                                                                                     truncated: *truncated,
+                                                                                                 });
+                                                                                             }
+                                                                                         }
+                                                                                         None => { tap_open = false; }
+                                                                                     }
+                                                                                 }
+                                                                             }
+                                                                         }
+                                                                     };
+                                                                     if let Ok(o) = &res {
+                                                                         if let Some((req0, decision)) = &o.approval_flow {
+                                                                             yield Ok(AgentEvent::ApprovalResult {
+                                                                                 tool_name: tc.name.clone(),
+                                                                                 approved: decision.approved,
+                                                                                 approver: decision.approver.clone(),
+                                                                                 auto_rejected: decision.auto_rejected,
+                                                                             });
+                                                                             // B21:approval_resolved(approval_id = proposal_id)
+                                                                             if let Some(j) = &journal {
+                                                                                 if let Err(e) = j.approval_resolved_with_decision(&req0.proposal_id, decision) {
+                                                                                     warn!(%session_id, error = %e, "approval_resolved journal failed");
+                                                                                 }
+                                                                             }
+                                                                         }
+                                                                     }
+                                                                     // 审批拒绝:未发生 spawn,pending 绑定滞留队头须清
+                                                                     //(批准路径的绑定已被执行段 spawn 消耗)
+                                                                     if let Ok(o) = &res {
+                                                                         if let Some((_, decision)) = &o.approval_flow {
+                                                                             if !decision.approved {
+                                                                                 crate::builtin_tools::shell_exec::unbind_pending(&tc.name);
+                                                                             }
+                                                                         }
+                                                                     }
+                                                                     res
+                                                                 }
+                                                                 Ok(ToolExecStage::PendingQuestion(query)) => {
+                                                                     // 批K 段7:ask_user 两阶段(人在环澄清卡)。帧先到
+                                                                     // 前端再进等待(时序同审批);等待在 runner 层不占
+                                                                     // 轮次,与 ApprovalPending 同构;收场帧+journal 本臂落
+                                                                     let question_id = query.question_id.clone();
+                                                                     yield Ok(AgentEvent::AskUser {
+                                                                         question_id: query.question_id.clone(),
+                                                                         question: query.question.clone(),
+                                                                         options: query.options.clone(),
+                                                                         multi_select: query.multi_select,
+                                                                         timeout_secs: query.timeout_secs,
+                                                                     });
+                                                                     if let Some(j) = &journal {
+                                                                         if let Err(e) = j.question_requested(&question_id, &tc.name, &query.question) {
+                                                                             warn!(%session_id, error = %e, "question_requested journal failed");
+                                                                         }
+                                                                     }
+                                                                     let res = runner
+                                                                         .resolve_ask_user(&session_id, &tc.arguments, query, journal.as_deref())
+                                                                         .await;
+                                                                     if let Ok((_, label)) = &res {
+                                                                         yield Ok(AgentEvent::AskUserResult {
+                                                                             answered: label == "answered",
+                                                                             timed_out: label == "timeout",
+                                                                             question_id: question_id.clone(),
+                                                                         });
+                                                                         if let Some(j) = &journal {
+                                                                             if let Err(e) = j.question_resolved(&question_id, label) {
+                                                                                 warn!(%session_id, error = %e, "question_resolved journal failed");
+                                                                             }
+                                                                         }
+                                                                     }
+                                                                     res.map(|(o, _)| o)
+                                                                 }
+                                                             };
+                                                             let mut outcome = match outcome_res {
+                                                                 Ok(o) => o,
+                                                                 Err(e) => {
+                                                                     warn!(
+                                                                         %session_id,
+                                                                         tool = %tc.name,
+                                                                         error = %e,
+                                                                         "本地 ReAct:工具执行失败,错误作为 tool 消息回喂"
+                                                                     );
+                                                                     // 笔记强制回喂 R-2:错误触发
+                                                                     runner.pending_note_feed = true;
+                                                                     tool_calls.push(tc.name.clone());
+                                                                     let err_content = serde_json::json!({
+                                                                         "error": e.to_string(),
+                                                                         "tool_name": tc.name,
+                                                                     })
+                                                                     .to_string();
+                                                                     let err_tool_msg = Message::Tool {
+                                                                         content: err_content.clone(),
+                                                                         tool_name: tc.name.clone(),
+                                                                         images: Vec::new(),
+                                                                     };
+                                                                     messages.push(err_tool_msg.clone());
+                                                                     if let Err(pe) = runner
+                                                                         .persist_message(&session_id, messages.len() - 1, err_tool_msg)
+                                                                         .await
+                                                                     {
+                                                                         // 持久化失败也不留悬挂在途 io_request(回写后终止)
+                                                                         if let Some(rid) = request_id {
+                                                                             let pe_str = pe.to_string();
+                                                                             if let Err(ie) = runner.evorule_client
+                                                                                 .submit_io_response(&session_id, rid, &serde_json::json!({"error": &pe_str}), Some(pe_str.as_str()))
+                                                                                 .await
+                                                                             {
+                                                                                 tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (persist_failed) failed; io_request may hang on engine side");
+                                                                             }
+                                                                         }
+                                                                         yield Err(pe);
+                                                                         return;
+                                                                     }
+                                                                     yield Ok(AgentEvent::ToolResult {
+                                                                         name: tc.name.clone(),
+                                                                         result: serde_json::json!({
+                                                                             "tool_name": tc.name,
+                                                                             "result": serde_json::json!({"error": e.to_string()}).to_string(),
+                                                                         }),
+                                                                     });
+                                                                     // 委托子会话锚落账(delegate 工具:spawn 账 drain,
+                                                                     // 事件序 tool_invoked → delegate_spawned → tool_result)
+                                                                     if tc.name == "delegate" {
+                                                                         runner.flush_delegate_spawns(journal.as_ref());
+                                                                     }
+                                                                     // B21:tool_result(error;内容与 transcript 回喂消息一致)
+                                                                     if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
+                                                                         if let Err(e) = j.tool_result(cid, "error", &err_content, runner.execution_profile_marker()) {
+                                                                             warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
+                                                                         }
+                                                                     }
+                                                                     continue;
+                                                                 }
+                                                             };
+                                                                                                                    // 逐调用停滞检测(F2 空转克星):汇聚点观察(工具,参数,结果);
+                                                             // 覆盖 Done 与两阶段审批两路,每调用恰一次;标记随 tool 消息回喂(fail-visible)
+                                                             let stagnation_verdict = runner.stagnation.observe(
+                                                                 &tc.name,
+                                                                 &tc.arguments.to_string(),
+                                                                 &outcome.final_result.to_string(),
+                                                             );
+                                                             match stagnation_verdict {
+                                                                 StagnationVerdict::Normal => {}
+                                                                 StagnationVerdict::Warning { repeat_count } => {
+                                                                     warn!(%session_id, tool = %tc.name, repeat_count, "stagnation warning (F2)");
+                                                                     runner.pending_note_feed = true;
+                                                                     if let Some(obj) = outcome.final_result.as_object_mut() {
+                                                                         obj.insert(
+                                                                             "stagnation".to_string(),
+                                                                             serde_json::json!(STAGNATION_WARNING_MARK),
+                                                                         );
+                                                                     }
+                                                                 }
+                                                                 StagnationVerdict::Exhausted => {
+                                                                     warn!(%session_id, tool = %tc.name, "stagnation EXHAUSTED (F2)——按 H2 阻塞收尾指引");
+                                                                     runner.pending_note_feed = true;
+                                                                     if let Some(obj) = outcome.final_result.as_object_mut() {
+                                                                         obj.insert(
+                                                                             "stagnation".to_string(),
+                                                                             serde_json::json!(STAGNATION_EXHAUSTED_MARK),
+                                                                         );
+                                                                     }
+                                                                 }
+                                                             }
+                                                             // 审批事件已在上面的两阶段流程中即时 yield
+                                                             // (ApprovalRequired 先于决策、ApprovalResult 随决定)
+                                                             // 记录 tool_calls(回合级汇总,Done/审计消费)+ tool 消息持久化
+                                                             // (回喂轮 LLM 需要它;tool_call_id 配对由 LlmHandler
+                                                             // 按 tool_name FIFO 匹配最近 assistant)
+                                                             tool_calls.push(tc.name.clone());
+                                                             let tool_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
+                                                             // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
+                                                             let mut raw_content = outcome.final_result.to_string();
+                                                             if let Some(adv) = write_advisory {
+                                                                 raw_content.push('\n');
+                                                                 raw_content.push_str(&adv);
+                                                             }
+                                                             // 轮级序列循环标记:随本轮首个 tool_result 回喂(fail-visible,
+                                                             // 终止行为零变化——max_steps 仍为最终兜底);
+                                                             // 结果体已含逐调用停滞标记时让位(避免同一 tool_result 叠两种标记)
+                                                             if let Some(mark) = seq_mark.take() {
+                                                                 let dominated = outcome.final_result.get("stagnation").is_some();
+                                                                 if !dominated {
+                                                                     raw_content.push('\n');
+                                                                     raw_content.push_str(mark);
+                                                                 }
+                                                             }
+                                                             // B1:旁路图片提取+瘦身(指纹替换 base64),
+                                                             // journal/回喂/持久化三面统一用瘦身后文本
+                                                             let (tool_images, raw_content) =
+                                                                 extract_images_from_raw(&raw_content, std::path::Path::new(B1_IMAGES_DIR));
+                                                             // 委托子会话锚落账(delegate 工具:spawn 账 drain,
+                                                             // 事件序 tool_invoked → delegate_spawned → tool_result)
+                                                             if tc.name == "delegate" {
+                                                                 runner.flush_delegate_spawns(journal.as_ref());
+                                                             }
+                                                             // B21:tool_result(ok;content = 工具输出全文与 transcript 一致)
+                                                             if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
+                                                                 if let Err(e) = j.tool_result(cid, "ok", &raw_content, runner.execution_profile_marker()) {
+                                                                     warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
+                                                                 }
+                                                             }
+                                                             // 引用化出站门:超限结果原文落盘+引用块,
+                                                             // 回喂/持久化两面统一携带(原文在引用文件)
+                                                             let gated_content = runner.gate_tool_result(
+                                                                 raw_content.clone(),
+                                                                 &tc.name,
+                                                                 j_call_id.as_deref(),
+                                                             );
+                                                             let tool_msg = Message::Tool {
+                                                                 content: gated_content.clone(),
+                                                                 tool_name: tc.name.clone(),
+                                                                 images: tool_images,
+                                                             };
+                                                             messages.push(tool_msg);
+                                                             if cancel_token.is_cancelled() {
+                                                                 // 中断于工具执行/审批等待:规范取消收尾(future 借用已随块结束释放)
+                                                                 info!(%session_id, "Cancelled during tool execution, cleaning up");
+                                                                 let duration = start_time.elapsed().as_millis() as u64;
+                                                                 yield Ok(AgentEvent::Error(AgentError::Internal(
+                                                                     "cancelled by user".to_string(),
+                                                                 )));
+                                                                 yield Ok(AgentEvent::Done(AgentResult::cancelled_result(
+                                                                     tool_calls.clone(),
+                                                                     step_count,
+                                                                     duration,
+                                                                 )));
+                                                                 if let Err(e) = runner.flush_messages(&session_id).await {
+                                                                     tracing::warn!(%session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                                 }
+                                                                 runner.submit_tool_traces(&session_id).await;
+                                                                 return;
+                                                             }
+                                                             if let Err(e) = runner
+                                                                 .persist_message(
+                                                                     &session_id,
+                                                                     tool_idx,
+                                                                     Message::Tool {
+                                                                         content: gated_content,
+                                                                         tool_name: tc.name.clone(),
+                                                                         images: Vec::new(),
+                                                                     },
+                                                                 )
+                                                                 .await
+                                                             {
+                                                                 // 持久化失败也不留悬挂在途 io_request(回写后终止)
+                                                                 if let Some(rid) = request_id {
+                                                                     let err_str = e.to_string();
+                                                                     if let Err(ie) = runner.evorule_client
+                                                                         .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
+                                                                         .await
+                                                                     {
+                                                                         tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (persist_failed) failed; io_request may hang on engine side");
+                                                                     }
+                                                                 }
+                                                                 yield Err(e);
+                                                                 return;
+                                                             }
+                                                             // ToolResult 事件(审批留痕内嵌)。
+                                                             // 帧面截断(交互批真机发现):事件此前带原始全文,
+                                                             // 大结果(grep 命中 89MB)直发前端=WS 帧爆炸/浏览器
+                                                             // 卡死;与回喂 LLM 同款上限截断+标记,全文仍随
+                                                             // journal 持久化(审计面不变)
+                                                             let mut result_value = serde_json::json!({
+                                                                 "tool_name": tc.name,
+                                                                 "result": truncate_tool_result(
+                                                                     outcome.final_result.to_string(),
+                                                                     runner.tool_result_max_tokens,
+                                                                 ),
+                                                             });
+                                                             if let Some(record) = outcome.approval_record {
+                                                                 result_value["approval"] = record;
+                                                             }
+                                                             yield Ok(AgentEvent::ToolResult {
+                                                                 name: tc.name.clone(),
+                                                                 result: result_value,
+                                                             });
+                                                             // 计划模式:plan_submit 校验通过即收束回合(交互批)。
+                                                             // 推 PlanSubmitted 帧后按收场序(turn_guard/flush/
+                                                             // traces)以 success Done 收场——计划文本已随
+                                                             // tool_invoked/tool_result 入账,批准记录随后续
+                                                             // 用户消息入账;重开会话历史可见(批账即持久化)。
+                                                             // 校验失败(真机实证:模型偶发 steps 字符串形态
+                                                             // 且超出宽容面)不收束——错误已按普通工具结果
+                                                             // 回喂,LLM 下一轮自行修正形态重提
+                                                             if runner.plan_mode
+                                                                 && tc.name
+                                                                     == crate::builtin_tools::plan_submit::PLAN_SUBMIT_TOOL
+                                                             {
+                                                                 if let Ok(canonical) =
+                                                                     crate::builtin_tools::plan_submit::validate_plan_args(&tc.arguments)
+                                                                 {
+                                                                     let plan_id =
+                                                                         crate::builtin_tools::plan_submit::plan_id_for(&canonical);
+                                                                     yield Ok(AgentEvent::PlanSubmitted {
+                                                                         plan_id,
+                                                                         plan: canonical,
+                                                                     });
+                                                                     let duration =
+                                                                         start_time.elapsed().as_millis() as u64;
+                                                                     if let Some(g) = turn_guard.take() {
+                                                                         g.end("plan_submitted", step_count as u64, duration);
+                                                                     }
+                                                                     if let Err(e) =
+                                                                         runner.flush_messages(&session_id).await
+                                                                     {
+                                                                         tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                                     }
+                                                                     runner.submit_tool_traces(&session_id).await;
+                                                                     let mut plan_result = AgentResult::success(
+                                                                         "计划已提交,等待用户批准或拒绝。".to_string(),
+                                                                         step_count,
+                                                                         duration,
+                                                                         tool_calls.clone(),
+                                                                     );
+                                                                     plan_result.tokens = runner.usage_counter.as_ref().map(|c| c.snapshot());
+                                                                     yield Ok(AgentEvent::Done(plan_result));
+                                                                     return;
+                                                                 }
+                                                             }
+                                                         }
+                                                         // M3 自验证门禁:轮末回喂前执行 pending verify(一轮 N 写
+                                                         // 只跑 1 次;verdict 作为结构化附加观察块拼进最后一条
+                                                         // tool 消息 content——write_advisory 同型回喂,零协议
+                                                         // 风险;VerifyRan 已在 run_pending 内全量入账)。
+                                                         if let Some(vorch) = runner.verify.as_ref() {
+                                                             if vorch.has_pending() {
+                                                                 if let Some(report) =
+                                                                     vorch.run_pending(journal.as_deref()).await
+                                                                 {
+                                                                     if !report.observation.is_empty() {
+                                                                         if let Some(Message::Tool { content, .. }) = messages.last_mut() {
+                                                                             content.push('\n');
+                                                                             content.push_str(&report.observation);
+                                                                         }
+                                                                     }
+                                                                     if report.escalate {
+                                                                         warn!(
+                                                                             %session_id,
+                                                                             verdict = %report.verdict,
+                                                                             "verify fix-loop limit reached; escalation surfaced to LLM"
+                                                                         );
+                                                                     }
+                                                                 }
+                                                             }
+                                                         }
+                                                         // 所有 tool 结果已入列 messages,回喂轮 LLM 将看到它们
+                                                         continue 'react;
+                                                     }
 
-                                               // finish_reason 终态分支（is_tool_call 判据不变）:
-                                               // content_filter/error → fail-visible 显式失败
-                                               // （error io_response + yield Error,审计链照常记录;
-                                               // 被拦截/错误终态内容不得当正常回答流转）
-                                               if matches!(
-                                                   finish_reason.as_deref(),
-                                                   Some("content_filter") | Some("error")
-                                               ) {
-                                                   let err_str = format!(
-                                                       "LLM response terminated by provider (finish_reason: {})",
-                                                       finish_reason.as_deref().unwrap_or("unknown")
-                                                   );
-                                                   if let Some(rid) = request_id {
-                                                       let _ = runner.evorule_client
-                                                           .submit_io_response(
-                                                               &session_id,
-                                                               rid,
-                                                               &serde_json::json!({"error": &err_str}),
-                                                               Some(err_str.as_str()),
-                                                           )
-                                                           .await;
-                                                   }
-                                                   yield Err(AgentError::EvoruleError(err_str));
-                                                   return;
-                                               }
+                                                     // finish_reason 终态分支（is_tool_call 判据不变）:
+                                                     // content_filter/error → fail-visible 显式失败
+                                                     // （error io_response + yield Error,审计链照常记录;
+                                                     // 被拦截/错误终态内容不得当正常回答流转）
+                                                     if matches!(
+                                                         finish_reason.as_deref(),
+                                                         Some("content_filter") | Some("error")
+                                                     ) {
+                                                         let err_str = format!(
+                                                             "LLM response terminated by provider (finish_reason: {})",
+                                                             finish_reason.as_deref().unwrap_or("unknown")
+                                                         );
+                                                         if let Some(rid) = request_id {
+                                                             let _ = runner.evorule_client
+                                                                 .submit_io_response(
+                                                                     &session_id,
+                                                                     rid,
+                                                                     &serde_json::json!({"error": &err_str}),
+                                                                     Some(err_str.as_str()),
+                                                                 )
+                                                                 .await;
+                                                         }
+                                                         yield Err(AgentError::EvoruleError(err_str));
+                                                         return;
+                                                     }
 
-                                               // finish_reason=length（生成长度截断）:半截输出
-                                               // 双可见化——结果面与消息历史同带截断标记,
-                                               // 不冒充完整回答（收尾自然终止）
-                                               if matches!(
-                                                   finish_reason.as_deref(),
-                                                   Some("length") | Some("max_tokens")
-                                               ) {
-                                                   full_content.push_str(
-                                                       "\n\n[输出因达到生成长度上限被截断,内容可能不完整]",
-                                                   );
-                                                   messages.push(Message::System {
-                                                       content: "[上一条 assistant 输出因达到生成长度上限被截断,内容可能不完整]".to_string(),
-                                                   });
-                                               }
+                                                     // finish_reason=length（生成长度截断）:半截输出
+                                                     // 双可见化——结果面与消息历史同带截断标记,
+                                                     // 不冒充完整回答（收尾自然终止）
+                                                     if matches!(
+                                                         finish_reason.as_deref(),
+                                                         Some("length") | Some("max_tokens")
+                                                     ) {
+                                                         full_content.push_str(
+                                                             "\n\n[输出因达到生成长度上限被截断,内容可能不完整]",
+                                                         );
+                                                         messages.push(Message::System {
+                                                             content: "[上一条 assistant 输出因达到生成长度上限被截断,内容可能不完整]".to_string(),
+                                                         });
+                                                     }
 
-                                               // 无 tool_calls:产出最终 content,提交 io_response 收尾
-                                               if let Some(rid) = request_id {
-                                                   let tool_calls_json: serde_json::Value = serde_json::Value::Null;
-                                                   let is_finished = matches!(finish_reason.as_deref(), Some("stop") | Some("end_turn"));
-                                                   // 【io_response 不携带消息史快照——机制定谳与非流式
-                                                   // 路径同源,完整根因与方法论见 handle_call_external
-                                                   // 尾部注释】历史快照曾致提交体随会话增长(实测
-                                                   // 1.7MB)顶爆引擎请求体上限(1MB)→每轮 413→会话
-                                                   // 软死且失败零日志。消息史权威通道=本地权威面
-                                                   // +flush_messages 逐条入链,不经本提交体。
-                                                   let resp = serde_json::json!({
-                                                       "content": full_content,
-                                                       "tool_calls": tool_calls_json,
-                                                       "is_finished": is_finished,
-                                                   });
-                                                   if let Err(e) = runner.evorule_client
-                                                       .submit_io_response(&session_id, rid, &resp, None)
-                                                       .await
-                                                   {
-                                                       // 输出门禁（server io_guard）enforce 模式以 422 拒绝收尾——
-                                                       // 纠偏回喂:追加纠正性 user 消息后重试（LLM 下轮如实说明
-                                                       // 或先调工具）,上限 IO_GUARD_MAX_RETRIES;超限以 error 应答
-                                                       // 收敛引擎 io_request（error 标记不触门禁）并 fail-visible。
-                                                       let is_guard_reject =
-                                                           matches!(&e, ApiError::ApiError { status: 422, .. });
-                                                       if is_guard_reject
-                                                           && guard_rejections < IO_GUARD_MAX_RETRIES
-                                                       {
-                                                           guard_rejections += 1;
-                                                           warn!(
-                                                               %session_id,
-                                                               request_id = rid,
-                                                               round = guard_rejections,
-                                                               "io_guard rejected final output; feeding back corrective turn"
-                                                           );
-                                                           messages.push(Message::User {
-                                                               content: IO_GUARD_CORRECTION_PROMPT.to_string(),
-                                                               images: Vec::new(),
-                                                           });
-                                                           continue 'react;
-                                                       }
-                                                       if is_guard_reject {
-                                                           let err_str = format!(
-                                                               "输出门禁拒绝收尾：纠正重试 {guard_rejections} 次后仍命中（IO_GUARD_REJECTED）"
-                                                           );
-                                                           let _ = runner.evorule_client
-                                                               .submit_io_response(
-                                                                   &session_id,
-                                                                   rid,
-                                                                   &serde_json::json!({"error": &err_str}),
-                                                                   Some(err_str.as_str()),
-                                                               )
-                                                               .await;
-                                                           yield Err(AgentError::EvoruleError(err_str));
-                                                           return;
-                                                       }
-                                                       // 【提交失败完整收尾(2026-11 修复,防回归勿删)】
-                                                       // 典型场景:引擎 RequestBodyLimitLayer 拒 413
-                                                       // (请求体超限)。旧实现此处 yield Err 后裸
-                                                       // return——引擎 io_request 悬挂、turn 不落账、
-                                                       // 零日志零 Done,用户侧表现为会话静默软死,
-                                                       // 根因(整史 messages 冗余,见上文注释)只能靠
-                                                       // 逐层考古。现对齐 max_steps/LLM 流失败臂先例:
-                                                       // 补交 error io_response 防悬挂(best-effort,
-                                                       // error 标记不触输出门禁)+Error 事件+turn 结束
-                                                       // +flush+tool_traces+Done,失败可见可诊断。
-                                                       let status = match &e {
-                                                           ApiError::ApiError { status, .. } => Some(*status),
-                                                           _ => None,
-                                                       };
-                                                       let request_bytes = serde_json::to_vec(&resp)
-                                                           .map(|b| b.len())
-                                                           .unwrap_or(0);
-                                                       warn!(
-                                                           %session_id,
-                                                           request_id = rid,
-                                                           error_status = status,
-                                                           request_bytes,
-                                                           error = %e,
-                                                           "final io_response submit failed; completing turn with error"
-                                                       );
-                                                       let err_str = e.to_string();
-                                                       if let Err(ie) = runner.evorule_client
-                                                           .submit_io_response(
-                                                               &session_id,
-                                                               rid,
-                                                               &serde_json::json!({"content": "", "error": &err_str}),
-                                                               Some(err_str.as_str()),
-                                                           )
-                                                           .await
-                                                       {
-                                                           warn!(
-                                                               %session_id,
-                                                               request_id = rid,
-                                                               error = %ie,
-                                                               "error io_response follow-up submit also failed"
-                                                           );
-                                                       }
-                                                       yield Ok(AgentEvent::Error(
-                                                           AgentError::EvoruleError(err_str.clone()),
-                                                       ));
-                                                       let duration = start_time.elapsed().as_millis() as u64;
-                                                       if let Some(g) = turn_guard.take() {
-                                                           g.end("error", step_count as u64, duration);
-                                                       }
-                                                       if let Err(fe) = runner.flush_messages(&session_id).await {
-                                                           warn!(
-                                                               %session_id,
-                                                               error = %fe,
-                                                               "flush_messages during failure wrap-up failed"
-                                                           );
-                                                       }
-                                                       runner.submit_tool_traces(&session_id).await;
-                                                       yield Ok(AgentEvent::Done(AgentResult::error(
-                                                           AgentError::EvoruleError(err_str).to_string(),
-                                                           step_count,
-                                                           duration,
-                                                       )));
-                                                       return;
-                                                   }
-                                               }
-                                               break 'react;
-                                               } // end 'react loop
+                                                     // 无 tool_calls:产出最终 content,提交 io_response 收尾
+                                                     if let Some(rid) = request_id {
+                                                         let tool_calls_json: serde_json::Value = serde_json::Value::Null;
+                                                         let is_finished = matches!(finish_reason.as_deref(), Some("stop") | Some("end_turn"));
+                                                         // 【io_response 不携带消息史快照——机制定谳与非流式
+                                                         // 路径同源,完整根因与方法论见 handle_call_external
+                                                         // 尾部注释】历史快照曾致提交体随会话增长(实测
+                                                         // 1.7MB)顶爆引擎请求体上限(1MB)→每轮 413→会话
+                                                         // 软死且失败零日志。消息史权威通道=本地权威面
+                                                         // +flush_messages 逐条入链,不经本提交体。
+                                                         let resp = serde_json::json!({
+                                                             "content": full_content,
+                                                             "tool_calls": tool_calls_json,
+                                                             "is_finished": is_finished,
+                                                         });
+                                                         if let Err(e) = runner.evorule_client
+                                                             .submit_io_response(&session_id, rid, &resp, None)
+                                                             .await
+                                                         {
+                                                             // 输出门禁（server io_guard）enforce 模式以 422 拒绝收尾——
+                                                             // 纠偏回喂:追加纠正性 user 消息后重试（LLM 下轮如实说明
+                                                             // 或先调工具）,上限 IO_GUARD_MAX_RETRIES;超限以 error 应答
+                                                             // 收敛引擎 io_request（error 标记不触门禁）并 fail-visible。
+                                                             let is_guard_reject =
+                                                                 matches!(&e, ApiError::ApiError { status: 422, .. });
+                                                             if is_guard_reject
+                                                                 && guard_rejections < IO_GUARD_MAX_RETRIES
+                                                             {
+                                                                 guard_rejections += 1;
+                                                                 warn!(
+                                                                     %session_id,
+                                                                     request_id = rid,
+                                                                     round = guard_rejections,
+                                                                     "io_guard rejected final output; feeding back corrective turn"
+                                                                 );
+                                                                 messages.push(Message::User {
+                                                                     content: IO_GUARD_CORRECTION_PROMPT.to_string(),
+                                                                     images: Vec::new(),
+                                                                 });
+                                                                 continue 'react;
+                                                             }
+                                                             if is_guard_reject {
+                                                                 let err_str = format!(
+                                                                     "输出门禁拒绝收尾：纠正重试 {guard_rejections} 次后仍命中（IO_GUARD_REJECTED）"
+                                                                 );
+                                                                 let _ = runner.evorule_client
+                                                                     .submit_io_response(
+                                                                         &session_id,
+                                                                         rid,
+                                                                         &serde_json::json!({"error": &err_str}),
+                                                                         Some(err_str.as_str()),
+                                                                     )
+                                                                     .await;
+                                                                 yield Err(AgentError::EvoruleError(err_str));
+                                                                 return;
+                                                             }
+                                                             // 【提交失败完整收尾(2026-11 修复,防回归勿删)】
+                                                             // 典型场景:引擎 RequestBodyLimitLayer 拒 413
+                                                             // (请求体超限)。旧实现此处 yield Err 后裸
+                                                             // return——引擎 io_request 悬挂、turn 不落账、
+                                                             // 零日志零 Done,用户侧表现为会话静默软死,
+                                                             // 根因(整史 messages 冗余,见上文注释)只能靠
+                                                             // 逐层考古。现对齐 max_steps/LLM 流失败臂先例:
+                                                             // 补交 error io_response 防悬挂(best-effort,
+                                                             // error 标记不触输出门禁)+Error 事件+turn 结束
+                                                             // +flush+tool_traces+Done,失败可见可诊断。
+                                                             let status = match &e {
+                                                                 ApiError::ApiError { status, .. } => Some(*status),
+                                                                 _ => None,
+                                                             };
+                                                             let request_bytes = serde_json::to_vec(&resp)
+                                                                 .map(|b| b.len())
+                                                                 .unwrap_or(0);
+                                                             warn!(
+                                                                 %session_id,
+                                                                 request_id = rid,
+                                                                 error_status = status,
+                                                                 request_bytes,
+                                                                 error = %e,
+                                                                 "final io_response submit failed; completing turn with error"
+                                                             );
+                                                             let err_str = e.to_string();
+                                                             if let Err(ie) = runner.evorule_client
+                                                                 .submit_io_response(
+                                                                     &session_id,
+                                                                     rid,
+                                                                     &serde_json::json!({"content": "", "error": &err_str}),
+                                                                     Some(err_str.as_str()),
+                                                                 )
+                                                                 .await
+                                                             {
+                                                                 warn!(
+                                                                     %session_id,
+                                                                     request_id = rid,
+                                                                     error = %ie,
+                                                                     "error io_response follow-up submit also failed"
+                                                                 );
+                                                             }
+                                                             yield Ok(AgentEvent::Error(
+                                                                 AgentError::EvoruleError(err_str.clone()),
+                                                             ));
+                                                             let duration = start_time.elapsed().as_millis() as u64;
+                                                             if let Some(g) = turn_guard.take() {
+                                                                 g.end("error", step_count as u64, duration);
+                                                             }
+                                                             if let Err(fe) = runner.flush_messages(&session_id).await {
+                                                                 warn!(
+                                                                     %session_id,
+                                                                     error = %fe,
+                                                                     "flush_messages during failure wrap-up failed"
+                                                                 );
+                                                             }
+                                                             runner.submit_tool_traces(&session_id).await;
+                                                             yield Ok(AgentEvent::Done(AgentResult::error(
+                                                                 AgentError::EvoruleError(err_str).to_string(),
+                                                                 step_count,
+                                                                 duration,
+                                                             )));
+                                                             return;
+                                                         }
+                                                     }
+                                                     break 'react;
+                                                     } // end 'react loop
 
-                                               // (工具执行由本地 ReAct 循环驱动,不再依赖 server 的 collect/merge)
-                                           }
-                                           "call_service" => {
-                                               let tool_name = params.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                               let args = params.get("args").cloned().unwrap_or(Value::Null);
-        // Runaway 计数(引擎路径工具调用同口径;
-                                               // 触发语义与本地 ReAct 挂点一致:落账+摘要+暂停收尾)
-                                               if runaway_guard.bump() {
-                                                   if let Some(j) = &journal {
-                                                       if let Err(e) = j.runaway_guard_tripped(
-                                                           runaway_guard.actions,
-                                                           runaway_guard.threshold,
-                                                       ) {
-                                                           warn!(%session_id, error = %e, "runaway_guard_tripped journal failed");
-                                                       }
-                                                   }
-                                                   let summary = format!(
-                                                       "Runaway guard tripped: {} automatic actions counted (limit {}); pending op '{}' was NOT executed. Task paused for human confirmation. Goal: {}",
-                                                       runaway_guard.actions,
-                                                       runaway_guard.threshold,
-                                                       tool_name,
-                                                       goal,
-                                                   );
-                                                   warn!(%session_id, actions = runaway_guard.actions, threshold = runaway_guard.threshold, "runaway guard tripped (call_service), pausing for human confirmation");
-                                                   yield Ok(AgentEvent::Error(
-                                                       AgentError::Internal(summary.clone()),
-                                                   ));
-                                                   let duration = start_time.elapsed().as_millis() as u64;
-                                                   if let Some(g) = turn_guard.take() {
-                                                       g.end("runaway_paused", step_count as u64, duration);
-                                                   }
-                                                   if let Err(e) = runner.flush_messages(&session_id).await {
-                                                       tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                                   }
-                                                   runner.submit_tool_traces(&session_id).await;
-                                                   yield Ok(AgentEvent::Done(AgentResult::error(
-                                                       summary,
-                                                       step_count,
-                                                       duration,
-                                                   )));
-                                                   return;
-                                               }
-                                               yield Ok(AgentEvent::ToolCall { name: tool_name.clone(), args: args.clone() });
-                                               // B21:tool_invoked(call_service 路径,evorule_request_id =
-                                               // IoRequest.id,审计链 join 键——ATIF 映射表 §五)
-                                               let j_call_id = journal.as_ref().and_then(|j| {
-                                                   j.tool_invoked(&tool_name, &args, request_id).ok()
-                                               });
+                                                     // (工具执行由本地 ReAct 循环驱动,不再依赖 server 的 collect/merge)
+                                                 }
+                                                 "call_service" => {
+                                                     let tool_name = params.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                     let args = params.get("args").cloned().unwrap_or(Value::Null);
+              // Runaway 计数(引擎路径工具调用同口径;
+                                                     // 触发语义与本地 ReAct 挂点一致:落账+摘要+暂停收尾)
+                                                     if runaway_guard.bump() {
+                                                         if let Some(j) = &journal {
+                                                             if let Err(e) = j.runaway_guard_tripped(
+                                                                 runaway_guard.actions,
+                                                                 runaway_guard.threshold,
+                                                             ) {
+                                                                 warn!(%session_id, error = %e, "runaway_guard_tripped journal failed");
+                                                             }
+                                                         }
+                                                         let summary = format!(
+                                                             "Runaway guard tripped: {} automatic actions counted (limit {}); pending op '{}' was NOT executed. Task paused for human confirmation. Goal: {}",
+                                                             runaway_guard.actions,
+                                                             runaway_guard.threshold,
+                                                             tool_name,
+                                                             goal,
+                                                         );
+                                                         warn!(%session_id, actions = runaway_guard.actions, threshold = runaway_guard.threshold, "runaway guard tripped (call_service), pausing for human confirmation");
+                                                         yield Ok(AgentEvent::Error(
+                                                             AgentError::Internal(summary.clone()),
+                                                         ));
+                                                         let duration = start_time.elapsed().as_millis() as u64;
+                                                         if let Some(g) = turn_guard.take() {
+                                                             g.end("runaway_paused", step_count as u64, duration);
+                                                         }
+                                                         if let Err(e) = runner.flush_messages(&session_id).await {
+                                                             tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                         }
+                                                         runner.submit_tool_traces(&session_id).await;
+                                                         yield Ok(AgentEvent::Done(AgentResult::error(
+                                                             summary,
+                                                             step_count,
+                                                             duration,
+                                                         )));
+                                                         return;
+                                                     }
+                                                     yield Ok(AgentEvent::ToolCall { name: tool_name.clone(), args: args.clone() });
+                                                     // B21:tool_invoked(call_service 路径,evorule_request_id =
+                                                     // IoRequest.id,审计链 join 键——ATIF 映射表 §五)
+                                                     let j_call_id = journal.as_ref().and_then(|j| {
+                                                         j.tool_invoked(&tool_name, &args, request_id).ok()
+                                                     });
 
-                                               // 审批+执行抽到两阶段 helper(与本地 ReAct 循环共用);
-                                               // 事件仍在此处 yield(stream! 宏限制)。Pending 时先
-                                               // yield ApprovalRequired 再等决策(帧须在 60s 窗口内
-                                               // 到达前端)。非流式路径(run)仍走 handle_call_service
-                                               // (内部 maybe_handle_approval,不产事件)
-                                               // 判据自检门禁(与非流式 handle_call_service 同款)。
-                                               // 拒绝 → 审计留痕 + 合成 tool 消息回喂 LLM + continue 下一个 tc
-                                               // (指令不提交引擎——判据不过不存在 done 退出路径)
-                                               let args = match apply_acceptance_gate(
-                                                   runner.acceptance_command.as_deref(),
-                                                   &args,
-                                               )
-                                               .await
-                                               {
-                                                   GateOutcome::Allow(a) => a,
-                                                   GateOutcome::Reject(detail) => {
-                                                       warn!(%session_id, %detail, "acceptance gate rejected instruction submission");
-                                                       if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                                           if let Err(e) = j.tool_result(cid, "rejected", &detail, runner.execution_profile_marker()) {
-                                                               warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
-                                                           }
-                                                       }
-                                                       tool_calls.push(tool_name.clone());
-                                                       let tool_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
-                                                       messages.push(Message::Tool {
-                                                           content: format!(
-                                                               "{{\"status\":\"rejected_by_acceptance_gate\",\"detail\":\"{detail}\"}}"
-                                                           ),
-                                                           tool_name: tool_name.clone(),
-                                                           images: Vec::new(),
-                                                       });
-                                                       if let Err(e) = runner
-                                                           .persist_message(&session_id, tool_idx, messages.last().cloned().expect("gate reject tool msg"))
-                                                           .await
-                                                       {
-                                                           tracing::warn!(session_id = %session_id, error = %e, "gate reject message persist failed");
-                                                       }
-                                                       yield Ok(AgentEvent::Info(format!(
-                                                           "acceptance gate rejected: {detail}"
-                                                       )));
-                                                       continue;
-                                                   }
-                                               };
-                                               // 笔记强制回喂 R-3 段末强制(task_done 判据门放行后):
-                                               // 未完成事项(todo)+失败清单(failure 正体)+缺根因草稿
-                                               // 非空 → advisory 附进工具结果(诚实分立:判据已过仍放行,
-                                               // 清单随沉淀必然在账;草稿催写转正)
-                                               let mut gate_note_advisory: Option<String> = None;
-                                               if tool_name == "task_done" {
-                                                   if let Some(mem) = runner.memory.as_ref() {
-                                                       match mem.fetch_notes_catalog().await {
-                                                           Ok(catalog) => {
-                                                               let open: Vec<_> = catalog
-                                                                   .iter()
-                                                                   .filter(|r| {
-                                                                       r.key.contains("todo")
-                                                                           || (r.key.contains("failure")
-                                                                               && !r.key.contains("draft"))
-                                                                   })
-                                                                   .collect();
-                                                               let drafts: Vec<_> = catalog
-                                                                   .iter()
-                                                                   .filter(|r| r.key.contains("draft"))
-                                                                   .collect();
-                                                               if !open.is_empty() || !drafts.is_empty() {
-                                                                   warn!(
-                                                                       %session_id,
-                                                                       open = open.len(),
-                                                                       drafts = drafts.len(),
-                                                                       "段末强制回喂:task_done 时仍有未完成事项/未消化失败(判据放行,清单随结果回喂)"
-                                                                   );
-                                                                   let mut lines = vec![format!(
-                                                                       "[段末强制回喂] 判据已过但账面仍有未完成事项 {} 项/缺根因草稿 {} 项(诚实分立;清单随本结果在目,草稿请补记转正):",
-                                                                       open.len(),
-                                                                       drafts.len()
-                                                                   )];
-                                                                   for r in open.iter().take(5) {
-                                                                       let t: String =
-                                                                           r.value.chars().take(150).collect();
-                                                                       lines.push(format!("- {}: {}", r.key, t));
-                                                                   }
-                                                                   for d in drafts.iter().take(5) {
-                                                                       lines.push(format!(
-                                                                           "- [催写] {} 缺根因假设,请补记",
-                                                                           d.key
-                                                                       ));
-                                                                   }
-                                                                   gate_note_advisory = Some(lines.join("
-                       "));
-                                                               }
-                                                           }
-                                                           Err(e) => {
-                                                               warn!(%session_id, error = %e, "段末笔记清单拉取失败(fail-soft,不阻塞放行)");
-                                                           }
-                                                       }
-                                                   }
-                                               }
-                                               // 写前置查询(Q2 R-4):写族意图→路径历史 advisory(执行前计算,随结果回喂)
-                                               let write_advisory =
-                                                   runner.write_intent_advisory(&tool_name, &args).await;
-                                               // 输出尾随(同主路径形态):tap 安装+select 转发;
-                                               // 并行 call_external 下绑定按 spawn 序近似归属,
-                                               // 消息自带 tool_name,前端按名找卡纠偏
-                                               let (tap_tx, mut tap_rx) =
-                                                   tokio::sync::mpsc::unbounded_channel::<crate::builtin_tools::shell_exec::TapSeg>();
-                                               crate::builtin_tools::shell_exec::push_pending_tap(&tool_name, tap_tx);
-                                               let mut tap_open = true;
-                                               // stdout/stderr 分色:双环各自截尾,帧带流别供前端分色渲染
-                                               let mut tap_ring_out: Vec<u8> = Vec::new();
-                                               let mut tap_ring_err: Vec<u8> = Vec::new();
-                                               let mut tap_out_truncated = false;
-                                               let mut tap_err_truncated = false;
-                                               let mut tap_flush_at = std::time::Instant::now();
-                                               const TAP_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
-                                               const TAP_RING: usize = 16 * 1024;
-                                               let outcome_res = {
-                                                   let mut stage_fut = std::pin::pin!(
-                                                       runner.execute_tool_stage(&session_id, &tool_name, &args, journal.as_deref())
-                                                   );
-                                                   loop {
-                                                       tokio::select! {
-                                                           biased;
-                                                           _ = cancel_token.cancelled() => {
-                                                               // 中断于工具执行/审批等待:break Err 哨兵,规范收尾在块外
-                                                               // is_cancelled() 拦截(stage_fut/resolve_fut 借用未结束,禁 runner 可变操作)
-                                                               break Err(AgentError::Internal("cancelled by user".to_string()))
-                                                           }
+                                                     // 审批+执行抽到两阶段 helper(与本地 ReAct 循环共用);
+                                                     // 事件仍在此处 yield(stream! 宏限制)。Pending 时先
+                                                     // yield ApprovalRequired 再等决策(帧须在 60s 窗口内
+                                                     // 到达前端)。非流式路径(run)仍走 handle_call_service
+                                                     // (内部 maybe_handle_approval,不产事件)
+                                                     // 判据自检门禁(与非流式 handle_call_service 同款)。
+                                                     // 拒绝 → 审计留痕 + 合成 tool 消息回喂 LLM + continue 下一个 tc
+                                                     // (指令不提交引擎——判据不过不存在 done 退出路径)
+                                                     let args = match apply_acceptance_gate(
+                                                         runner.acceptance_command.as_deref(),
+                                                         &args,
+                                                     )
+                                                     .await
+                                                     {
+                                                         GateOutcome::Allow(a) => a,
+                                                         GateOutcome::Reject(detail) => {
+                                                             warn!(%session_id, %detail, "acceptance gate rejected instruction submission");
+                                                             if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
+                                                                 if let Err(e) = j.tool_result(cid, "rejected", &detail, runner.execution_profile_marker()) {
+                                                                     warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
+                                                                 }
+                                                             }
+                                                             tool_calls.push(tool_name.clone());
+                                                             let tool_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
+                                                             messages.push(Message::Tool {
+                                                                 content: format!(
+                                                                     "{{\"status\":\"rejected_by_acceptance_gate\",\"detail\":\"{detail}\"}}"
+                                                                 ),
+                                                                 tool_name: tool_name.clone(),
+                                                                 images: Vec::new(),
+                                                             });
+                                                             if let Err(e) = runner
+                                                                 .persist_message(&session_id, tool_idx, messages.last().cloned().expect("gate reject tool msg"))
+                                                                 .await
+                                                             {
+                                                                 tracing::warn!(session_id = %session_id, error = %e, "gate reject message persist failed");
+                                                             }
+                                                             yield Ok(AgentEvent::Info(format!(
+                                                                 "acceptance gate rejected: {detail}"
+                                                             )));
+                                                             continue;
+                                                         }
+                                                     };
+                                                     // 笔记强制回喂 R-3 段末强制(task_done 判据门放行后):
+                                                     // 未完成事项(todo)+失败清单(failure 正体)+缺根因草稿
+                                                     // 非空 → advisory 附进工具结果(诚实分立:判据已过仍放行,
+                                                     // 清单随沉淀必然在账;草稿催写转正)
+                                                     let mut gate_note_advisory: Option<String> = None;
+                                                     if tool_name == "task_done" {
+                                                         if let Some(mem) = runner.memory.as_ref() {
+                                                             match mem.fetch_notes_catalog().await {
+                                                                 Ok(catalog) => {
+                                                                     let open: Vec<_> = catalog
+                                                                         .iter()
+                                                                         .filter(|r| {
+                                                                             r.key.contains("todo")
+                                                                                 || (r.key.contains("failure")
+                                                                                     && !r.key.contains("draft"))
+                                                                         })
+                                                                         .collect();
+                                                                     let drafts: Vec<_> = catalog
+                                                                         .iter()
+                                                                         .filter(|r| r.key.contains("draft"))
+                                                                         .collect();
+                                                                     if !open.is_empty() || !drafts.is_empty() {
+                                                                         warn!(
+                                                                             %session_id,
+                                                                             open = open.len(),
+                                                                             drafts = drafts.len(),
+                                                                             "段末强制回喂:task_done 时仍有未完成事项/未消化失败(判据放行,清单随结果回喂)"
+                                                                         );
+                                                                         let mut lines = vec![format!(
+                                                                             "[段末强制回喂] 判据已过但账面仍有未完成事项 {} 项/缺根因草稿 {} 项(诚实分立;清单随本结果在目,草稿请补记转正):",
+                                                                             open.len(),
+                                                                             drafts.len()
+                                                                         )];
+                                                                         for r in open.iter().take(5) {
+                                                                             let t: String =
+                                                                                 r.value.chars().take(150).collect();
+                                                                             lines.push(format!("- {}: {}", r.key, t));
+                                                                         }
+                                                                         for d in drafts.iter().take(5) {
+                                                                             lines.push(format!(
+                                                                                 "- [催写] {} 缺根因假设,请补记",
+                                                                                 d.key
+                                                                             ));
+                                                                         }
+                                                                         gate_note_advisory = Some(lines.join("
+                             "));
+                                                                     }
+                                                                 }
+                                                                 Err(e) => {
+                                                                     warn!(%session_id, error = %e, "段末笔记清单拉取失败(fail-soft,不阻塞放行)");
+                                                                 }
+                                                             }
+                                                         }
+                                                     }
+                                                     // 写前置查询(Q2 R-4):写族意图→路径历史 advisory(执行前计算,随结果回喂)
+                                                     let write_advisory =
+                                                         runner.write_intent_advisory(&tool_name, &args).await;
+                                                     // 输出尾随(同主路径形态):tap 安装+select 转发;
+                                                     // 并行 call_external 下绑定按 spawn 序近似归属,
+                                                     // 消息自带 tool_name,前端按名找卡纠偏
+                                                     let (tap_tx, mut tap_rx) =
+                                                         tokio::sync::mpsc::unbounded_channel::<crate::builtin_tools::shell_exec::TapSeg>();
+                                                     crate::builtin_tools::shell_exec::push_pending_tap(&tool_name, tap_tx);
+                                                     let mut tap_open = true;
+                                                     // stdout/stderr 分色:双环各自截尾,帧带流别供前端分色渲染
+                                                     let mut tap_ring_out: Vec<u8> = Vec::new();
+                                                     let mut tap_ring_err: Vec<u8> = Vec::new();
+                                                     let mut tap_out_truncated = false;
+                                                     let mut tap_err_truncated = false;
+                                                     let mut tap_flush_at = std::time::Instant::now();
+                                                     const TAP_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+                                                     const TAP_RING: usize = 16 * 1024;
+                                                     let outcome_res = {
+                                                         let mut stage_fut = std::pin::pin!(
+                                                             runner.execute_tool_stage(&session_id, &tool_name, &args, journal.as_deref())
+                                                         );
+                                                         loop {
+                                                             tokio::select! {
+                                                                 biased;
+                                                                 _ = cancel_token.cancelled() => {
+                                                                     // 中断于工具执行/审批等待:break Err 哨兵,规范收尾在块外
+                                                                     // is_cancelled() 拦截(stage_fut/resolve_fut 借用未结束,禁 runner 可变操作)
+                                                                     break Err(AgentError::Internal("cancelled by user".to_string()))
+                                                                 }
 
-                                                           res = &mut stage_fut => break res,
-                                                           seg = tap_rx.recv(), if tap_open => {
-                                                               match seg {
-                                                                   Some(tapseg) => {
-                                                                       let (ring, truncated) = if tapseg.stream == "err" {
-                                                                           (&mut tap_ring_err, &mut tap_err_truncated)
-                                                                       } else {
-                                                                           (&mut tap_ring_out, &mut tap_out_truncated)
-                                                                       };
-                                                                       ring.extend_from_slice(&tapseg.seg);
-                                                                       if ring.len() > TAP_RING {
-                                                                           let drop_n = ring.len() - TAP_RING;
-                                                                           ring.drain(..drop_n);
-                                                                           *truncated = true;
-                                                                       }
-                                                                       if tap_flush_at.elapsed() >= TAP_WINDOW && !ring.is_empty() {
-                                                                           let text = String::from_utf8_lossy(ring).into_owned();
-                                                                           ring.clear();
-                                                                           tap_flush_at = std::time::Instant::now();
-                                                                           yield Ok(AgentEvent::ToolOutputChunk {
-                                                                               tool_name: tapseg.tool_name,
-                                                                               stream: tapseg.stream.to_string(),
-                                                                               chunk: text,
-                                                                               truncated: *truncated,
-                                                                           });
-                                                                       }
-                                                                   }
-                                                                   None => { tap_open = false; }
-                                                               }
-                                                           }
-                                                       }
-                                                   }
-                                               };
-                                               // 尾随环形缓冲残余不发送:权威 ToolResult 即将
-                                               // 到达并包含全量输出,残余段重发属重复信息
-                                               let outcome_res = match outcome_res {
-                                                   Err(e) => Err(e),
-                                                   Ok(ToolExecStage::Done(o)) => {
-                                                       // 执行完成:按名清理残留绑定(幂等)
-                                                       crate::builtin_tools::shell_exec::unbind_pending(&tool_name);
-                                                       Ok(o)
-                                                   }
-                                                   Ok(ToolExecStage::Pending(req)) => {
-                                                       yield Ok(AgentEvent::ApprovalRequired {
-                                                           tool_name: tool_name.clone(),
-                                                           command: req.command.clone(),
-                                                           risk: req.risk.clone(),
-                                                           alternative: req.alternative.clone(),
-                                                           proposal_id: req.proposal_id.clone(),
-                                                           preview: crate::agent::approval::build_preview(&tool_name, &args),
-                                                       });
-                                                       // B21:approval_requested(60s 审批窗开启)
-                                                       if let Some(j) = &journal {
-                                                           if let Err(e) = j.approval_requested(&req.proposal_id, &tool_name, &req.command) {
-                                                               warn!(%session_id, tool = %tool_name, error = %e, "approval_requested journal failed");
-                                                           }
-                                                       }
-                                                       let res = {
-                                                           // 审批等待+批准后执行的尾随转发段(同主路径)
-                                                           let mut resolve_fut = std::pin::pin!(
-                                                               runner.resolve_approval(&session_id, &tool_name, &args, req, journal.as_deref())
-                                                           );
-                                                           let mut resolve_ring_out: Vec<u8> = Vec::new();
-                                                           let mut resolve_ring_err: Vec<u8> = Vec::new();
-                                                           let mut resolve_out_truncated = false;
-                                                           let mut resolve_err_truncated = false;
-                                                           let mut resolve_flush_at = std::time::Instant::now();
-                                                           loop {
-                                                               tokio::select! {
-                                                                   biased;
-                                                                   _ = cancel_token.cancelled() => {
-                                                                       // 中断于工具执行/审批等待:break Err 哨兵,规范收尾在块外
-                                                                       // is_cancelled() 拦截(stage_fut/resolve_fut 借用未结束,禁 runner 可变操作)
-                                                                       break Err(AgentError::Internal("cancelled by user".to_string()))
-                                                                   }
+                                                                 res = &mut stage_fut => break res,
+                                                                 seg = tap_rx.recv(), if tap_open => {
+                                                                     match seg {
+                                                                         Some(tapseg) => {
+                                                                             let (ring, truncated) = if tapseg.stream == "err" {
+                                                                                 (&mut tap_ring_err, &mut tap_err_truncated)
+                                                                             } else {
+                                                                                 (&mut tap_ring_out, &mut tap_out_truncated)
+                                                                             };
+                                                                             ring.extend_from_slice(&tapseg.seg);
+                                                                             if ring.len() > TAP_RING {
+                                                                                 let drop_n = ring.len() - TAP_RING;
+                                                                                 ring.drain(..drop_n);
+                                                                                 *truncated = true;
+                                                                             }
+                                                                             if tap_flush_at.elapsed() >= TAP_WINDOW && !ring.is_empty() {
+                                                                                 let text = String::from_utf8_lossy(ring).into_owned();
+                                                                                 ring.clear();
+                                                                                 tap_flush_at = std::time::Instant::now();
+                                                                                 yield Ok(AgentEvent::ToolOutputChunk {
+                                                                                     tool_name: tapseg.tool_name,
+                                                                                     stream: tapseg.stream.to_string(),
+                                                                                     chunk: text,
+                                                                                     truncated: *truncated,
+                                                                                 });
+                                                                             }
+                                                                         }
+                                                                         None => { tap_open = false; }
+                                                                     }
+                                                                 }
+                                                             }
+                                                         }
+                                                     };
+                                                     // 尾随环形缓冲残余不发送:权威 ToolResult 即将
+                                                     // 到达并包含全量输出,残余段重发属重复信息
+                                                     let outcome_res = match outcome_res {
+                                                         Err(e) => Err(e),
+                                                         Ok(ToolExecStage::Done(o)) => {
+                                                             // 执行完成:按名清理残留绑定(幂等)
+                                                             crate::builtin_tools::shell_exec::unbind_pending(&tool_name);
+                                                             Ok(o)
+                                                         }
+                                                         Ok(ToolExecStage::Pending(req)) => {
+                                                             yield Ok(AgentEvent::ApprovalRequired {
+                                                                 tool_name: tool_name.clone(),
+                                                                 command: req.command.clone(),
+                                                                 risk: req.risk.clone(),
+                                                                 alternative: req.alternative.clone(),
+                                                                 proposal_id: req.proposal_id.clone(),
+                                                                 preview: crate::agent::approval::build_preview(&tool_name, &args),
+                                                             });
+                                                             // B21:approval_requested(60s 审批窗开启)
+                                                             if let Some(j) = &journal {
+                                                                 if let Err(e) = j.approval_requested(&req.proposal_id, &tool_name, &req.command) {
+                                                                     warn!(%session_id, tool = %tool_name, error = %e, "approval_requested journal failed");
+                                                                 }
+                                                             }
+                                                             let res = {
+                                                                 // 审批等待+批准后执行的尾随转发段(同主路径)
+                                                                 let mut resolve_fut = std::pin::pin!(
+                                                                     runner.resolve_approval(&session_id, &tool_name, &args, req, journal.as_deref())
+                                                                 );
+                                                                 let mut resolve_ring_out: Vec<u8> = Vec::new();
+                                                                 let mut resolve_ring_err: Vec<u8> = Vec::new();
+                                                                 let mut resolve_out_truncated = false;
+                                                                 let mut resolve_err_truncated = false;
+                                                                 let mut resolve_flush_at = std::time::Instant::now();
+                                                                 loop {
+                                                                     tokio::select! {
+                                                                         biased;
+                                                                         _ = cancel_token.cancelled() => {
+                                                                             // 中断于工具执行/审批等待:break Err 哨兵,规范收尾在块外
+                                                                             // is_cancelled() 拦截(stage_fut/resolve_fut 借用未结束,禁 runner 可变操作)
+                                                                             break Err(AgentError::Internal("cancelled by user".to_string()))
+                                                                         }
 
-                                                                   r = &mut resolve_fut => break r,
-                                                                   seg = tap_rx.recv(), if tap_open => {
-                                                                       match seg {
-                                                                           Some(tapseg) => {
-                                                                               let (ring, truncated) = if tapseg.stream == "err" {
-                                                                                   (&mut resolve_ring_err, &mut resolve_err_truncated)
-                                                                               } else {
-                                                                                   (&mut resolve_ring_out, &mut resolve_out_truncated)
-                                                                               };
-                                                                               ring.extend_from_slice(&tapseg.seg);
-                                                                               if ring.len() > TAP_RING {
-                                                                                   let drop_n = ring.len() - TAP_RING;
-                                                                                   ring.drain(..drop_n);
-                                                                                   *truncated = true;
-                                                                               }
-                                                                               if resolve_flush_at.elapsed() >= TAP_WINDOW && !ring.is_empty() {
-                                                                                   let text = String::from_utf8_lossy(ring).into_owned();
-                                                                                   ring.clear();
-                                                                                   resolve_flush_at = std::time::Instant::now();
-                                                                                   yield Ok(AgentEvent::ToolOutputChunk {
-                                                                                       tool_name: tapseg.tool_name,
-                                                                                       stream: tapseg.stream.to_string(),
-                                                                                       chunk: text,
-                                                                                       truncated: *truncated,
-                                                                                   });
-                                                                               }
-                                                                           }
-                                                                           None => { tap_open = false; }
-                                                                       }
-                                                                   }
-                                                               }
-                                                           }
-                                                       };
-                                                       if let Ok(o) = &res {
-                                                           if let Some((req0, decision)) = &o.approval_flow {
-                                                               yield Ok(AgentEvent::ApprovalResult {
-                                                                   tool_name: tool_name.clone(),
-                                                                   approved: decision.approved,
-                                                                   approver: decision.approver.clone(),
-                                                                   auto_rejected: decision.auto_rejected,
-                                                               });
-                                                               // B21:approval_resolved(approval_id = proposal_id)
-                                                               if let Some(j) = &journal {
-                                                                   if let Err(e) = j.approval_resolved_with_decision(&req0.proposal_id, decision) {
-                                                                       warn!(%session_id, error = %e, "approval_resolved journal failed");
-                                                                   }
-                                                               }
-                                                           }
-                                                       }
-                                                       // 审批拒绝:未发生 spawn,pending 绑定滞留队头须清
-                                                       if let Ok(o) = &res {
-                                                           if let Some((_, decision)) = &o.approval_flow {
-                                                               if !decision.approved {
-                                                                   crate::builtin_tools::shell_exec::unbind_pending(&tool_name);
-                                                               }
-                                                           }
-                                                       }
-                                                       res
-                                                   }
-                                                   Ok(ToolExecStage::PendingQuestion(query)) => {
-                                                       // 批K 段7:ask_user 两阶段(人在环澄清卡,与本函数审批臂同构)
-                                                       let question_id = query.question_id.clone();
-                                                       yield Ok(AgentEvent::AskUser {
-                                                           question_id: query.question_id.clone(),
-                                                           question: query.question.clone(),
-                                                           options: query.options.clone(),
-                                                           multi_select: query.multi_select,
-                                                           timeout_secs: query.timeout_secs,
-                                                       });
-                                                       if let Some(j) = &journal {
-                                                           if let Err(e) = j.question_requested(&question_id, &tool_name, &query.question) {
-                                                               warn!(%session_id, error = %e, "question_requested journal failed");
-                                                           }
-                                                       }
-                                                       let res = tokio::select! {
-                                                           biased;
-                                                           r = runner
-                                                               .resolve_ask_user(&session_id, &args, query, journal.as_deref()) => r,
-                                                           _ = cancel_token.cancelled() => {
-                                                               // 取消路径:ask_user 等待同样挂 cancel——
-                                                               // 哨兵 Err 走既有 Err 臂 cancelled 分支收尾
-                                                               Err(AgentError::Internal(
-                                                                   "cancelled by user".to_string(),
-                                                               ))
-                                                           }
-                                                       };
-                                                       if let Ok((_, label)) = &res {
-                                                           yield Ok(AgentEvent::AskUserResult {
-                                                               answered: label == "answered",
-                                                               timed_out: label == "timeout",
-                                                               question_id: question_id.clone(),
-                                                           });
-                                                           if let Some(j) = &journal {
-                                                               if let Err(e) = j.question_resolved(&question_id, label) {
-                                                                   warn!(%session_id, error = %e, "question_resolved journal failed");
-                                                               }
-                                                           }
-                                                       }
-                                                       res.map(|(o, _)| o)
-                                                   }
-                                               };
-                                               let outcome = match outcome_res {
-                                                   Ok(o) => o,
-                                                   Err(e) => {
-                                                       if let Some(rid) = request_id {
-                                                           let err_str = e.to_string();
-                                                           let err_resp = serde_json::json!({"error": &err_str});
-                                                           if let Err(ie) = runner.evorule_client
-                                                               .submit_io_response(&session_id, rid, &err_resp, Some(err_str.as_str()))
-                                                               .await
-                                                           {
-                                                               tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (tool_exec_error) failed; io_request may hang on engine side");
-                                                           }
-                                                       }
-                                                       yield Ok(AgentEvent::Error(e.clone()));
-                                                       // B21:tool_result(error;工具尝试已失败,补记保重放完整)
-                                                       if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                                           if let Err(je) = j.tool_result(cid, "error", &e.to_string(), runner.execution_profile_marker()) {
-                                                               warn!(%session_id, call_id = %cid, error = %je, "tool_result journal failed");
-                                                           }
-                                                       }
-                                                       let duration = start_time.elapsed().as_millis() as u64;
-                                                       if let Err(e) = runner.flush_messages(&session_id).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                       }
-                                                       runner.submit_tool_traces(&session_id).await;
-                                                       if cancel_token.is_cancelled() {
-                                                           // 中断于工具等待:走 cancelled 收尾分支(而非 error 语义)
-                                                           let duration = start_time.elapsed().as_millis() as u64;
-                                                           if let Some(g) = turn_guard.take() {
-                                                               g.end("cancelled", step_count as u64, duration);
-                                                           }
-                                                           yield Ok(AgentEvent::Error(AgentError::Internal(
-                                                               "cancelled by user".to_string(),
-                                                           )));
-                                                           yield Ok(AgentEvent::Done(AgentResult::cancelled_result(
-                                                               Vec::new(),
-                                                               step_count,
-                                                               duration,
-                                                           )));
-                                                           return;
-                                                       }
-                                                       // B21:turn_ended(error,优雅终止路径显式收尾)
-                                                       if let Some(g) = turn_guard.take() {
-                                                           g.end("error", step_count as u64, duration);
-                                                       }
-                                                       yield Ok(AgentEvent::Done(AgentResult::error(
-                                                           e.to_string(), step_count, duration,
-                                                       )));
-                                                       return;
-                                                   }
-                                               };
-                                               // 审批事件已在两阶段流程中即时 yield(见 Pending 分支)
-                                               // 停滞检测(与非流式同款;标记随 tool 消息回喂)
-                                               let final_result = {
-                                                   let mut fr = outcome.final_result;
-                                                   let verdict = runner.stagnation.observe(
-                                                       &tool_name,
-                                                       &args.to_string(),
-                                                       &fr.to_string(),
-                                                   );
-                                                   match verdict {
-                                                       StagnationVerdict::Normal => {}
-                                                       StagnationVerdict::Warning { repeat_count } => {
-                                                           warn!(%session_id, tool = %tool_name, repeat_count, "stagnation warning (F2)");
-                                                           // 笔记强制回喂 R-2:停滞触发,下一轮回喂相关 failure 教训
-                                                           runner.pending_note_feed = true;
-                                                           if let Some(obj) = fr.as_object_mut() {
-                                                               obj.insert(
-                                                                   "stagnation".to_string(),
-                                                                   serde_json::json!(STAGNATION_WARNING_MARK),
-                                                               );
-                                                           }
-                                                       }
-                                                       StagnationVerdict::Exhausted => {
-                                                           warn!(%session_id, tool = %tool_name, "stagnation EXHAUSTED (F2)——按 H2 阻塞收尾指引");
-                                                           runner.pending_note_feed = true;
-                                                           if let Some(obj) = fr.as_object_mut() {
-                                                               obj.insert(
-                                                                   "stagnation".to_string(),
-                                                                   serde_json::json!(STAGNATION_EXHAUSTED_MARK),
-                                                               );
-                                                           }
-                                                       }
-                                                   }
-                                                   fr
-                                               };
+                                                                         r = &mut resolve_fut => break r,
+                                                                         seg = tap_rx.recv(), if tap_open => {
+                                                                             match seg {
+                                                                                 Some(tapseg) => {
+                                                                                     let (ring, truncated) = if tapseg.stream == "err" {
+                                                                                         (&mut resolve_ring_err, &mut resolve_err_truncated)
+                                                                                     } else {
+                                                                                         (&mut resolve_ring_out, &mut resolve_out_truncated)
+                                                                                     };
+                                                                                     ring.extend_from_slice(&tapseg.seg);
+                                                                                     if ring.len() > TAP_RING {
+                                                                                         let drop_n = ring.len() - TAP_RING;
+                                                                                         ring.drain(..drop_n);
+                                                                                         *truncated = true;
+                                                                                     }
+                                                                                     if resolve_flush_at.elapsed() >= TAP_WINDOW && !ring.is_empty() {
+                                                                                         let text = String::from_utf8_lossy(ring).into_owned();
+                                                                                         ring.clear();
+                                                                                         resolve_flush_at = std::time::Instant::now();
+                                                                                         yield Ok(AgentEvent::ToolOutputChunk {
+                                                                                             tool_name: tapseg.tool_name,
+                                                                                             stream: tapseg.stream.to_string(),
+                                                                                             chunk: text,
+                                                                                             truncated: *truncated,
+                                                                                         });
+                                                                                     }
+                                                                                 }
+                                                                                 None => { tap_open = false; }
+                                                                             }
+                                                                         }
+                                                                     }
+                                                                 }
+                                                             };
+                                                             if let Ok(o) = &res {
+                                                                 if let Some((req0, decision)) = &o.approval_flow {
+                                                                     yield Ok(AgentEvent::ApprovalResult {
+                                                                         tool_name: tool_name.clone(),
+                                                                         approved: decision.approved,
+                                                                         approver: decision.approver.clone(),
+                                                                         auto_rejected: decision.auto_rejected,
+                                                                     });
+                                                                     // B21:approval_resolved(approval_id = proposal_id)
+                                                                     if let Some(j) = &journal {
+                                                                         if let Err(e) = j.approval_resolved_with_decision(&req0.proposal_id, decision) {
+                                                                             warn!(%session_id, error = %e, "approval_resolved journal failed");
+                                                                         }
+                                                                     }
+                                                                 }
+                                                             }
+                                                             // 审批拒绝:未发生 spawn,pending 绑定滞留队头须清
+                                                             if let Ok(o) = &res {
+                                                                 if let Some((_, decision)) = &o.approval_flow {
+                                                                     if !decision.approved {
+                                                                         crate::builtin_tools::shell_exec::unbind_pending(&tool_name);
+                                                                     }
+                                                                 }
+                                                             }
+                                                             res
+                                                         }
+                                                         Ok(ToolExecStage::PendingQuestion(query)) => {
+                                                             // 批K 段7:ask_user 两阶段(人在环澄清卡,与本函数审批臂同构)
+                                                             let question_id = query.question_id.clone();
+                                                             yield Ok(AgentEvent::AskUser {
+                                                                 question_id: query.question_id.clone(),
+                                                                 question: query.question.clone(),
+                                                                 options: query.options.clone(),
+                                                                 multi_select: query.multi_select,
+                                                                 timeout_secs: query.timeout_secs,
+                                                             });
+                                                             if let Some(j) = &journal {
+                                                                 if let Err(e) = j.question_requested(&question_id, &tool_name, &query.question) {
+                                                                     warn!(%session_id, error = %e, "question_requested journal failed");
+                                                                 }
+                                                             }
+                                                             let res = tokio::select! {
+                                                                 biased;
+                                                                 r = runner
+                                                                     .resolve_ask_user(&session_id, &args, query, journal.as_deref()) => r,
+                                                                 _ = cancel_token.cancelled() => {
+                                                                     // 取消路径:ask_user 等待同样挂 cancel——
+                                                                     // 哨兵 Err 走既有 Err 臂 cancelled 分支收尾
+                                                                     Err(AgentError::Internal(
+                                                                         "cancelled by user".to_string(),
+                                                                     ))
+                                                                 }
+                                                             };
+                                                             if let Ok((_, label)) = &res {
+                                                                 yield Ok(AgentEvent::AskUserResult {
+                                                                     answered: label == "answered",
+                                                                     timed_out: label == "timeout",
+                                                                     question_id: question_id.clone(),
+                                                                 });
+                                                                 if let Some(j) = &journal {
+                                                                     if let Err(e) = j.question_resolved(&question_id, label) {
+                                                                         warn!(%session_id, error = %e, "question_resolved journal failed");
+                                                                     }
+                                                                 }
+                                                             }
+                                                             res.map(|(o, _)| o)
+                                                         }
+                                                     };
+                                                     let outcome = match outcome_res {
+                                                         Ok(o) => o,
+                                                         Err(e) => {
+                                                             if let Some(rid) = request_id {
+                                                                 let err_str = e.to_string();
+                                                                 let err_resp = serde_json::json!({"error": &err_str});
+                                                                 if let Err(ie) = runner.evorule_client
+                                                                     .submit_io_response(&session_id, rid, &err_resp, Some(err_str.as_str()))
+                                                                     .await
+                                                                 {
+                                                                     tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (tool_exec_error) failed; io_request may hang on engine side");
+                                                                 }
+                                                             }
+                                                             yield Ok(AgentEvent::Error(e.clone()));
+                                                             // B21:tool_result(error;工具尝试已失败,补记保重放完整)
+                                                             if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
+                                                                 if let Err(je) = j.tool_result(cid, "error", &e.to_string(), runner.execution_profile_marker()) {
+                                                                     warn!(%session_id, call_id = %cid, error = %je, "tool_result journal failed");
+                                                                 }
+                                                             }
+                                                             let duration = start_time.elapsed().as_millis() as u64;
+                                                             if let Err(e) = runner.flush_messages(&session_id).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                             }
+                                                             runner.submit_tool_traces(&session_id).await;
+                                                             if cancel_token.is_cancelled() {
+                                                                 // 中断于工具等待:走 cancelled 收尾分支(而非 error 语义)
+                                                                 let duration = start_time.elapsed().as_millis() as u64;
+                                                                 if let Some(g) = turn_guard.take() {
+                                                                     g.end("cancelled", step_count as u64, duration);
+                                                                 }
+                                                                 yield Ok(AgentEvent::Error(AgentError::Internal(
+                                                                     "cancelled by user".to_string(),
+                                                                 )));
+                                                                 yield Ok(AgentEvent::Done(AgentResult::cancelled_result(
+                                                                     Vec::new(),
+                                                                     step_count,
+                                                                     duration,
+                                                                 )));
+                                                                 return;
+                                                             }
+                                                             // B21:turn_ended(error,优雅终止路径显式收尾)
+                                                             if let Some(g) = turn_guard.take() {
+                                                                 g.end("error", step_count as u64, duration);
+                                                             }
+                                                             yield Ok(AgentEvent::Done(AgentResult::error(
+                                                                 e.to_string(), step_count, duration,
+                                                             )));
+                                                             return;
+                                                         }
+                                                     };
+                                                     // 审批事件已在两阶段流程中即时 yield(见 Pending 分支)
+                                                     // 停滞检测(与非流式同款;标记随 tool 消息回喂)
+                                                     let final_result = {
+                                                         let mut fr = outcome.final_result;
+                                                         let verdict = runner.stagnation.observe(
+                                                             &tool_name,
+                                                             &args.to_string(),
+                                                             &fr.to_string(),
+                                                         );
+                                                         match verdict {
+                                                             StagnationVerdict::Normal => {}
+                                                             StagnationVerdict::Warning { repeat_count } => {
+                                                                 warn!(%session_id, tool = %tool_name, repeat_count, "stagnation warning (F2)");
+                                                                 // 笔记强制回喂 R-2:停滞触发,下一轮回喂相关 failure 教训
+                                                                 runner.pending_note_feed = true;
+                                                                 if let Some(obj) = fr.as_object_mut() {
+                                                                     obj.insert(
+                                                                         "stagnation".to_string(),
+                                                                         serde_json::json!(STAGNATION_WARNING_MARK),
+                                                                     );
+                                                                 }
+                                                             }
+                                                             StagnationVerdict::Exhausted => {
+                                                                 warn!(%session_id, tool = %tool_name, "stagnation EXHAUSTED (F2)——按 H2 阻塞收尾指引");
+                                                                 runner.pending_note_feed = true;
+                                                                 if let Some(obj) = fr.as_object_mut() {
+                                                                     obj.insert(
+                                                                         "stagnation".to_string(),
+                                                                         serde_json::json!(STAGNATION_EXHAUSTED_MARK),
+                                                                     );
+                                                                 }
+                                                             }
+                                                         }
+                                                         fr
+                                                     };
 
-                                               // B1:旁路图片提取+瘦身(指纹替换 base64),
-                                               // journal/回喂/持久化三面统一用瘦身后文本
-                                               let (tool_images, extracted_raw) =
-                                                   extract_images_from_raw(&final_result.to_string(), std::path::Path::new(B1_IMAGES_DIR));
+                                                     // B1:旁路图片提取+瘦身(指纹替换 base64),
+                                                     // journal/回喂/持久化三面统一用瘦身后文本
+                                                     let (tool_images, extracted_raw) =
+                                                         extract_images_from_raw(&final_result.to_string(), std::path::Path::new(B1_IMAGES_DIR));
 
-                                               // B21:tool_result(ok;content = 工具输出全文与 io_response 一致)
-                                               if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                                   if let Err(e) = j.tool_result(cid, "ok", &extracted_raw, runner.execution_profile_marker()) {
-                                                       warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
-                                                   }
-                                               }
+                                                     // B21:tool_result(ok;content = 工具输出全文与 io_response 一致)
+                                                     if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
+                                                         if let Err(e) = j.tool_result(cid, "ok", &extracted_raw, runner.execution_profile_marker()) {
+                                                             warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
+                                                         }
+                                                     }
 
-                                               // 3. 记录 tool_calls + 持久化 tool 消息(同 handle_call_service)
-                                               tool_calls.push(tool_name.clone());
-                                               let tool_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
-                                               // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
-                                               let mut raw_content = extracted_raw;
-                                               if let Some(adv) = gate_note_advisory.take() {
-                                                   raw_content.push('\n');
-                                                   raw_content.push_str(&adv);
-                                               }
-                                               if let Some(adv) = write_advisory {
-                                                   raw_content.push('\n');
-                                                   raw_content.push_str(&adv);
-                                               }
-                                               // 引用化出站门:超限结果原文落盘+引用块,
-                                               // 回喂/持久化两面统一携带(原文在引用文件)
-                                               let gated_content = runner.gate_tool_result(
-                                                   raw_content.clone(),
-                                                   &tool_name,
-                                                   j_call_id.as_deref(),
-                                               );
-                                               let tool_msg = Message::Tool {
-                                                   content: gated_content.clone(),
-                                                   tool_name: tool_name.clone(),
-                                                   images: tool_images,
-                                               };
-                                               messages.push(tool_msg);
-                                               if let Err(e) = runner
-                                                   .persist_message(
-                                                       &session_id,
-                                                       tool_idx,
-                                                       Message::Tool {
-                                                           content: gated_content,
-                                                           tool_name: tool_name.clone(),
-                                                           images: Vec::new(),
-                                                       },
-                                                   )
-                                                   .await
-                                               {
-                                                   // 持久化失败也不留悬挂在途 io_request(回写后终止)
-                                                   if let Some(rid) = request_id {
-                                                       let err_str = e.to_string();
-                                                       if let Err(ie) = runner.evorule_client
-                                                           .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
-                                                           .await
-                                                       {
-                                                           tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (persist_failed) failed; io_request may hang on engine side");
-                                                       }
-                                                   }
-                                                   // 工具已执行、轨迹已采集：终止前补提交，避免审计链缺口（fail-soft）
-                                                   runner.submit_tool_traces(&session_id).await;
-                                                   yield Err(e);
-                                                   return;
-                                               }
+                                                     // 3. 记录 tool_calls + 持久化 tool 消息(同 handle_call_service)
+                                                     tool_calls.push(tool_name.clone());
+                                                     let tool_idx = messages.len() + runner.persist_idx_delta.load(std::sync::atomic::Ordering::Relaxed);
+                                                     // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
+                                                     let mut raw_content = extracted_raw;
+                                                     if let Some(adv) = gate_note_advisory.take() {
+                                                         raw_content.push('\n');
+                                                         raw_content.push_str(&adv);
+                                                     }
+                                                     if let Some(adv) = write_advisory {
+                                                         raw_content.push('\n');
+                                                         raw_content.push_str(&adv);
+                                                     }
+                                                     // 引用化出站门:超限结果原文落盘+引用块,
+                                                     // 回喂/持久化两面统一携带(原文在引用文件)
+                                                     let gated_content = runner.gate_tool_result(
+                                                         raw_content.clone(),
+                                                         &tool_name,
+                                                         j_call_id.as_deref(),
+                                                     );
+                                                     let tool_msg = Message::Tool {
+                                                         content: gated_content.clone(),
+                                                         tool_name: tool_name.clone(),
+                                                         images: tool_images,
+                                                     };
+                                                     messages.push(tool_msg);
+                                                     if let Err(e) = runner
+                                                         .persist_message(
+                                                             &session_id,
+                                                             tool_idx,
+                                                             Message::Tool {
+                                                                 content: gated_content,
+                                                                 tool_name: tool_name.clone(),
+                                                                 images: Vec::new(),
+                                                             },
+                                                         )
+                                                         .await
+                                                     {
+                                                         // 持久化失败也不留悬挂在途 io_request(回写后终止)
+                                                         if let Some(rid) = request_id {
+                                                             let err_str = e.to_string();
+                                                             if let Err(ie) = runner.evorule_client
+                                                                 .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
+                                                                 .await
+                                                             {
+                                                                 tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (persist_failed) failed; io_request may hang on engine side");
+                                                             }
+                                                         }
+                                                         // 工具已执行、轨迹已采集：终止前补提交，避免审计链缺口（fail-soft）
+                                                         runner.submit_tool_traces(&session_id).await;
+                                                         yield Err(e);
+                                                         return;
+                                                     }
 
-                                               // 4. yield ToolResult + 提交 io_response(格式同 handle_call_service)
-                                               // 本轮发生过审批时,把审批留痕内嵌进 result(不扩 Fact 枚举)
-                                               // 帧面截断(同本地 ReAct 臂:大结果与回喂同上限,全文留 journal)
-                                               let mut result_value = serde_json::json!({
-                                                   "tool_name": tool_name,
-                                                   "result": truncate_tool_result(
-                                                       final_result.to_string(),
-                                                       runner.tool_result_max_tokens,
-                                                   ),
-                                               });
-                                               if let Some(record) = outcome.approval_record {
-                                                   result_value["approval"] = record;
-                                               }
-                                               yield Ok(AgentEvent::ToolResult {
-                                                   name: tool_name.clone(),
-                                                   result: result_value.clone(),
-                                               });
+                                                     // 4. yield ToolResult + 提交 io_response(格式同 handle_call_service)
+                                                     // 本轮发生过审批时,把审批留痕内嵌进 result(不扩 Fact 枚举)
+                                                     // 帧面截断(同本地 ReAct 臂:大结果与回喂同上限,全文留 journal)
+                                                     let mut result_value = serde_json::json!({
+                                                         "tool_name": tool_name,
+                                                         "result": truncate_tool_result(
+                                                             final_result.to_string(),
+                                                             runner.tool_result_max_tokens,
+                                                         ),
+                                                     });
+                                                     if let Some(record) = outcome.approval_record {
+                                                         result_value["approval"] = record;
+                                                     }
+                                                     yield Ok(AgentEvent::ToolResult {
+                                                         name: tool_name.clone(),
+                                                         result: result_value.clone(),
+                                                     });
 
-                                               if let Some(rid) = request_id {
-                                                   if let Err(e) = runner.evorule_client
-                                                       .submit_io_response(&session_id, rid, &result_value, None)
-                                                       .await
-                                                   {
-                                                       warn!(%session_id, request_id = rid, error = %e, "call_service io_response submit failed");
-                                                       yield Err(AgentError::EvoruleError(e.to_string()));
-                                                       return;
-                                                   }
-                                               }
-                                           }
-                                           _ => {
-                                               // 未知 io_type:提交错误 io_response 防止卡死
-                                               if let Some(rid) = request_id {
-                                                   if let Err(e) = runner.evorule_client
-                                                       .submit_io_response(&session_id, rid, &serde_json::json!({"error": "unsupported io_type"}), Some("unsupported io_type"))
-                                                       .await
-                                                   {
-                                                       tracing::warn!(session_id = %session_id, request_id = rid, error = %e, "submit_io_response (unsupported_io_type) failed; io_request may hang on engine side");
-                                                   }
-                                               }
-                                               yield Ok(AgentEvent::Info(format!("Unknown io_type: {}", io_type)));
-                                           }
-                                       }
-                                   }
-                                   "Stable" => {
-                                       // 回退后无续跑工作即到达 Stable——fail-visible，不以空
-                                       // 产出伪装成功（只在 rewind 语境改判，无 rewind 的合法
-                                       // 空响应仍按原语义放行）。
-                                       if rewound_awaiting_work {
-                                           let duration = start_time.elapsed().as_millis() as u64;
-                                           let msg = format!(
-                                               "turn failed after auto-rewind{}: no resumable work \
-                                                followed the rewind (the rewound turn produced no \
-                                                output and the engine issued no new work); \
-                                                reporting as error instead of an empty success",
-                                               last_rewind_version
-                                                   .map(|v| format!(" to version {v}"))
-                                                   .unwrap_or_default(),
-                                           );
-                                           warn!(%session_id, step_count, msg = %msg,
-                                               "rewind ended without resumed work; failing visibly");
-                                           if let Err(e) = runner.flush_messages(&session_id).await {
-                                               tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                           }
-                                           if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
-                                               tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
-                                           }
-                                           runner.submit_tool_traces(&session_id).await;
-                                           runner.interrupt_evorule_session_best_effort(&session_id).await;
-                                           // B21:turn_ended(error)
-                                           if let Some(g) = turn_guard.take() {
-                                               g.end("error", step_count as u64, duration);
-                                           }
-                                           yield Ok(AgentEvent::Done(AgentResult::error(
-                                               msg, step_count, duration,
-                                           )));
-                                           return;
-                                       }
-                                       let duration = start_time.elapsed().as_millis() as u64;
-                                       if let Err(e) = runner.flush_messages(&session_id).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                       }
-                                       // C1:会话沉淀（best-effort，摘要+稳定事实→共享空间）
-                                       if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
-                                       }
-                                       // 批 F 锚定：journal 链尾写入引擎审计链（防整链重算；best-effort，失败下次终态补锚）
-                                       if let Some(j) = journal.as_ref() {
-                                           if let Err(e) = crate::agent::journal_anchor::anchor_to_engine_chain(
-                                               &runner.evorule_client,
-                                               &session_id,
-                                               j,
-                                           ).await {
-                                               tracing::warn!(session_id = %session_id, error = %e, "journal chain anchor failed (unanchored-tail)");
-                                           }
-                                       }
-                                       // R2-T04 链体积观测（B3）：会话收尾时 best-effort 查审计链长告警
-                                       runner.check_chain_size(&session_id).await;
-                                       let state = match runner.evorule_client.get_state(&session_id).await {
-                                           Ok(s) => s,
-                                           Err(e) => {
-                                               warn!(%session_id, error = %e, "get_state at Stable failed");
-                                               yield Err(AgentError::EvoruleError(e.to_string()));
-                                               return;
-                                           }
-                                       };
-                                       let content = state["payload"]["llm_response"]["content"]
-                                           .as_str()
-                                           .or_else(|| state["payload"]["content"].as_str())
-                                           .or_else(|| state["payload"]["result"].as_str())
-                                           .or_else(|| state["payload"].as_str())
-                                           .unwrap_or_default()
-                                           .to_string();
-                                       // Fallback: evorule payload 无 content 时,使用最近一次 LLM 输出
-                                       let content = if content.is_empty() && !last_llm_content.is_empty() {
-                                           last_llm_content.clone()
-                                       } else {
-                                           content
-                                       };
-                                       runner.submit_tool_traces(&session_id).await;
-                                       // B21:turn_ended(success)
-                                       if let Some(g) = turn_guard.take() {
-                                           g.end("success", step_count as u64, duration);
-                                       }
-                                       let mut final_result = AgentResult::success(
-                                           content, step_count, duration, tool_calls,
-                                       );
-                                       // 真值计量收尾：usage_counter 若已接线，快照累计 token 记录随结果外送
-                                       final_result.tokens = runner.usage_counter.as_ref().map(|c| c.snapshot());
-                                       yield Ok(AgentEvent::Done(final_result));
-                                       return;
-                                   }
-                                   "StateTransition" => {
-                                       // 状态转换,继续循环
-                                       rewind_budget.reset(REWIND_BUDGET_LIMIT); // H1:正常推进即回满(只罚连续失败)
-                                   }
-                                   "Error" => {
-                                       let msg = event.payload.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
-                                       // 长任务 I/O 超时续跑判定(非流式 run() 同款镜像)：
-                                       // 仅超时/迟到响应类 Error 重发命令续跑；其余类型
-                                       // Error 维持既有 rewind+fail-visible 语义。
-                                       let timeout_class = msg.contains("timed out")
-                                           || msg.contains("unknown/stale request_id");
-                                       // 批 F 锚定：错误终态同样锚（终态锚覆盖 Stable/Error 两态）
-                                       if let Some(j) = journal.as_ref() {
-                                           if let Err(e) = crate::agent::journal_anchor::anchor_to_engine_chain(
-                                               &runner.evorule_client,
-                                               &session_id,
-                                               j,
-                                           ).await {
-                                               tracing::warn!(session_id = %session_id, error = %e, "journal chain anchor failed on Error terminal");
-                                           }
-                                       }
-                                       // H1:回退预算执法——超预算熔断为 fail-visible(与非流式同语义)
-                                       // 尝试 auto_rewind
-                                       if let Ok(rewind_version) = runner.auto_rewind(&session_id).await {
-                                           if rewind_budget.consume() {
-                                               // H1:护栏跨重启连续——消费落账(余额快照),
-                                               // 崩溃恢复重放回填,护栏计数不因进程边界清零
-                                               if let Some(j) = journal.as_ref() {
-                                                   if let Err(e) = j
-                                                       .rewind_budget_consumed(rewind_budget.remaining)
-                                                   {
-                                                       tracing::warn!(
-                                                           session_id = %session_id,
-                                                           error = %e,
-                                                           "rewind_budget_consumed journal failed"
-                                                       );
-                                                   }
-                                               }
-                                               // 置位等待标志：仅当后续真实工作(IoRequest)恢复时
-                                               // 清位；回退后无任何工作直达 Stable 时按 fail-visible 收尾。
-                                               rewound_awaiting_work = true;
-                                               last_rewind_version = Some(rewind_version);
-                                               yield Ok(AgentEvent::Info(format!("Auto-rewind to version {}", rewind_version)));
-                                               if timeout_class {
-                                                   match runner
-                                                       .resubmit_call_external_for_resume(
-                                                           &session_id,
-                                                           &system_prompt,
-                                                           &goal,
-                                                       )
-                                                       .await
-                                                   {
-                                                       Ok(()) => {
-                                                           info!(
-                                                               %session_id,
-                                                               "timeout-class error: call_external command resubmitted to resume the turn"
-                                                           );
-                                                           yield Ok(AgentEvent::Info(
-                                                               "Resumed after timeout: call_external command resubmitted".to_string(),
-                                                           ));
-                                                       }
-                                                       Err(e) => warn!(
-                                                           %session_id, error = %e,
-                                                           "resume resubmit failed; falling back to fail-visible if no new work arrives"
-                                                       ),
-                                                   }
-                                               }
-                                               continue;
-                                           }
-                                           tracing::warn!(session_id = %session_id, remaining = 0,
-                                               "H1 rewind budget exhausted: 连续 Error 回退达上限(32),熔断为 fail-visible 错误结果");
-                                       }
-                                       let duration = start_time.elapsed().as_millis() as u64;
-                                       if let Err(e) = runner.flush_messages(&session_id).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                       }
-                                       // C1:会话沉淀（best-effort，即使出错也尝试沉淀已收集的对话）
-                                       if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
-                                       }
-                                       runner.submit_tool_traces(&session_id).await;
-                                       // B1:Error 熔断收尾 best-effort 中断 server 反应器（fail-soft）
-                                       runner.interrupt_evorule_session_best_effort(&session_id).await;
-                                       // B21:turn_ended(error)
-                                       if let Some(g) = turn_guard.take() {
-                                           g.end("error", step_count as u64, duration);
-                                       }
-                                       yield Ok(AgentEvent::Done(AgentResult::error(msg.to_string(), step_count, duration)));
-                                       return;
-                                   }
-                                   "Violation" => {
-                                       // D-01（契约档 §6.2，流式消费面补齐）：enforce 命中直接失败
-                                       // 上抛——不 rewind、不重试；与 workflow 链路 Violation 分支
-                                       // 同语义，凭 `enforce violation:` 前缀供上层判别终止不 replan。
-                                       let rule_index = event.payload.get("rule_index").and_then(|v| v.as_u64());
-                                       let reason = event
-                                           .payload
-                                           .get("reason")
-                                           .and_then(|v| v.as_str())
-                                           .unwrap_or("(no reason)");
-                                       warn!(%session_id, rule_index, %reason, "enforce 拦截（流式路径）：违规指令被拒绝执行");
-                                       let duration = start_time.elapsed().as_millis() as u64;
-                                       if let Err(e) = runner.flush_messages(&session_id).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                       }
-                                       if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
-                                       }
-                                       runner.submit_tool_traces(&session_id).await;
-                                       // B21:turn_ended(error)
-                                       if let Some(g) = turn_guard.take() {
-                                           g.end("error", step_count as u64, duration);
-                                       }
-                                       yield Ok(AgentEvent::Done(AgentResult::error(
-                                           format!("enforce violation: rule_index={rule_index:?}, reason={reason}"),
-                                           step_count, duration,
-                                       )));
-                                       return;
-                                   }
-                                   _ => {
-                                       // 未知事件,继续循环
-                                   }
-                               }
-                           }
+                                                     if let Some(rid) = request_id {
+                                                         if let Err(e) = runner.evorule_client
+                                                             .submit_io_response(&session_id, rid, &result_value, None)
+                                                             .await
+                                                         {
+                                                             warn!(%session_id, request_id = rid, error = %e, "call_service io_response submit failed");
+                                                             yield Err(AgentError::EvoruleError(e.to_string()));
+                                                             return;
+                                                         }
+                                                     }
+                                                 }
+                                                 _ => {
+                                                     // 未知 io_type:提交错误 io_response 防止卡死
+                                                     if let Some(rid) = request_id {
+                                                         if let Err(e) = runner.evorule_client
+                                                             .submit_io_response(&session_id, rid, &serde_json::json!({"error": "unsupported io_type"}), Some("unsupported io_type"))
+                                                             .await
+                                                         {
+                                                             tracing::warn!(session_id = %session_id, request_id = rid, error = %e, "submit_io_response (unsupported_io_type) failed; io_request may hang on engine side");
+                                                         }
+                                                     }
+                                                     yield Ok(AgentEvent::Info(format!("Unknown io_type: {}", io_type)));
+                                                 }
+                                             }
+                                         }
+                                         "Stable" => {
+                                             // 回退后无续跑工作即到达 Stable——fail-visible，不以空
+                                             // 产出伪装成功（只在 rewind 语境改判，无 rewind 的合法
+                                             // 空响应仍按原语义放行）。
+                                             if rewound_awaiting_work {
+                                                 let duration = start_time.elapsed().as_millis() as u64;
+                                                 let msg = format!(
+                                                     "turn failed after auto-rewind{}: no resumable work \
+                                                      followed the rewind (the rewound turn produced no \
+                                                      output and the engine issued no new work); \
+                                                      reporting as error instead of an empty success",
+                                                     last_rewind_version
+                                                         .map(|v| format!(" to version {v}"))
+                                                         .unwrap_or_default(),
+                                                 );
+                                                 warn!(%session_id, step_count, msg = %msg,
+                                                     "rewind ended without resumed work; failing visibly");
+                                                 if let Err(e) = runner.flush_messages(&session_id).await {
+                                                     tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                 }
+                                                 if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                                                     tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                                                 }
+                                                 runner.submit_tool_traces(&session_id).await;
+                                                 runner.interrupt_evorule_session_best_effort(&session_id).await;
+                                                 // B21:turn_ended(error)
+                                                 if let Some(g) = turn_guard.take() {
+                                                     g.end("error", step_count as u64, duration);
+                                                 }
+                                                 yield Ok(AgentEvent::Done(AgentResult::error(
+                                                     msg, step_count, duration,
+                                                 )));
+                                                 return;
+                                             }
+                                             let duration = start_time.elapsed().as_millis() as u64;
+                                             if let Err(e) = runner.flush_messages(&session_id).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                             }
+                                             // C1:会话沉淀（best-effort，摘要+稳定事实→共享空间）
+                                             if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                                             }
+                                             // 批 F 锚定：journal 链尾写入引擎审计链（防整链重算；best-effort，失败下次终态补锚）
+                                             if let Some(j) = journal.as_ref() {
+                                                 if let Err(e) = crate::agent::journal_anchor::anchor_to_engine_chain(
+                                                     &runner.evorule_client,
+                                                     &session_id,
+                                                     j,
+                                                 ).await {
+                                                     tracing::warn!(session_id = %session_id, error = %e, "journal chain anchor failed (unanchored-tail)");
+                                                 }
+                                             }
+                                             // R2-T04 链体积观测（B3）：会话收尾时 best-effort 查审计链长告警
+                                             runner.check_chain_size(&session_id).await;
+                                             let state = match runner.evorule_client.get_state(&session_id).await {
+                                                 Ok(s) => s,
+                                                 Err(e) => {
+                                                     warn!(%session_id, error = %e, "get_state at Stable failed");
+                                                     yield Err(AgentError::EvoruleError(e.to_string()));
+                                                     return;
+                                                 }
+                                             };
+                                             let content = state["payload"]["llm_response"]["content"]
+                                                 .as_str()
+                                                 .or_else(|| state["payload"]["content"].as_str())
+                                                 .or_else(|| state["payload"]["result"].as_str())
+                                                 .or_else(|| state["payload"].as_str())
+                                                 .unwrap_or_default()
+                                                 .to_string();
+                                             // Fallback: evorule payload 无 content 时,使用最近一次 LLM 输出
+                                             let content = if content.is_empty() && !last_llm_content.is_empty() {
+                                                 last_llm_content.clone()
+                                             } else {
+                                                 content
+                                             };
+                                             runner.submit_tool_traces(&session_id).await;
+                                             // B21:turn_ended(success)
+                                             if let Some(g) = turn_guard.take() {
+                                                 g.end("success", step_count as u64, duration);
+                                             }
+                                             let mut final_result = AgentResult::success(
+                                                 content, step_count, duration, tool_calls,
+                                             );
+                                             // 真值计量收尾：usage_counter 若已接线，快照累计 token 记录随结果外送
+                                             final_result.tokens = runner.usage_counter.as_ref().map(|c| c.snapshot());
+                                             yield Ok(AgentEvent::Done(final_result));
+                                             return;
+                                         }
+                                         "StateTransition" => {
+                                             // 状态转换,继续循环
+                                             rewind_budget.reset(REWIND_BUDGET_LIMIT); // H1:正常推进即回满(只罚连续失败)
+                                         }
+                                         "Error" => {
+                                             let msg = event.payload.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                                             // 长任务 I/O 超时续跑判定(非流式 run() 同款镜像)：
+                                             // 仅超时/迟到响应类 Error 重发命令续跑；其余类型
+                                             // Error 维持既有 rewind+fail-visible 语义。
+                                             let timeout_class = msg.contains("timed out")
+                                                 || msg.contains("unknown/stale request_id");
+                                             // 批 F 锚定：错误终态同样锚（终态锚覆盖 Stable/Error 两态）
+                                             if let Some(j) = journal.as_ref() {
+                                                 if let Err(e) = crate::agent::journal_anchor::anchor_to_engine_chain(
+                                                     &runner.evorule_client,
+                                                     &session_id,
+                                                     j,
+                                                 ).await {
+                                                     tracing::warn!(session_id = %session_id, error = %e, "journal chain anchor failed on Error terminal");
+                                                 }
+                                             }
+                                             // H1:回退预算执法——超预算熔断为 fail-visible(与非流式同语义)
+                                             // 尝试 auto_rewind
+                                             if let Ok(rewind_version) = runner.auto_rewind(&session_id).await {
+                                                 if rewind_budget.consume() {
+                                                     // H1:护栏跨重启连续——消费落账(余额快照),
+                                                     // 崩溃恢复重放回填,护栏计数不因进程边界清零
+                                                     if let Some(j) = journal.as_ref() {
+                                                         if let Err(e) = j
+                                                             .rewind_budget_consumed(rewind_budget.remaining)
+                                                         {
+                                                             tracing::warn!(
+                                                                 session_id = %session_id,
+                                                                 error = %e,
+                                                                 "rewind_budget_consumed journal failed"
+                                                             );
+                                                         }
+                                                     }
+                                                     // 置位等待标志：仅当后续真实工作(IoRequest)恢复时
+                                                     // 清位；回退后无任何工作直达 Stable 时按 fail-visible 收尾。
+                                                     rewound_awaiting_work = true;
+                                                     last_rewind_version = Some(rewind_version);
+                                                     yield Ok(AgentEvent::Info(format!("Auto-rewind to version {}", rewind_version)));
+                                                     if timeout_class {
+                                                         match runner
+                                                             .resubmit_call_external_for_resume(
+                                                                 &session_id,
+                                                                 &system_prompt,
+                                                                 &goal,
+                                                             )
+                                                             .await
+                                                         {
+                                                             Ok(()) => {
+                                                                 info!(
+                                                                     %session_id,
+                                                                     "timeout-class error: call_external command resubmitted to resume the turn"
+                                                                 );
+                                                                 yield Ok(AgentEvent::Info(
+                                                                     "Resumed after timeout: call_external command resubmitted".to_string(),
+                                                                 ));
+                                                             }
+                                                             Err(e) => warn!(
+                                                                 %session_id, error = %e,
+                                                                 "resume resubmit failed; falling back to fail-visible if no new work arrives"
+                                                             ),
+                                                         }
+                                                     }
+                                                     continue;
+                                                 }
+                                                 tracing::warn!(session_id = %session_id, remaining = 0,
+                                                     "H1 rewind budget exhausted: 连续 Error 回退达上限(32),熔断为 fail-visible 错误结果");
+                                             }
+                                             let duration = start_time.elapsed().as_millis() as u64;
+                                             if let Err(e) = runner.flush_messages(&session_id).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                             }
+                                             // C1:会话沉淀（best-effort，即使出错也尝试沉淀已收集的对话）
+                                             if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                                             }
+                                             runner.submit_tool_traces(&session_id).await;
+                                             // B1:Error 熔断收尾 best-effort 中断 server 反应器（fail-soft）
+                                             runner.interrupt_evorule_session_best_effort(&session_id).await;
+                                             // B21:turn_ended(error)
+                                             if let Some(g) = turn_guard.take() {
+                                                 g.end("error", step_count as u64, duration);
+                                             }
+                                             yield Ok(AgentEvent::Done(AgentResult::error(msg.to_string(), step_count, duration)));
+                                             return;
+                                         }
+                                         "Violation" => {
+                                             // D-01（契约档 §6.2，流式消费面补齐）：enforce 命中直接失败
+                                             // 上抛——不 rewind、不重试；与 workflow 链路 Violation 分支
+                                             // 同语义，凭 `enforce violation:` 前缀供上层判别终止不 replan。
+                                             let rule_index = event.payload.get("rule_index").and_then(|v| v.as_u64());
+                                             let reason = event
+                                                 .payload
+                                                 .get("reason")
+                                                 .and_then(|v| v.as_str())
+                                                 .unwrap_or("(no reason)");
+                                             warn!(%session_id, rule_index, %reason, "enforce 拦截（流式路径）：违规指令被拒绝执行");
+                                             let duration = start_time.elapsed().as_millis() as u64;
+                                             if let Err(e) = runner.flush_messages(&session_id).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                             }
+                                             if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                                             }
+                                             runner.submit_tool_traces(&session_id).await;
+                                             // B21:turn_ended(error)
+                                             if let Some(g) = turn_guard.take() {
+                                                 g.end("error", step_count as u64, duration);
+                                             }
+                                             yield Ok(AgentEvent::Done(AgentResult::error(
+                                                 format!("enforce violation: rule_index={rule_index:?}, reason={reason}"),
+                                                 step_count, duration,
+                                             )));
+                                             return;
+                                         }
+                                         _ => {
+                                             // 未知事件,继续循环
+                                         }
+                                     }
+                                 }
 
-                           // 事件流关闭
-                           let duration = start_time.elapsed().as_millis() as u64;
-                           if let Err(e) = runner.flush_messages(&session_id).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                       }
-                           // 断流路径补 sediment(流式镜像)
-                           if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
-                                       }
-                           runner.submit_tool_traces(&session_id).await;
-                           // B21:turn_ended(error)
-                           if let Some(g) = turn_guard.take() {
-                               g.end("error", step_count as u64, duration);
-                           }
-                           // D-01 二次保险（B2）：断流可能吞掉 Violation 帧，查 evolution-signals
-                           // 兜底归因 enforce 命中；查询不可用时降级返回原错误（不掩盖不阻塞）。
-                           let closed_error = runner
-                               .detect_enforce_after_stream_close(&session_id, "Event stream closed")
-                               .await;
-                           yield Ok(AgentEvent::Done(AgentResult::error(
-                               closed_error, step_count, duration,
-                           )));
-                       })
+                                 // 事件流关闭
+                                 let duration = start_time.elapsed().as_millis() as u64;
+                                 if let Err(e) = runner.flush_messages(&session_id).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                             }
+                                 // 断流路径补 sediment(流式镜像)
+                                 if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                                                 tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                                             }
+                                 runner.submit_tool_traces(&session_id).await;
+                                 // B21:turn_ended(error)
+                                 if let Some(g) = turn_guard.take() {
+                                     g.end("error", step_count as u64, duration);
+                                 }
+                                 // D-01 二次保险（B2）：断流可能吞掉 Violation 帧，查 evolution-signals
+                                 // 兜底归因 enforce 命中；查询不可用时降级返回原错误（不掩盖不阻塞）。
+                                 let closed_error = runner
+                                     .detect_enforce_after_stream_close(&session_id, "Event stream closed")
+                                     .await;
+                                 yield Ok(AgentEvent::Done(AgentResult::error(
+                                     closed_error, step_count, duration,
+                                 )));
+                             })
     }
 }
 
@@ -12913,7 +12913,7 @@ pub(crate) struct EmergencyTrimReport {
     pub edits: Vec<(usize, String)>,
     /// 整段压缩区内容哈希(region 触发时=drain 前对当前区切片计;未触发=空串)
     pub region_hash: String,
-    /// 整段压缩区被移除消息的角色分布(③层触发时非空;B-367 丢界补账——
+    /// 整段压缩区被移除消息的角色分布(③层触发时非空;丢界补账——
     /// journal 载荷可回放「删了什么类型」,重建证据链免盲搜 JSONL)
     pub removed_by_role: std::collections::BTreeMap<String, usize>,
 }
@@ -13095,7 +13095,7 @@ pub(crate) fn emergency_trim_for_payload_limit(messages: &mut Vec<Message>) -> E
             };
             // 区内容哈希(drain 前对当前区切片计;与摘要缓存键同源)
             report.region_hash = region_hash_of(&messages[sys_end..split]);
-            // 丢界补账(B-367):被压缩区角色分布随载荷落账,压缩事件不再只有计数
+            // 丢界补账:被压缩区角色分布随载荷落账,压缩事件不再只有计数
             let mut removed_by_role: std::collections::BTreeMap<String, usize> =
                 std::collections::BTreeMap::new();
             for m in &messages[sys_end..split] {
@@ -13185,7 +13185,7 @@ pub(crate) fn enforce_payload_byte_gate(messages: &mut Vec<Message>) -> PayloadG
 mod runner_tests;
 
 /// G8 拒绝结果载荷——agent 可见面区分「超时自动拒绝」vs「用户真实拒绝」
-/// （o109 审批信号改进：decision_label 与 reason 透传；status 语义只加不改，
+/// （ 审批信号改进：decision_label 与 reason 透传；status 语义只加不改，
 /// 既有消费方按 status=rejected 的解析保持兼容。三站点统一走本助手=编译期强制。）
 pub(crate) fn g8_rejection_payload(
     decision_label: &str,

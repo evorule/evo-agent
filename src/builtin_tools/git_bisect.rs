@@ -25,7 +25,7 @@
 //!
 //! 风险注记:二分期间仓处于 detached HEAD+BISECT_* 状态文件在位,与写面
 //! 工具(file_write/git_commit/git_stash)并发互斥无机制强制——缓解=status
-//! 可见性+红线文档(二分会话态禁止并行写操作)+试点建议沙箱仓先行。
+//! 可见性+红线文档(二分会话态禁止并行写操作)+长跑建议沙箱仓先行。
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};

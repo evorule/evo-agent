@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// o32 残余收口:panic 原因捕获面
+//  残余收口:panic 原因捕获面
 //
 // TurnEndGuard 的 panic drop 发生在 unwind 途中,drop 无法直接访问 panic
 // payload——以「链式 panic hook + 线程局部」捕获:hook 把 payload 消息与
@@ -162,7 +162,7 @@ pub struct TodoItemSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum JournalEvent {
-    /// 会话开档身份锚(B-172):New 模式开新档时首事件落账;Resume 续写不重落。
+    /// 会话开档身份锚:New 模式开新档时首事件落账;Resume 续写不重落。
     /// 双职责:①异会话撞号/文件身份错位的可诊断锚(Resume 打开时校验
     /// session_id 一致性,失配 fail-fast);②账本时代判据(agent/model/温度
     /// 档位供分析器分代)。None 字段不入行;旧档无本事件容忍(缺省不变式)。
@@ -395,7 +395,7 @@ pub enum JournalEvent {
         folded_approvals: usize,
         /// 是否触发了整段历史压缩兜底层
         history_compacted: bool,
-        /// 整段压缩区被移除消息的角色分布（B-367 丢界补账；serde default
+        /// 整段压缩区被移除消息的角色分布（ 丢界补账；serde default
         /// 保旧 journal 兼容——旧事件无此键反序列化为空表）
         #[serde(default)]
         removed_by_role: std::collections::BTreeMap<String, usize>,
@@ -913,7 +913,7 @@ pub enum JournalError {
     /// 事件序列化失败
     #[error("journal encode: {0}")]
     Encode(String),
-    /// 会话身份失配(B-172):New 模式遇已存在非空档(异会话撞号)或 Resume
+    /// 会话身份失配:New 模式遇已存在非空档(异会话撞号)或 Resume
     /// 模式档内身份锚与会话号不一致(文件与身份错位)。fail-fast 不盲追加
     /// ——撞号盲追加会使异时代账目混入同档,污染审计链与恢复面。同会话
     /// 续跑请用 Resume 语义;异会话请人工归档/改名处置旧账。
@@ -926,7 +926,7 @@ pub enum JournalError {
     },
 }
 
-/// journal 开档模式(B-172 异会话撞号防护):
+/// journal 开档模式(异会话撞号防护):
 /// - `New`:新会话开新档。目标档已存在且非空 = 异会话撞号,fail-fast
 ///   (`ForeignSession`)——server 会话号计数器重置后新会号撞旧档时,续写
 ///   会把异时代账目混入同档;开新档成功后首事件落 `session_opened` 身份锚。
@@ -1116,7 +1116,7 @@ impl JournalWriter {
         )
     }
 
-    /// 分模式打开(B-172):`OpenMode::New` 供新会话开新档(撞号 fail-fast +
+    /// 分模式打开:`OpenMode::New` 供新会话开新档(撞号 fail-fast +
     /// 身份锚落账),`OpenMode::Resume` 为既有续写语义(旧档容忍)。
     pub fn open_with_mode(
         dir: &Path,
@@ -1159,7 +1159,7 @@ impl JournalWriter {
                 .map(|pos| pos + 1)
                 .unwrap_or(0);
             let mut chained_prev: Option<String> = None;
-            // B-172 锚校验:档首若为 session_opened 身份锚,会话号与入参不符
+            //  锚校验:档首若为 session_opened 身份锚,会话号与入参不符
             // = 文件与身份错位,fail-fast;旧档无锚容忍(缺省不变式)
             let mut anchor_checked = false;
             let raw_lines: Vec<String> = String::from_utf8_lossy(&bytes[..valid_len])
@@ -1282,7 +1282,7 @@ impl JournalWriter {
             registry_key,
             file_path: path,
         };
-        // B-172:New 模式开新档首事件落身份锚(先于 tail_hung 崩溃标记——
+        // :New 模式开新档首事件落身份锚(先于 tail_hung 崩溃标记——
         // New 模式档必空,tail_hung 恒 false,锚恒为 seq1)
         if mode == OpenMode::New {
             let opened_ts = std::time::SystemTime::now()
@@ -1435,7 +1435,7 @@ impl JournalWriter {
 
     /// turn 开始:写 turn_started,返回轮守卫(drop 未显式 end 时补写 aborted)
     pub fn begin_turn(&self, goal: &str) -> Result<TurnEndGuard, JournalError> {
-        // o32 残余收口:首次开轮即装链式 panic hook(幂等),panic drop 带因补写
+        //  残余收口:首次开轮即装链式 panic hook(幂等),panic drop 带因补写
         install_panic_reason_hook();
         let turn_seq;
         {
@@ -2326,13 +2326,13 @@ impl TurnEndGuard {
 impl Drop for TurnEndGuard {
     fn drop(&mut self) {
         // end_turn 幂等:显式 end 后此处为 no-op;panic unwind 中带因补写
-        // (o32 残余收口:原因含 panic 消息与位点,会话面可直读,免翻 serve.log)
+        // (残余收口:原因含 panic 消息与位点,会话面可直读,免翻 serve.log)
         if let Some(reason) = take_panic_reason_if_panicking() {
             let _ = self
                 .writer
                 .end_turn_with_reason("aborted", 0, 0, Some(&reason));
         } else {
-            // N-009 仪器化:非 panic 走到 Drop 兜底=轮循环静默早退/回合 future
+            //  仪器化:非 panic 走到 Drop 兜底=轮循环静默早退/回合 future
             // 被外部放弃——此前只落 journal 无任何日志面,事故取证全盲
             // (2026-11-19 会话 1795045491932 实证:aborted/0/0/null 唯一线索)
             tracing::warn!(
@@ -2673,7 +2673,7 @@ pub fn gc_wire_blobs(
         }
         stats.bytes_after += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         if !expired_infos.is_empty() {
-            // B-172:gc 补落账为既有账面续写(Resume 模式;档内身份锚如在则校验)
+            // :gc 补落账为既有账面续写(Resume 模式;档内身份锚如在则校验)
             let w = JournalWriter::open_with_mode(
                 path.parent().unwrap_or(Path::new(".")),
                 &stem,
@@ -3646,7 +3646,7 @@ mod tests {
 
     #[test]
     fn test_emergency_trim_role_inventory_roundtrip_and_legacy_compat() {
-        // B-367 丢界补账:①新载荷(角色分布+区间)落账读回;②旧事件(无新键)
+        //  丢界补账:①新载荷(角色分布+区间)落账读回;②旧事件(无新键)
         // serde default 反序列化兼容
         let dir = std::env::temp_dir().join(format!("jf-emtrim-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4371,7 +4371,7 @@ mod tests {
         );
     }
 
-    /// o32 残余收口:panic unwind 中的 guard drop 带因补写 aborted——
+    ///  残余收口:panic unwind 中的 guard drop 带因补写 aborted——
     /// reason 含 panic 消息与位点,会话面可直接定位,不必翻 serve.log
     #[test]
     fn turn_guard_panic_drop_writes_reason() {
@@ -4670,7 +4670,7 @@ mod tests {
         assert_eq!(r.replay_runaway_actions(), 50);
     }
 
-    // ===== B-172：journal 异会话撞号防护（New/Resume 双模 + 身份锚） =====
+    // ===== ：journal 异会话撞号防护（New/Resume 双模 + 身份锚） =====
 
     #[test]
     fn test_open_new_fails_fast_on_existing_nonempty_file() {

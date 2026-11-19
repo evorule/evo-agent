@@ -694,9 +694,9 @@ impl AgentApiState {
     /// 基准根。--agent-root 优先,未指定回落 workdir(行为零变化)。
     /// 桌面 serve 形态 workdir=runtime(编排基础设施)与用户工作区解耦,
     /// agent 语义面必须跟随本根——否则落 runtime 指向不存在路径
-    /// (fail-visible)。注意(B-368 实证修正):undo 工具 store 实际在
+    /// (fail-visible)。注意(实证修正):undo 工具 store 实际在
     /// toolkit 构建期绑 workdir/DEFAULT_WRITABLE_DIR(非本根);checkpoint
-    /// 仓库根自 B-368 起跟生效边界(写面基根/sandbox_root)——语义面与
+    /// 仓库根自  起跟生效边界(写面基根/sandbox_root)——语义面与
     /// 快照/写面链的绑定关系见 serve_tools::checkpoint_repo_root。
     pub fn agent_workspace_root(&self) -> &std::path::Path {
         self.agent_root.as_deref().unwrap_or(&self.workdir)
@@ -1883,7 +1883,7 @@ async fn run_agent(
         .with_metrics(state.metrics.clone())
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源)
         .with_journal_dir(state.workdir.join("data").join("sessions"))
-        // checkpoint 仓库根跟生效边界（B-368 案 A：快照链与写面同根——
+        // checkpoint 仓库根跟生效边界（ 案 A：快照链与写面同根——
         // 合成态=write_face 基根，declared=sandbox_root；--agent-root≠workdir
         // 分叉部署下不再与写面分叉）
         .with_workspace_checkpoint_writable(
@@ -2344,7 +2344,7 @@ async fn run_agent_stream(
     .with_metrics(state.metrics.clone())
     // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源)
     .with_journal_dir(state.workdir.join("data").join("sessions"))
-    // checkpoint 仓库根跟生效边界（B-368 案 A：与 run_agent 口径一致）
+    // checkpoint 仓库根跟生效边界（ 案 A：与 run_agent 口径一致）
     .with_workspace_checkpoint(&crate::api::serve_tools::checkpoint_repo_root(
         req.workspace.as_deref().map(std::path::Path::new),
         state.agent_workspace_root(),
@@ -3631,7 +3631,7 @@ async fn spawn_background_task(
     let goal = body.goal.clone();
     let child_for_drain = child_id.clone();
     // 派生锚落父 journal(B25 谱系面/任务列表数据源;直发路径与工具路径同账)。
-    // B-172:旁挂锚写=既有续写语义(Resume 模式,旧档容忍)
+    // :旁挂锚写=既有续写语义(Resume 模式,旧档容忍)
     if let Ok(j) = crate::agent::journal::JournalWriter::open_with_mode(
         &state.workdir.join("data").join("sessions"),
         &body.session_id,

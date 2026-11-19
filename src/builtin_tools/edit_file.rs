@@ -311,7 +311,7 @@ impl FileEditTool {
             let anchor_trimmed: Vec<&str> = anchor_lines.iter().map(|l| trimmed(l)).collect();
             let windows = fuzzy_windows(&file_norm, &anchor_trimmed);
             if windows.is_empty() || anchor_trimmed.iter().all(|l| l.is_empty()) {
-                // ── 容错二级:最近区域诊断(o10 处置方向②——报错携带盘上
+                // ── 容错二级:最近区域诊断(处置方向②——报错携带盘上
                 // 实际内容片段,消灭「只能盲试锚形态」)──
                 let diag = nearest_region(&file_lines, &anchor_lines)
                     .map(|(n, line)| {
@@ -392,7 +392,7 @@ impl FileEditTool {
             return Err(e);
         }
 
-        // o107 传输校验:rename 后回读逐字节比对(防传输层吞字);不匹配重写一次,
+        //  传输校验:rename 后回读逐字节比对(防传输层吞字);不匹配重写一次,
         // 仍不匹配显式报错 fail-visible
         let on_disk =
             std::fs::read(&target).map_err(|e| format!("post-write verify read failed: {}", e))?;
@@ -441,7 +441,7 @@ impl FileEditTool {
     /// 大文件分段编辑(P1 余量):流式行空间路径——内存 O(锚+行),不随文件
     /// 体积增长。双 pass:分析流(逐行 UTF-8 校验 fail-visible;exact/trim
     /// 双层窗口匹配;唯一性闸;上下文捕获)→ 写入流(窗外行原字节 verbatim,
-    /// 窗内写替换行序列)。o107 同款语义流式化:tmp 写入 → 写入账面对账
+    /// 窗内写替换行序列)。 同款语义流式化:tmp 写入 → 写入账面对账
     /// (总长+各窗口字节域逐一对账)→ mismatch 重写一次仍败显式报错 →
     /// rename 落盘。
     ///
@@ -664,7 +664,7 @@ impl FileEditTool {
             let _ = std::fs::remove_file(&tmp_path);
         })?;
 
-        // ── PASS 3:o107 同款验证(写入账面 vs tmp 实盘:总长 + 各窗口字节域
+        // ── PASS 3: 同款验证(写入账面 vs tmp 实盘:总长 + 各窗口字节域
         // 逐一比对预期替换行)──
         let verify = |spans: &[(u64, u64, bool)], written_expected: u64| -> Result<(), String> {
             let actual_len = std::fs::metadata(&tmp_path)
@@ -701,7 +701,7 @@ impl FileEditTool {
             Ok(())
         };
         if verify(&spans, bytes_after).is_err() {
-            // mismatch → 重写一次(o107 同款:mismatch 重写/显式报错;写入
+            // mismatch → 重写一次(同款:mismatch 重写/显式报错;写入
             // 确定性故窗口表复用)
             spans.clear();
             bytes_after = write_once(&mut spans).inspect_err(|_e| {

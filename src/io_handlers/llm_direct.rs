@@ -457,163 +457,163 @@ pub(crate) fn execute_stream(
     retry: DirectRetryParams,
 ) -> std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, String>> + Send>> {
     Box::pin(async_stream::stream! {
-        let mut body = body;
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("stream".to_string(), Value::Bool(true));
-        }
+          let mut body = body;
+          if let Some(obj) = body.as_object_mut() {
+              obj.insert("stream".to_string(), Value::Bool(true));
+          }
 
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(retry.connect_timeout_secs))
-            .timeout(std::time::Duration::from_secs(retry.request_timeout_secs))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+          let client = reqwest::Client::builder()
+              .connect_timeout(std::time::Duration::from_secs(retry.connect_timeout_secs))
+              .timeout(std::time::Duration::from_secs(retry.request_timeout_secs))
+              .build()
+              .unwrap_or_else(|_| reqwest::Client::new());
 
-        let resp = match client
-            .post(&cfg.api_base)
-            .bearer_auth(&cfg.api_key)
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                yield Err(format!("LLM stream request failed: {}", e));
-                return;
-            }
-        };
+          let resp = match client
+              .post(&cfg.api_base)
+              .bearer_auth(&cfg.api_key)
+              .json(&body)
+              .send()
+              .await
+          {
+              Ok(r) => r,
+              Err(e) => {
+                  yield Err(format!("LLM stream request failed: {}", e));
+                  return;
+              }
+          };
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            yield Err(format!("LLM API error ({}): {}", status, text));
-            return;
-        }
+          if !resp.status().is_success() {
+              let status = resp.status();
+              let text = resp.text().await.unwrap_or_default();
+              yield Err(format!("LLM API error ({}): {}", status, text));
+              return;
+          }
 
-        // SSE 增量解析(\n\n 切帧,残留缓冲收尾——与 relay 切帧语义对齐)
-        // o10 根因修复:字节块经流式 UTF-8 安全解码器入缓冲——多字节字符跨
-        // 网络块切分不再被 lossy 替换成 U+FFFD(坏字①型根因封死)
-        let mut decoder = crate::io_handlers::stream_text::StreamTextDecoder::new();
-        let mut buffer = String::new();
-        let mut acc_content = String::new();
-        let mut acc_reasoning = String::new();
-        let mut acc_tools: BTreeMap<usize, DirectToolAcc> = BTreeMap::new();
-        let mut acc_finish: Option<String> = None;
-        let mut acc_usage: Option<Value> = None;
-        let mut saw_done = false;
-        let mut sse = resp.bytes_stream();
-        'frames: loop {
-            while let Some(pos) = buffer.find("\n\n") {
-                let frame: String = buffer.drain(..pos + 2).collect();
-                let (chunks, end) = provider_sse_frame_outcome(
-                    &frame,
-                    &mut acc_content,
-                    &mut acc_reasoning,
-                    &mut acc_tools,
-                    &mut acc_finish,
-                    &mut acc_usage,
-                );
-                for chunk in chunks {
-                    yield Ok(chunk);
-                }
-                match end {
-                    FrameEnd::Continue => {}
-                    FrameEnd::Stop => {
-                        saw_done = true;
-                        break 'frames;
-                    }
-                    FrameEnd::Fail(msg) => {
-                        yield Err(msg);
-                        return;
-                    }
-                }
-            }
-            match sse.next().await {
-                Some(Ok(chunk)) => match decoder.feed(&chunk) {
-                    Ok(text) => buffer.push_str(&text),
-                    Err(e) => {
-                        yield Err(format!("LLM stream decode failed: {e}"));
-                        return;
-                    }
-                },
-                Some(Err(e)) => {
-                    yield Err(format!("LLM stream read failed: {}", e));
-                    return;
-                }
-                None => break 'frames,
-            }
-        }
-        // 流收尾残留缓冲(末帧无尾随空行形态)
-        let residual = std::mem::take(&mut buffer);
-        if !residual.trim().is_empty() {
-            let (chunks, end) = provider_sse_frame_outcome(
-                &residual,
-                &mut acc_content,
-                &mut acc_reasoning,
-                &mut acc_tools,
-                &mut acc_finish,
-                &mut acc_usage,
-            );
-            for chunk in chunks {
-                yield Ok(chunk);
-            }
-            match end {
-                FrameEnd::Continue => {}
-                FrameEnd::Stop => saw_done = true,
-                FrameEnd::Fail(msg) => {
-                    yield Err(msg);
-                    return;
-                }
-            }
-        }
-        if !saw_done {
-            yield Err("direct 流式响应未含 [DONE] 终止符(连接提前关闭)".to_string());
-            return;
-        }
+          // SSE 增量解析(\n\n 切帧,残留缓冲收尾——与 relay 切帧语义对齐)
+    //  根因修复:字节块经流式 UTF-8 安全解码器入缓冲——多字节字符跨
+          // 网络块切分不再被 lossy 替换成 U+FFFD(坏字①型根因封死)
+          let mut decoder = crate::io_handlers::stream_text::StreamTextDecoder::new();
+          let mut buffer = String::new();
+          let mut acc_content = String::new();
+          let mut acc_reasoning = String::new();
+          let mut acc_tools: BTreeMap<usize, DirectToolAcc> = BTreeMap::new();
+          let mut acc_finish: Option<String> = None;
+          let mut acc_usage: Option<Value> = None;
+          let mut saw_done = false;
+          let mut sse = resp.bytes_stream();
+          'frames: loop {
+              while let Some(pos) = buffer.find("\n\n") {
+                  let frame: String = buffer.drain(..pos + 2).collect();
+                  let (chunks, end) = provider_sse_frame_outcome(
+                      &frame,
+                      &mut acc_content,
+                      &mut acc_reasoning,
+                      &mut acc_tools,
+                      &mut acc_finish,
+                      &mut acc_usage,
+                  );
+                  for chunk in chunks {
+                      yield Ok(chunk);
+                  }
+                  match end {
+                      FrameEnd::Continue => {}
+                      FrameEnd::Stop => {
+                          saw_done = true;
+                          break 'frames;
+                      }
+                      FrameEnd::Fail(msg) => {
+                          yield Err(msg);
+                          return;
+                      }
+                  }
+              }
+              match sse.next().await {
+                  Some(Ok(chunk)) => match decoder.feed(&chunk) {
+                      Ok(text) => buffer.push_str(&text),
+                      Err(e) => {
+                          yield Err(format!("LLM stream decode failed: {e}"));
+                          return;
+                      }
+                  },
+                  Some(Err(e)) => {
+                      yield Err(format!("LLM stream read failed: {}", e));
+                      return;
+                  }
+                  None => break 'frames,
+              }
+          }
+          // 流收尾残留缓冲(末帧无尾随空行形态)
+          let residual = std::mem::take(&mut buffer);
+          if !residual.trim().is_empty() {
+              let (chunks, end) = provider_sse_frame_outcome(
+                  &residual,
+                  &mut acc_content,
+                  &mut acc_reasoning,
+                  &mut acc_tools,
+                  &mut acc_finish,
+                  &mut acc_usage,
+              );
+              for chunk in chunks {
+                  yield Ok(chunk);
+              }
+              match end {
+                  FrameEnd::Continue => {}
+                  FrameEnd::Stop => saw_done = true,
+                  FrameEnd::Fail(msg) => {
+                      yield Err(msg);
+                      return;
+                  }
+              }
+          }
+          if !saw_done {
+              yield Err("direct 流式响应未含 [DONE] 终止符(连接提前关闭)".to_string());
+              return;
+          }
 
-        // === [DONE] 后合成完整 LlmResponse 终帧(聚合自全部增量) ===
-        let tool_calls = if acc_tools.is_empty() {
-            None
-        } else {
-            Some(
-                acc_tools
-                    .into_values()
-                    .map(|acc| {
-                        let arguments: Value =
-                            serde_json::from_str(acc.arguments.trim()).unwrap_or(Value::Object(Default::default()));
-                        ToolCall {
-                            name: acc.name,
-                            arguments,
-                            id: acc.id,
-                        }
-                    })
-                    .collect::<Vec<ToolCall>>(),
-            )
-        };
-        let token_usage = acc_usage.as_ref().and_then(|u| {
-            let mut parsed: TokenUsage = serde_json::from_value(u.clone()).ok()?;
-            if parsed.cached_tokens.is_none() {
-                // OpenAI 兼容指针优先;取不到时回落 嵌套族命中字段
-                // cache_read_input_tokens(cache_creation_input_tokens 是缓存
-                // 写入非命中,明确不映射)
-                parsed.cached_tokens = u
-                    .pointer("/prompt_tokens_details/cached_tokens")
-                    .and_then(Value::as_u64)
-                    .map(|n| n as usize)
-                    .or_else(|| {
-                        u.pointer("/cache_read_input_tokens")
-                            .and_then(Value::as_u64)
-                            .map(|n| n as usize)
-                    });
-            }
-            Some(parsed)
-        });
-        yield Ok(StreamChunk::Done(LlmResponse {
-            content: acc_content,
-            tool_calls,
-            finish_reason: acc_finish.or_else(|| Some("stop".to_string())),
-            token_usage,
-        }));
-    })
+          // === [DONE] 后合成完整 LlmResponse 终帧(聚合自全部增量) ===
+          let tool_calls = if acc_tools.is_empty() {
+              None
+          } else {
+              Some(
+                  acc_tools
+                      .into_values()
+                      .map(|acc| {
+                          let arguments: Value =
+                              serde_json::from_str(acc.arguments.trim()).unwrap_or(Value::Object(Default::default()));
+                          ToolCall {
+                              name: acc.name,
+                              arguments,
+                              id: acc.id,
+                          }
+                      })
+                      .collect::<Vec<ToolCall>>(),
+              )
+          };
+          let token_usage = acc_usage.as_ref().and_then(|u| {
+              let mut parsed: TokenUsage = serde_json::from_value(u.clone()).ok()?;
+              if parsed.cached_tokens.is_none() {
+                  // OpenAI 兼容指针优先;取不到时回落 嵌套族命中字段
+                  // cache_read_input_tokens(cache_creation_input_tokens 是缓存
+                  // 写入非命中,明确不映射)
+                  parsed.cached_tokens = u
+                      .pointer("/prompt_tokens_details/cached_tokens")
+                      .and_then(Value::as_u64)
+                      .map(|n| n as usize)
+                      .or_else(|| {
+                          u.pointer("/cache_read_input_tokens")
+                              .and_then(Value::as_u64)
+                              .map(|n| n as usize)
+                      });
+              }
+              Some(parsed)
+          });
+          yield Ok(StreamChunk::Done(LlmResponse {
+              content: acc_content,
+              tool_calls,
+              finish_reason: acc_finish.or_else(|| Some("stop".to_string())),
+              token_usage,
+          }));
+      })
 }
 
 #[cfg(test)]

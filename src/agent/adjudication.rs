@@ -7,7 +7,7 @@
 //! 1. **候选检测**（确定性）双规：
 //!    - 词面相似（分词集 Jaccard ≥ 阈值）+ 词法极性相反（一方命中否定词表、
 //!      另一方未命中）；
-//!    - 同主题异值（B-411 P2，o12 正主）：Recipe 独占槽位 key 词形命中 +
+//!  - 同主题异值（ P2， 正主）：Recipe 独占槽位 key 词形命中 +
 //!      值词形集不相交——覆盖「同主题异键异值全肯定极性」类（极性规则
 //!      结构性漏检的活体案例）。
 //! 2. **裁决**（规则）：authority ▸ confidence ▸ freshness 序（维度序由
@@ -34,7 +34,7 @@ fn authority_rank(record: &MemoryRecord) -> u8 {
     match record.source.as_deref() {
         Some("user") => 3,
         Some("system") => 2,
-        // ledger 层（B-411 P3）：实测核验事实（o12 L2 约定 source:"ledger"，
+        // ledger 层（ P3）：实测核验事实（ L2 约定 source:"ledger"，
         // 携带作废锚）与系统派生同层、高于模型提取——防实测锚被排在 llm
         // 之下致裁决方向反转
         Some(s) if s == "ledger" || s.starts_with("ledger-") => 2,
@@ -133,7 +133,7 @@ pub fn adjudication_path(namespace: &str, winner_path: &str, loser_path: &str) -
     format!("shared.{namespace}.adjudication.{short}")
 }
 
-/// 值词形抽取（确定性；B-411 P2）：value 文本按空白与常见标点切词，词元含
+/// 值词形抽取（确定性； P2）：value 文本按空白与常见标点切词，词元含
 /// 路径分隔符（`\`、`/`）或纯数字（含点分）即「具体值词元」，小写化、去尾
 /// 标点。ASCII `:` 不入切词集（盘符 `c:\...` 与 URL 的可判定性）；中文标点
 /// （全角）在切词集内。
@@ -200,7 +200,7 @@ fn first_common_slot(a: &MemoryRecord, b: &MemoryRecord, slots: &[ValueSlot]) ->
     })
 }
 
-/// 同主题异值冲突扫描（B-411 P2，o12 正主）：同独占槽位（key 词形命中）
+/// 同主题异值冲突扫描（ P2， 正主）：同独占槽位（key 词形命中）
 /// 且双方值词形集均非空且不相交 → 矛盾候选对，裁决复用维度序。**值相交=
 /// 并存合法**（多路径/多端口类），不判矛盾；槽位外主题不检——语义等价
 /// 交由 Recipe 槽位数据扩充（与否定词表同一保守纪律），不做词法猜测。
@@ -387,8 +387,8 @@ mod tests {
 
     #[test]
     fn test_value_conflict_o12_live_case() {
-        // o12 活体案例①（同主题异键异值、全肯定极性——极性规则结构性漏检，
-        // B-411 P2 值冲突规则的正主场景）
+        //  活体案例①（同主题异键异值、全肯定极性——极性规则结构性漏检，
+        //  P2 值冲突规则的正主场景）
         let records = vec![
             rec(
                 "当前工作区绑定状态",
