@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
-// N-011 回归锁:「复制 API Token」逻辑面三态——①有 token+clipboard 可用=
+// 回归锁:「复制 API Token」逻辑面三态——①有 token+clipboard 可用=
 // 复制成功;②token 未注入=empty 拒绝(auth 关闭态提示);③clipboard 不可用
 // 掉 execCommand 回退链仍成功。token 源=壳 init_script 注入的
 // localStorage['evo_agent_token'](webview 已持有,按钮零新增暴露面)。
@@ -9,7 +9,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const { copyApiToken } = await import('../src/lib/tokenCopy.js');
 
-describe('copyApiToken(N-011 token 显式复制门)', () => {
+describe('copyApiToken(token 显式复制门)', () => {
   let writeText;
 
   beforeEach(() => {
