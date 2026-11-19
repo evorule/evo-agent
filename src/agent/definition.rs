@@ -717,6 +717,17 @@ pub struct AgentDefinition {
     /// 哲学同构),判据全文+模型+时间戳落 journal 可回放
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceptance_generation: Option<bool>,
+    /// Long-horizon capability marker (optional; absent or false =
+    /// non-long-horizon, zero behavior change — default invariant).
+    ///
+    /// When true, `task_done` admission upgrades from the criteria piece
+    /// alone to the write-off conjunction (criteria passed AND journal
+    /// evidence committed AND breakpoint fresh; see
+    /// [`crate::agent::writeoff`]). The conjunction is computed by the
+    /// runner from the session journal; the model never supplies gate
+    /// inputs. Effective assembly point: `AgentRunner::from_definition`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longhorizon: Option<bool>,
     /// 自验证门禁配置(写面撤销批 M3;可选,None=门禁不存在,既有定义零影响)
     ///
     /// 命令仅来自本配置(人类预置,模型只读消费不可生成/修改);写面工具
@@ -2354,6 +2365,7 @@ mod tests {
             context_window_tokens: None,
             acceptance_command: None,
             acceptance_generation: None,
+            longhorizon: None,
             verify: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
@@ -2736,6 +2748,7 @@ mod tests {
             context_window_tokens: None,
             acceptance_command: None,
             acceptance_generation: None,
+            longhorizon: None,
             verify: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
@@ -3127,6 +3140,7 @@ mod tests {
             context_window_tokens: None,
             acceptance_command: None,
             acceptance_generation: None,
+            longhorizon: None,
             verify: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
@@ -3372,6 +3386,7 @@ mod tests {
             context_window_tokens: None,
             acceptance_command: None,
             acceptance_generation: None,
+            longhorizon: None,
             verify: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,

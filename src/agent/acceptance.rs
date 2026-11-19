@@ -11,8 +11,23 @@
 //!   G8 同款决策权归 runner)+ 失败时 `params.acceptance_detail`;
 //! - 拒绝时 `GateOutcome::Reject(detail)` 由调用方作为 tool_result 回喂
 //!   LLM,指令不提交引擎。
+//!
+//! Write-off conjunction extension (long-horizon mode): when the caller
+//! hands in the journal-projected pieces
+//! ([`crate::agent::writeoff::JournalPieces`]), the `task_done` admission
+//! condition upgrades from the criteria piece alone to the three-piece
+//! conjunction (all criteria passed AND window evidence committed AND
+//! breakpoint fresh). The three-valued verdict Pass/Reject/Unknown comes
+//! from the pure functions in [`crate::agent::writeoff`]; both Reject and
+//! Unknown refuse the submission (Unknown never pretends to pass, same
+//! discipline as the verify gate's `unknown` verdict), with every missing
+//! piece itemized in the detail. Passing None (non-long-horizon mode)
+//! keeps the legacy criteria-only behavior byte-identical (default
+//! invariant).
 
 use serde_json::Value;
+
+use crate::agent::writeoff::{self, CriteriaState, JournalPieces, WriteoffVerdict};
 
 /// 门禁结果
 pub enum GateOutcome {
@@ -23,7 +38,17 @@ pub enum GateOutcome {
 }
 
 /// 判据自检门禁入口
-pub async fn apply_acceptance_gate(acceptance_command: Option<&str>, args: &Value) -> GateOutcome {
+///
+/// `writeoff_pieces`: journal-projected conjunction pieces (computed by
+/// the runner for long-horizon mode; the model never supplies them). None
+/// = non-long-horizon mode, legacy criteria-only behavior. When Some, the
+/// `task_done` admission upgrades to the three-piece conjunction and both
+/// Reject and Unknown refuse the submission with the itemized detail.
+pub async fn apply_acceptance_gate(
+    acceptance_command: Option<&str>,
+    args: &Value,
+    writeoff_pieces: Option<&JournalPieces>,
+) -> GateOutcome {
     let itype = args
         .get("instruction_type")
         .and_then(|v| v.as_str())
@@ -31,6 +56,15 @@ pub async fn apply_acceptance_gate(acceptance_command: Option<&str>, args: &Valu
     match itype {
         "task_done" => {
             let Some(cmd) = acceptance_command else {
+                // Conjunction mode without a configured command: the
+                // criteria piece cannot be established, so the conjunction
+                // evaluation reports it honestly (unknown is not pass).
+                // Non-conjunction mode keeps the legacy allow.
+                if let Some(pieces) = writeoff_pieces {
+                    let verdict =
+                        writeoff::evaluate_conjunction(CriteriaState::Unconfigured, pieces);
+                    return GateOutcome::Reject(writeoff_refusal(&verdict));
+                }
                 return GateOutcome::Allow(args.clone());
             };
             let outcome = run_acceptance_command(cmd).await;
@@ -44,6 +78,22 @@ pub async fn apply_acceptance_gate(acceptance_command: Option<&str>, args: &Valu
                     tail_str(&String::from_utf8_lossy(&o.stderr), 400),
                 ),
             };
+            if let Some(pieces) = writeoff_pieces {
+                // Conjunction mode: the criteria result enters the
+                // three-piece verdict; both Reject and Unknown refuse the
+                // submission without injecting the pass flag (unknown is
+                // not pass). Injection happens only on the Allow path
+                // after the full conjunction passed.
+                let criteria = if passed {
+                    CriteriaState::Passed
+                } else {
+                    CriteriaState::Failed(detail.clone())
+                };
+                let verdict = writeoff::evaluate_conjunction(criteria, pieces);
+                if !matches!(verdict, WriteoffVerdict::Pass) {
+                    return GateOutcome::Reject(writeoff_refusal(&verdict));
+                }
+            }
             let mut args = args.clone();
             if let Some(obj) = args.as_object_mut() {
                 let params = obj.entry("params").or_insert_with(|| serde_json::json!({}));
@@ -80,6 +130,22 @@ pub async fn apply_acceptance_gate(acceptance_command: Option<&str>, args: &Valu
             }
         }
         _ => GateOutcome::Allow(args.clone()),
+    }
+}
+
+/// Build the refusal detail for a non-Pass write-off verdict. Both verdict
+/// classes refuse the submission; the wording states which (a plain reject
+/// vs an unknowable face that is not treated as pass) and the verdict
+/// payload already itemizes every failing/unknowable piece.
+fn writeoff_refusal(verdict: &WriteoffVerdict) -> String {
+    match verdict {
+        WriteoffVerdict::Pass => String::new(), // unreachable: caller guards on non-Pass
+        WriteoffVerdict::Reject(detail) => format!(
+            "task_done 已被合取门禁拒绝(缺项明细:{detail})——判据通过、证据落盘、断点块新鲜三件未全过,不存在 done 退出路径"
+        ),
+        WriteoffVerdict::Unknown(detail) => format!(
+            "task_done 已被合取门禁拒绝(unknown 不假装通过:{detail})——无法确证的合取件按拒绝处理,不存在 done 退出路径"
+        ),
     }
 }
 
@@ -304,7 +370,7 @@ mod tests {
             "instruction_type": "task_done",
             "params": { "milestone_current": 3 }
         });
-        match apply_acceptance_gate(Some("exit 0"), &args).await {
+        match apply_acceptance_gate(Some("exit 0"), &args, None).await {
             GateOutcome::Allow(a) => {
                 assert_eq!(a["params"]["acceptance_passed"], serde_json::json!(true));
                 // 原有 params 字段保留
@@ -320,7 +386,7 @@ mod tests {
             "instruction_type": "task_done",
             "params": {}
         });
-        match apply_acceptance_gate(Some("exit 3"), &args).await {
+        match apply_acceptance_gate(Some("exit 3"), &args, None).await {
             GateOutcome::Reject(d) => {
                 assert!(d.contains("验收判据未通过"));
                 // 拒绝不改写原 args 的语义:注入发生在 Allow 路径,此处 detail 已含原因
@@ -333,7 +399,7 @@ mod tests {
     async fn test_gate_unconfigured_allows_task_done() {
         let args = serde_json::json!({ "instruction_type": "task_done", "params": {} });
         assert!(matches!(
-            apply_acceptance_gate(None, &args).await,
+            apply_acceptance_gate(None, &args, None).await,
             GateOutcome::Allow(_)
         ));
     }
@@ -342,7 +408,7 @@ mod tests {
     async fn test_gate_task_blocked_requires_reason() {
         let no_reason = serde_json::json!({ "instruction_type": "task_blocked", "params": {} });
         assert!(matches!(
-            apply_acceptance_gate(None, &no_reason).await,
+            apply_acceptance_gate(None, &no_reason, None).await,
             GateOutcome::Reject(_)
         ));
         let with_reason = serde_json::json!({
@@ -350,7 +416,7 @@ mod tests {
             "params": { "reason": "deps unavailable, fail-visible" }
         });
         assert!(matches!(
-            apply_acceptance_gate(None, &with_reason).await,
+            apply_acceptance_gate(None, &with_reason, None).await,
             GateOutcome::Allow(_)
         ));
     }
@@ -359,7 +425,7 @@ mod tests {
     async fn test_gate_passthrough_other_instructions() {
         let args = serde_json::json!({ "instruction_type": "task_start", "params": {} });
         assert!(matches!(
-            apply_acceptance_gate(Some("exit 1"), &args).await,
+            apply_acceptance_gate(Some("exit 1"), &args, None).await,
             GateOutcome::Allow(_)
         ));
     }
@@ -420,5 +486,195 @@ mod tests {
         assert!(p.contains("外部锚"));
         // 空工具面也成立
         assert!(build_criteria_prompt("g", &[]).contains("工具清单不可用"));
+    }
+
+    // ===== Write-off conjunction gate (long-horizon mode) =====
+
+    use crate::agent::writeoff::{EvidenceState, FreshnessState};
+
+    /// Piece-state shorthand for the conjunction gate tests.
+    fn pieces(evidence: EvidenceState, freshness: FreshnessState) -> JournalPieces {
+        JournalPieces {
+            evidence,
+            freshness,
+        }
+    }
+
+    fn done_args() -> serde_json::Value {
+        serde_json::json!({ "instruction_type": "task_done", "params": {} })
+    }
+
+    #[tokio::test]
+    async fn test_writeoff_allows_when_conjunction_passes() {
+        // All three pieces satisfied: admission granted and the runner
+        // truth injected exactly as in legacy mode.
+        let p = pieces(
+            EvidenceState::Present {
+                digest: "d".to_string(),
+            },
+            FreshnessState::Fresh,
+        );
+        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p)).await {
+            GateOutcome::Allow(a) => {
+                assert_eq!(a["params"]["acceptance_passed"], serde_json::json!(true));
+            }
+            GateOutcome::Reject(d) => panic!("satisfied conjunction must allow: {d}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_writeoff_forged_pass_flag_cannot_grant_admission() {
+        // G8 negative: a model-forged params.acceptance_passed=true is
+        // never consulted — the criteria truth comes from the command
+        // exit, and the conjunction refuses regardless of the flag.
+        let args = serde_json::json!({
+            "instruction_type": "task_done",
+            "params": { "acceptance_passed": true }
+        });
+        let p = pieces(
+            EvidenceState::Present {
+                digest: "d".to_string(),
+            },
+            FreshnessState::Fresh,
+        );
+        match apply_acceptance_gate(Some("exit 7"), &args, Some(&p)).await {
+            GateOutcome::Reject(d) => {
+                assert!(d.contains("缺项明细"), "{d}");
+                assert!(d.contains("acceptance criteria not met"), "{d}");
+            }
+            GateOutcome::Allow(_) => panic!("forged flag must not grant admission"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_writeoff_missing_one_matrix_refuses_done() {
+        let ok_evidence = EvidenceState::Present {
+            digest: "d".to_string(),
+        };
+        // Single-missing cases.
+        let cases = [
+            (
+                EvidenceState::Missing,
+                FreshnessState::Fresh,
+                "committed evidence missing",
+            ),
+            (
+                ok_evidence.clone(),
+                FreshnessState::Stale,
+                "breakpoint stale",
+            ),
+            (
+                ok_evidence.clone(),
+                FreshnessState::Missing,
+                "breakpoint missing",
+            ),
+        ];
+        for (evidence, freshness, needle) in cases {
+            let p = pieces(evidence, freshness);
+            match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p)).await {
+                GateOutcome::Reject(d) => {
+                    assert!(d.contains(needle), "case `{needle}` detail: {d}");
+                }
+                GateOutcome::Allow(_) => {
+                    panic!("single-missing case `{needle}` must refuse done")
+                }
+            }
+        }
+        // All-missing case: every failing piece listed in one detail.
+        let p = pieces(EvidenceState::Missing, FreshnessState::Missing);
+        match apply_acceptance_gate(Some("exit 3"), &done_args(), Some(&p)).await {
+            GateOutcome::Reject(d) => {
+                assert!(d.contains("acceptance criteria not met"), "{d}");
+                assert!(d.contains("committed evidence missing"), "{d}");
+                assert!(d.contains("breakpoint missing"), "{d}");
+            }
+            GateOutcome::Allow(_) => panic!("all-missing case must refuse done"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_writeoff_unknown_journal_refuses_done_not_pass() {
+        // Journal disabled/unreadable: both journal pieces are Unknown.
+        // Unknown must refuse done — it must never degrade to a pass.
+        let p = pieces(EvidenceState::Unknown, FreshnessState::Unknown);
+        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p)).await {
+            GateOutcome::Reject(d) => {
+                assert!(d.contains("unknown 不假装通过"), "{d}");
+                assert!(d.contains("cannot be established"), "{d}");
+            }
+            GateOutcome::Allow(_) => panic!("unknown must not pass"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_writeoff_unconfigured_command_is_unknown_refusal() {
+        // Long-horizon mode demands a criteria command: without one, the
+        // legacy unconditional allow must NOT happen — the gate refuses
+        // with the unknowable-criteria face.
+        let p = pieces(
+            EvidenceState::Present {
+                digest: "d".to_string(),
+            },
+            FreshnessState::Fresh,
+        );
+        match apply_acceptance_gate(None, &done_args(), Some(&p)).await {
+            GateOutcome::Reject(d) => {
+                assert!(d.contains("cannot be established"), "{d}");
+            }
+            GateOutcome::Allow(_) => {
+                panic!("missing criteria command must refuse in conjunction mode")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_non_longhorizon_mode_behavior_unchanged() {
+        // Default invariant (writeoff_pieces = None): criteria-only
+        // admission. A passing command allows with no journal pieces at
+        // all, and an unconfigured command still allows — the pieces that
+        // would reject in conjunction mode are simply not consulted.
+        assert!(matches!(
+            apply_acceptance_gate(Some("exit 0"), &done_args(), None).await,
+            GateOutcome::Allow(_)
+        ));
+        assert!(matches!(
+            apply_acceptance_gate(None, &done_args(), None).await,
+            GateOutcome::Allow(_)
+        ));
+        // Legacy forged-flag negative still holds without the conjunction.
+        let args = serde_json::json!({
+            "instruction_type": "task_done",
+            "params": { "acceptance_passed": true }
+        });
+        assert!(matches!(
+            apply_acceptance_gate(Some("exit 3"), &args, None).await,
+            GateOutcome::Reject(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_writeoff_mode_leaves_other_instructions_untouched() {
+        // The conjunction only governs task_done: task_blocked reason
+        // check and passthrough instructions behave identically in
+        // conjunction mode.
+        let p = pieces(EvidenceState::Unknown, FreshnessState::Unknown);
+        let blocked = serde_json::json!({ "instruction_type": "task_blocked", "params": {} });
+        assert!(matches!(
+            apply_acceptance_gate(None, &blocked, Some(&p)).await,
+            GateOutcome::Reject(_)
+        ));
+        let blocked_ok = serde_json::json!({
+            "instruction_type": "task_blocked",
+            "params": { "reason": "honest exit" }
+        });
+        assert!(matches!(
+            apply_acceptance_gate(None, &blocked_ok, Some(&p)).await,
+            GateOutcome::Allow(_)
+        ));
+        let start = serde_json::json!({ "instruction_type": "task_start", "params": {} });
+        assert!(matches!(
+            apply_acceptance_gate(Some("exit 1"), &start, Some(&p)).await,
+            GateOutcome::Allow(_)
+        ));
     }
 }

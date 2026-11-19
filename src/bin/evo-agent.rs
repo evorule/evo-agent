@@ -5766,6 +5766,7 @@ mod run_policy_gate_tests {
             context_window_tokens: None,
             acceptance_command: None,
             acceptance_generation: None,
+            longhorizon: None,
             verify: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
