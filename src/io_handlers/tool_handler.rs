@@ -678,10 +678,13 @@ mod tests {
 
     #[test]
     fn test_exec_timeout_follows_manifest_timeout_class() {
-        // 分派断言:Fast/Default 档工具按静态表取不同超时值
+        // 分派断言:Fast/Default/Long 档工具按静态表取不同超时值
+        // （shell_exec 为 Long 档样本：构建类命令 600s；Default 样本取无
+        // 特殊分派的 file_read）
         let handler = ToolHandler::new();
         let fast = lookup_static("grep_files").unwrap();
-        let default = lookup_static("shell_exec").unwrap();
+        let default = lookup_static("file_read").unwrap();
+        let long = lookup_static("shell_exec").unwrap();
         assert_eq!(
             fast.timeout_class,
             crate::agent::tool_manifest::TimeoutClass::Fast
@@ -690,8 +693,13 @@ mod tests {
             default.timeout_class,
             crate::agent::tool_manifest::TimeoutClass::Default
         );
+        assert_eq!(
+            long.timeout_class,
+            crate::agent::tool_manifest::TimeoutClass::Long
+        );
         assert_eq!(handler.exec_timeout_for(&fast), Duration::from_secs(30));
         assert_eq!(handler.exec_timeout_for(&default), Duration::from_secs(60));
+        assert_eq!(handler.exec_timeout_for(&long), Duration::from_secs(600));
     }
 
     #[tokio::test]
