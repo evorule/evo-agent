@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bridge;
+pub mod client;
 pub mod process;
 pub mod transport;
 

@@ -183,9 +183,22 @@ impl ToolFunction for FileEditTool {
     async fn call(&self, args: &Value) -> IoResult {
         let tool = self.clone();
         let args = args.clone();
-        tokio::task::spawn_blocking(move || tool.call_sync(&args))
+        let mut out = tokio::task::spawn_blocking(move || tool.call_sync(&args))
             .await
-            .map_err(|e| format!("edit_file tool panicked: {}", e))?
+            .map_err(|e| format!("edit_file tool panicked: {}", e))??;
+        // 编辑回执诊断(建议性):coding 档+LSP 门通过时对落地文件拉一次
+        // 语言服务器诊断——「改完即知错」秒级闭环。任何失败省略字段
+        // (编辑本身已成功,诊断缺席不反噬);manual 档=零字段=逐字节兼容。
+        // 大文件分段路径(v1)不带本字段——分段面自带逐窗口对账。
+        let target = out.get("path").and_then(|v| v.as_str()).map(PathBuf::from);
+        let diag = match target.as_deref() {
+            Some(p) => crate::lsp::client::envelope_diagnostics(&self.workdir, p, None).await,
+            None => None,
+        };
+        if let (Some(obj), Some(d)) = (out.as_object_mut(), diag) {
+            obj.insert("diagnostics".to_string(), d);
+        }
+        Ok(out)
     }
 }
 

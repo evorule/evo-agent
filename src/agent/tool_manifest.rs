@@ -516,6 +516,10 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 故 ReadOnly 显式标定,见下方读写分级臂;AutoPolicy 免裁决同
         // code_search 先例)
         b("codegraph", vec![Network]),
+        // 语言服务器只读查询面(诊断/文档符号;agent 侧自持客户端复用 lsp
+        // spawn 机械,不占用 UI WS 桥单连接;Process 域=本机子进程, ReadOnly
+        // 显式标定见下方读写分级臂)
+        b("lsp", vec![Process]),
         // dev-feedback P2: 多 worktree 自动化(并行任务隔离的机制化承载;
         // 建仓检出保护/脏树 fail-visible/分支名白名单;GitWrite 域,
         // 审批走基线档)
@@ -650,7 +654,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             | "code_search" | "codegraph" | "chain_status" | "git_status" | "git_diff"
             | "git_log" | "query_journal" | "query_trace" | "read_back" | "diff_runs"
             | "read_skill" | "memory_recall" | "audit_query" | "audit_summary" | "todo_read"
-            | "handover_read" | "web_search" => {
+            | "handover_read" | "web_search" | "lsp" => {
                 m.side_effect = EffectClass::ReadOnly;
             }
             _ => {}
@@ -1192,9 +1196,11 @@ mod tests {
         //     114→115；Sensitive 同 git 写族面）
         //   （容错 patch apply_patch +1：FsWrite 域 Sentineled，
         //     数量锁 115→116）
-        assert_eq!(builtin_manifests().len(), 48);
+        //   （语言服务器只读查询面 lsp +1：Process 域 ReadOnly 标定，
+        //     数量锁 116→117，server 不在 PATH=fail-visible 带安装指引）
+        assert_eq!(builtin_manifests().len(), 49);
         assert_eq!(rule_manifests().len(), 60);
-        assert_eq!(all().len(), 116);
+        assert_eq!(all().len(), 117);
     }
 
     #[test]
@@ -1224,7 +1230,7 @@ mod tests {
         names.extend(memory_manifests().iter().map(|m| m.name.clone()));
         // 数量锁(与模块头「内置+规则+delegate+memory」演进同源;计数漂移
         // 此处当场红)
-        assert_eq!(names.len(), 116, "static manifest count lock");
+        assert_eq!(names.len(), 117, "static manifest count lock");
         let mut sorted = names.clone();
         sorted.sort();
         let before = sorted.len();
@@ -1353,22 +1359,23 @@ mod tests {
 
     #[test]
     fn test_effect_class_calibration_locked() {
-        // 读写分级标定锁（并行调度分组判据）：只读族显式标定数=29
+        // 读写分级标定锁（并行调度分组判据）：只读族显式标定数=31
         // （审计摘要卡 audit_summary 只读小视图 +1；代码知识图谱只读查询
-        // codegraph +1）；未标定一律 Mutating（保守串行，缺省不变式）。
-        // 扩标须 diff 审改数。
+        // codegraph +1；语言服务器只读查询 lsp +1）；未标定一律 Mutating
+        // （保守串行，缺省不变式）。扩标须 diff 审改数。
         let all = static_manifests();
         let readonly: Vec<&str> = all
             .iter()
             .filter(|m| m.side_effect == EffectClass::ReadOnly)
             .map(|m| m.name.as_str())
             .collect();
-        assert_eq!(readonly.len(), 30, "ReadOnly 标定数锁: {:?}", readonly);
+        assert_eq!(readonly.len(), 31, "ReadOnly 标定数锁: {:?}", readonly);
         let look = |n: &str| lookup_static(n).unwrap().side_effect;
         // 内置只读族抽样
         assert_eq!(look("file_read"), EffectClass::ReadOnly);
         assert_eq!(look("grep_files"), EffectClass::ReadOnly);
         assert_eq!(look("codegraph"), EffectClass::ReadOnly);
+        assert_eq!(look("lsp"), EffectClass::ReadOnly);
         assert_eq!(look("memory_recall"), EffectClass::ReadOnly);
         assert_eq!(look("audit_summary"), EffectClass::ReadOnly);
         assert_eq!(look("todo_read"), EffectClass::ReadOnly);
