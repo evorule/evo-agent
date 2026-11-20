@@ -3983,6 +3983,33 @@ impl AgentRunner {
         if let Some(memory) = self.memory.as_mut() {
             // F-616:usage 增量批量回写(sediment 前刷,批量端点一次 HTTP)
             memory.flush_usage(session_id).await;
+            // D8 错误→经验蒸馏落账(recipe error_distill 门控,缺省关=零变化):
+            // 红→绿循环候选出队→stable fact 落账(键 llm.errorfix.<sig>,带 as_of)
+            if let Some(cfg) = memory.error_distill_config() {
+                if cfg.enabled {
+                    for cand in crate::agent::error_distill::drain() {
+                        let key = cand.fact_key();
+                        let value = cand.fact_value(crate::agent::error_distill::now_epoch());
+                        match serde_json::to_string(&value) {
+                            Ok(v) => {
+                                if let Err(e) = memory
+                                    .set_scoped(crate::agent::memory::MemoryScope::Shared, &key, &v)
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        key = %key,
+                                        error = %e,
+                                        "error distill write skipped (fail-soft)"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, "error distill serialize skipped");
+                            }
+                        }
+                    }
+                }
+            }
             // L1 修复(断点5-时序):apply_lifecycle_transitions 移至 sediment 之后。
             // 旧序:lifecycle→sediment——本会话新捕获的 Captured 事件必然缺席
             // 本次生命周期检查(sediment 还没跑),单次会话模式下永远等不到
@@ -12208,7 +12235,6 @@ pub fn sanitize_tool_pairing(messages: &mut [Message]) {
 /// 先于项目级 {workdir}/AGENTS.md,按序拼接;总量 16KB 上限(超限按序裁剪
 /// 并标注)。两级均无文件时 None(组装零变化)。
 pub fn load_agents_md_segment(workdir: &std::path::Path) -> Option<String> {
-    const MAX_BYTES: usize = 16 * 1024;
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .ok();
@@ -12217,11 +12243,23 @@ pub fn load_agents_md_segment(workdir: &std::path::Path) -> Option<String> {
             .join(".evo-agent")
             .join("AGENTS.md")
     });
+    load_agents_md_segment_with(workdir, user_level.as_deref())
+}
+
+/// 可注入变体:用户级文件路径显式传入(测试隔离——本机 user 级文件存在
+/// 与否不影响断言;生产壳传推导路径)。
+fn load_agents_md_segment_with(
+    workdir: &std::path::Path,
+    user_level: Option<&std::path::Path>,
+) -> Option<String> {
+    const MAX_BYTES: usize = 16 * 1024;
     let project_level = workdir.join("AGENTS.md");
     let mut parts: Vec<String> = Vec::new();
     // 用户级缺失不阻断项目级(两级独立读取);内容与上一级完全相同则去重跳过
-    let levels: [(&str, Option<std::path::PathBuf>); 2] =
-        [("用户级", user_level), ("项目级", Some(project_level))];
+    let levels: [(&str, Option<&std::path::Path>); 2] = [
+        ("用户级", user_level),
+        ("项目级", Some(project_level.as_path())),
+    ];
     for (label, p) in levels {
         let Some(p) = p else { continue };
         if let Ok(s) = std::fs::read_to_string(&p) {
@@ -12279,7 +12317,8 @@ mod agents_md_tests {
     #[test]
     fn empty_when_no_files() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_agents_md_segment(dir.path()).is_none());
+        // user 级注入 None(隔离本机 ~/.evo-agent/AGENTS.md 实态)
+        assert!(super::load_agents_md_segment_with(dir.path(), None).is_none());
     }
 
     #[test]
@@ -12297,7 +12336,7 @@ mod agents_md_tests {
     fn blank_project_file_counts_as_absent() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "   \n\t").unwrap();
-        assert!(load_agents_md_segment(dir.path()).is_none());
+        assert!(super::load_agents_md_segment_with(dir.path(), None).is_none());
     }
 
     #[test]

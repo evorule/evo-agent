@@ -265,6 +265,41 @@ impl BuildCheckTool {
         (errors, warnings, diags, truncated)
     }
 
+    /// D8 观测：红→绿循环检测（可测纯入口;call() 传 recipe 门）。
+    ///
+    /// failed(有诊断)→记录 pending;pass 且 pending 在场→产出候选并入队
+    /// （门启用时）,返回候选供信封携带;门关=静默取走 pending（零可见）。
+    fn observe_verdict(
+        verdict: &str,
+        errors: usize,
+        diags: &[Value],
+        command: &str,
+        workspace_key: &str,
+        gate: Option<&crate::agent::recipe::ErrorDistill>,
+    ) -> Option<Value> {
+        match verdict {
+            "failed" if errors > 0 => {
+                let top = diags
+                    .iter()
+                    .find_map(|d| {
+                        d.get("message")
+                            .and_then(|m| m.as_str())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| format!("{errors} errors"));
+                crate::agent::error_distill::record_failure(workspace_key, errors, top, command);
+                None
+            }
+            "pass" => {
+                let cand = crate::agent::error_distill::resolve_if_pending(workspace_key, command)?;
+                let gate_cfg = gate?;
+                crate::agent::error_distill::enqueue(cand.clone(), gate_cfg.cap);
+                Some(serde_json::to_value(&cand).ok()?)
+            }
+            _ => None,
+        }
+    }
+
     /// cargo_test failures 块解析:`failures:` 行与 `test result:` 行之间的
     /// 非空行=失败测试名,逐条落 `test_failure` 条目(severity=8;编译诊断
     /// 由 $rustc 通道独立计数,两通道零重叠)。帽感知:超帽只记 truncated。
@@ -437,6 +472,25 @@ impl crate::io_handlers::tool_handler::ToolFunction for BuildCheckTool {
         };
         let verdict = classify_verdict(out.exit_code, errors);
 
+        // D8 错误→经验蒸馏：红→绿循环检测（进程级 pending;门控=recipe
+        // error_distill.enabled,未启用=检测照走但候选不入队不出信封——
+        // manual/缺省档信封零新增字段）
+        let workspace_key = self
+            .workdir
+            .canonicalize()
+            .unwrap_or_else(|_| self.workdir.clone())
+            .to_string_lossy()
+            .to_string();
+        let gate = crate::agent::recipe::error_distill_gate();
+        let distill = Self::observe_verdict(
+            &verdict,
+            errors,
+            &diags,
+            command,
+            &workspace_key,
+            gate.as_ref(),
+        );
+
         let profile_key = match &profile {
             ProfileRef::Builtin(p) => p.key,
             ProfileRef::Declared(d) => d.key.as_str(),
@@ -481,6 +535,9 @@ impl crate::io_handlers::tool_handler::ToolFunction for BuildCheckTool {
             }
             if let Some(w) = &load_problem {
                 o.insert("profiles_note".to_string(), Value::String(w.clone()));
+            }
+            if let Some(d) = distill {
+                o.insert("distill_candidate".to_string(), d);
             }
             if let Some(n) = note {
                 o.insert("note".to_string(), Value::String(n));
@@ -587,6 +644,90 @@ mod tests {
             "counts must stay exact beyond the cap"
         );
         assert_eq!(r.get("truncated").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    // === D8 错误→经验蒸馏观测 ===
+
+    fn d8_ws(tag: &str) -> String {
+        format!(
+            "{}\\d8-{}-{}",
+            std::env::temp_dir().display(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )
+    }
+
+    #[test]
+    fn d8_red_records_green_emits_with_gate() {
+        let ws = d8_ws("gate-on");
+        let gate = crate::agent::recipe::ErrorDistill {
+            enabled: true,
+            cap: 5,
+        };
+        let diags = [serde_json::json!({"message": "boom at line 3"})];
+        // 红:记录 pending,无候选返回
+        assert!(BuildCheckTool::observe_verdict(
+            "failed",
+            2,
+            &diags,
+            "cargo check",
+            &ws,
+            Some(&gate)
+        )
+        .is_none());
+        // 绿:产出候选并入队
+        let cand = BuildCheckTool::observe_verdict("pass", 0, &[], "cargo check", &ws, Some(&gate))
+            .expect("candidate on green");
+        assert_eq!(cand["error_count"], 2);
+        assert!(cand["signature"].as_str().unwrap().len() == 8);
+        assert!(
+            crate::agent::error_distill::drain()
+                .iter()
+                .any(|c| c.signature == cand["signature"].as_str().unwrap()),
+            "候选已入队"
+        );
+    }
+
+    #[test]
+    fn d8_gate_off_swallows_silently() {
+        let ws = d8_ws("gate-off");
+        let diags = [serde_json::json!({"message": "silent boom"})];
+        BuildCheckTool::observe_verdict("failed", 1, &diags, "cargo check", &ws, None);
+        // 门关:绿=静默取走 pending,零候选零入队
+        assert!(
+            BuildCheckTool::observe_verdict("pass", 0, &[], "cargo check", &ws, None).is_none()
+        );
+        assert!(
+            !crate::agent::error_distill::drain()
+                .iter()
+                .any(|c| c.workspace == ws),
+            "门关=不入队"
+        );
+    }
+
+    #[test]
+    fn d8_pass_without_red_is_noop() {
+        let ws = d8_ws("no-red");
+        assert!(BuildCheckTool::observe_verdict(
+            "pass",
+            0,
+            &[],
+            "cargo check",
+            &ws,
+            Some(&crate::agent::recipe::ErrorDistill {
+                enabled: true,
+                cap: 5,
+            })
+        )
+        .is_none());
+        // failed 但零诊断:不记录(无签名素材)
+        BuildCheckTool::observe_verdict("failed", 0, &[], "cargo check", &ws, None);
+        assert!(
+            BuildCheckTool::observe_verdict("pass", 0, &[], "cargo check", &ws, None).is_none()
+        );
     }
 
     #[tokio::test]
