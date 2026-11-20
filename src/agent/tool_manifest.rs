@@ -854,8 +854,8 @@ const READ_ONLY_RULE_TOOLS: &[&str] = &[
     "publish_queue_get",
 ];
 
-/// 规则工具 manifest（60 条 = 透传 50 + 本地逻辑 7 + why/order 3，名称集合与
-/// rule_tool_specs() 相等——测试锁）
+/// 规则工具 manifest（61 条 = 透传 50 + 本地逻辑 7 + why/order 3 + 临界机 1，
+/// 名称集合与 rule_tool_specs() 相等——测试锁）
 fn rule_manifests() -> Vec<ToolManifest> {
     let mut manifests: Vec<ToolManifest> = crate::rule_tools::adapter::ALL_TRANSPARENT_BINDINGS
         .iter()
@@ -912,6 +912,19 @@ fn rule_manifests() -> Vec<ToolManifest> {
     for name in ["explain_denial", "causal_order", "lineage_of"] {
         let mut m = base(
             name,
+            ToolSource::RuleLocal,
+            SpecSource::Rule,
+            vec![CapDomain::Governance],
+        );
+        m.side_effect = EffectClass::ReadOnly;
+        manifests.push(m);
+    }
+    // 临界机验证 1（rule_tools::criticality_tools::register 的注册名，判定
+    // 只读回路）——只读，Standard（免裁决但落账）+AutoPolicy（免审）+无开关
+    // （不进 GOVERNANCE_SNAPSHOT/SWITCH_SNAPSHOT，快照面零变化）
+    {
+        let mut m = base(
+            "criticality_verify",
             ToolSource::RuleLocal,
             SpecSource::Rule,
             vec![CapDomain::Governance],
@@ -1205,10 +1218,12 @@ mod tests {
         //   （语言服务器只读查询面 lsp +1：Process 域 ReadOnly 标定，
         //     数量锁 116→117，server 不在 PATH=fail-visible 带安装指引）
         //   （编程环境预检 env_doctor +1：Process 域 ReadOnly 标定，
-        //     数量锁 117→118，版本查询探针零写面）
+        //     版本查询探针零写面）
+        //   （临界机验证 criticality_verify +1：规则 61，数量锁 118→120，
+        //     Governance 域 ReadOnly 标定，判定只读回路）
         assert_eq!(builtin_manifests().len(), 51);
-        assert_eq!(rule_manifests().len(), 60);
-        assert_eq!(all().len(), 119);
+        assert_eq!(rule_manifests().len(), 61);
+        assert_eq!(all().len(), 120);
     }
 
     #[test]
@@ -1251,7 +1266,7 @@ mod tests {
         names.extend(memory_manifests().iter().map(|m| m.name.clone()));
         // 数量锁(与模块头「内置+规则+delegate+memory」演进同源;计数漂移
         // 此处当场红)
-        assert_eq!(names.len(), 119, "static manifest count lock");
+        assert_eq!(names.len(), 120, "static manifest count lock");
         let mut sorted = names.clone();
         sorted.sort();
         let before = sorted.len();
@@ -1380,9 +1395,11 @@ mod tests {
 
     #[test]
     fn test_effect_class_calibration_locked() {
-        // 读写分级标定锁（并行调度分组判据）：只读族显式标定数=31
+        // 读写分级标定锁（并行调度分组判据）：只读族显式标定数=34
         // （审计摘要卡 audit_summary 只读小视图 +1；代码知识图谱只读查询
-        // codegraph +1；语言服务器只读查询 lsp +1）；未标定一律 Mutating
+        // codegraph +1；语言服务器只读查询 lsp +1；编程环境预检
+        // env_doctor +1；测试影响建议 test_impact +1；临界机验证
+        // criticality_verify 判定只读回路 +1）；未标定一律 Mutating
         // （保守串行，缺省不变式）。扩标须 diff 审改数。
         let all = static_manifests();
         let readonly: Vec<&str> = all
@@ -1390,7 +1407,7 @@ mod tests {
             .filter(|m| m.side_effect == EffectClass::ReadOnly)
             .map(|m| m.name.as_str())
             .collect();
-        assert_eq!(readonly.len(), 33, "ReadOnly 标定数锁: {:?}", readonly);
+        assert_eq!(readonly.len(), 34, "ReadOnly 标定数锁: {:?}", readonly);
         let look = |n: &str| lookup_static(n).unwrap().side_effect;
         // 内置只读族抽样
         assert_eq!(look("file_read"), EffectClass::ReadOnly);
@@ -1412,12 +1429,13 @@ mod tests {
             look(crate::agent::memory_tool::MEMORY_GET_TOOL),
             EffectClass::ReadOnly
         );
-        // 规则只读五件
+        // 规则只读六件
         assert_eq!(look("explain_denial"), EffectClass::ReadOnly);
         assert_eq!(look("causal_order"), EffectClass::ReadOnly);
         assert_eq!(look("lineage_of"), EffectClass::ReadOnly);
         assert_eq!(look("publish_list"), EffectClass::ReadOnly);
         assert_eq!(look("publish_queue_get"), EffectClass::ReadOnly);
+        assert_eq!(look("criticality_verify"), EffectClass::ReadOnly);
         // 写面/进程/交互/委托/未标定 = Mutating
         assert_eq!(look("file_write"), EffectClass::Mutating);
         assert_eq!(look("edit_file"), EffectClass::Mutating);

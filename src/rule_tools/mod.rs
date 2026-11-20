@@ -10,9 +10,12 @@
 //!   meta_summary / evolution_signals / rule_promote / verdict_submit）→
 //!   `local_handlers` 统一外置；
 //! - 3 个查账 why/order 工具（explain_denial / causal_order / lineage_of，
-//!   PR-11b）→ `why_tools`（因果查询面，只读）。
+//!   PR-11b）→ `why_tools`（因果查询面，只读）；
+//! - 1 个临界机验证工具（criticality_verify，判定只读回路）→
+//!   `criticality_tools`（确定性三态判定注入面，只读）。
 
 pub mod adapter;
+pub mod criticality_tools;
 pub mod local_handlers;
 pub mod why_tools;
 
@@ -21,20 +24,22 @@ use crate::api::workspace_client::WorkspaceApiClient;
 use crate::builtin_tools::ToolSpec;
 use crate::io_handlers::tool_handler::ToolHandler;
 
-/// 组装完整规则工具集（透传 49 + 本地逻辑 7 + why/order 3 = 59 工具）
+/// 组装完整规则工具集（透传 49 + 本地逻辑 7 + why/order 3 + 临界机 1 = 60 工具）
 pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> ToolHandler {
     let mut h = ToolHandler::new();
     adapter::register_bindings(&mut h, ws, ev, adapter::ALL_TRANSPARENT_BINDINGS);
     local_handlers::register(&mut h, ws, ev);
     why_tools::register(&mut h, ws, ev);
+    criticality_tools::register(&mut h, ev);
     h
 }
 
-/// 全部规则工具 spec（59 个）
+/// 全部规则工具 spec（60 个）
 pub fn rule_tool_specs() -> Vec<ToolSpec> {
     let mut specs = adapter::specs_from(adapter::ALL_TRANSPARENT_BINDINGS);
     specs.extend(local_handlers::specs());
     specs.extend(why_tools::specs());
+    specs.extend(criticality_tools::specs());
     specs
 }
 
@@ -45,7 +50,7 @@ mod tests {
     #[test]
     fn test_rule_tool_specs_count() {
         let specs = rule_tool_specs();
-        assert_eq!(specs.len(), 60, "expected 60 rule tool specs");
+        assert_eq!(specs.len(), 61, "expected 61 rule tool specs");
     }
 
     #[test]
@@ -219,9 +224,9 @@ service_tools = ["config_persist", "rule_sandbox"]
     }
 
     #[test]
-    fn test_full_rule_toolkit_registers_all_58() {
-        // 验证 full_rule_toolkit 注册了全部 58 个工具（49 透传 + 6 本地逻辑 +
-        // 3 why/order，has_tool 逐个校验；计数与 rule_tool_specs 对齐）
+    fn test_full_rule_toolkit_registers_all_59() {
+        // 验证 full_rule_toolkit 注册了全部 59 个工具（49 透传 + 6 本地逻辑 +
+        // 3 why/order + 1 临界机，has_tool 逐个校验；计数与 rule_tool_specs 对齐）
         let ws = WorkspaceApiClient::new("http://localhost:0");
         let ev = EvoruleApiClient::new("http://localhost:0");
         let h = full_rule_toolkit(&ws, &ev);
@@ -302,8 +307,10 @@ service_tools = ["config_persist", "rule_sandbox"]
             "explain_denial",
             "causal_order",
             "lineage_of",
+            // 临界机 1（测量命题确定性三态判定回路，判定只读）
+            "criticality_verify",
         ];
-        assert_eq!(all_tools.len(), 58);
+        assert_eq!(all_tools.len(), 59);
         for name in &all_tools {
             assert!(
                 h.has_tool(name),

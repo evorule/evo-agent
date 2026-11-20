@@ -6,10 +6,10 @@ Full reference for the evo-agent tool system: the 3-tier security model, the bui
 
 ## Tool totals
 
-- **Spec count**: 59 tools (locked by tests).
-- **Serve surface (default)**: 62 tools = 17 built-in + 45 rule tools.
+- **Spec count**: 61 tools (locked by tests).
+- **Serve surface (default)**: 63 tools = 17 built-in + 46 rule tools.
 - **sandbox/dataset/publish/production** account for 14 tools that are defined but not exposed on the serve surface (advanced tools).
-- **Rule-management toolkit total: 52** (workspace 2 + rule 12 + translate 3 + audit 4 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + hit-stats 2 + skill assembly 1 + meta 1 + evolution 2 + why/order 3) — the breakdown table below reflects this corrected total.
+- **Rule-management toolkit total: 53** (workspace 2 + rule 12 + translate 3 + audit 4 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + hit-stats 2 + skill assembly 1 + meta 1 + evolution 2 + why/order 3 + criticality 1) — the breakdown table below reflects this corrected total.
 
 ## 3-tier security model
 
@@ -31,7 +31,7 @@ Full reference for the evo-agent tool system: the 3-tier security model, the bui
 
 Full-tree search skips large directories by default (`target` / `node_modules` / `.git` / `.evo-trash` / `data`); `search_files` accepts `exclude` and `grep_files` accepts `excludeGlobs` to add more (e.g. `["vendor", "dist"]`).
 
-## Rule-management toolkit (52)
+## Rule-management toolkit (53)
 
 Assembled via `rule_management_toolkit` / `full_rule_toolkit`, used by the `rule-copilot` agent:
 
@@ -52,6 +52,26 @@ Assembled via `rule_management_toolkit` / `full_rule_toolkit`, used by the `rule
 | meta | 1 | meta_summary (constraint-list summary) |
 | evolution | 2 | evolution_signals (evolution-signal pull) + rule_promote (constraint-layer promotion nomination) |
 | why/order | 3 | explain_denial (denial-reason explanation + reconciliation against the rule original; the io_guard retained-value denial closes the loop on itself via the fact's hit record) + causal_order (causal ordering of two facts, chained-hash order) + lineage_of (rule lineage = version chain + promotion ledger), all read-only |
+| criticality | 1 | criticality_verify (deterministic three-state verdict for measurement claims via the server criticality pipeline; read-only) |
+
+## Criticality verification (numeric claims must be verified)
+
+When the agent states or consumes **numeric claims** (measured values, computed
+quantities, physical constants) that an EvoRule server with an assembled
+reference frame (law sets + constant sets) can check, it should route them
+through `criticality_verify` instead of asserting them unverified. Semantics
+discipline:
+
+| Verdict | Meaning | Agent behavior |
+|---------|---------|----------------|
+| `stable` | Claim consistent with the reference frame within tolerance | May proceed (evidence attached) |
+| `alert` | Constant out of bounds (proposal package attached) | Send back for regeneration/revision; surface the proposal package to the user — **never** persist the verdict as a substitute for the human governance gate |
+| `contradiction` | Law violated | Send back for regeneration/revision (revise the claim or the law) |
+| error / no reference frame | `law_host_not_configured` (503) or 422 rejection | Report honestly ("no reference frame in this environment" / fix claim shape per `detail`); never fabricate a verdict |
+
+The verdict is **advisory evidence for a human gate**: judgments are
+read-only, proposals go through the governance chain, and the agent must not
+write any verdict into durable state as an approval replacement.
 
 ## Governance write switch (agentTools.governanceWrite)
 
@@ -59,8 +79,8 @@ Governance write access defaults to **fully on** (`true`, backward compatible �
 
 | Setting | Effect |
 |---------|--------|
-| `agentTools.governanceWrite = true` (default) | All 46 rule tools; zero change from the status quo |
-| `agentTools.governanceWrite = false` | **21 governance-write tools go offline as a group** (8 rule writes + rule_promote + ws_create + sandbox_start/close + dataset_create + publish ×5 + bundle_export/bundle_import/bundle_import_dry_run) — they don't even appear in the LLM's tool spec (the capability surface ceases to exist, not "calls rejected"); 25 read-only tools remain (query / audit / knowledge / skill assembly / meta / evolution_signals / translate / validate, etc.) |
+| `agentTools.governanceWrite = true` (default) | All 47 rule tools; zero change from the status quo |
+| `agentTools.governanceWrite = false` | **21 governance-write tools go offline as a group** (8 rule writes + rule_promote + ws_create + sandbox_start/close + dataset_create + publish ×5 + bundle_export/bundle_import/bundle_import_dry_run) — they don't even appear in the LLM's tool spec (the capability surface ceases to exist, not "calls rejected"); 26 read-only tools remain (query / audit / knowledge / skill assembly / meta / evolution_signals / translate / validate / criticality_verify, etc.) |
 
 Notes: the key is `application`-scoped and **cannot be overridden at workspace level** (preventing project-level configs from privately expanding the agent tool surface). After turning it off, the LLM can still assist "human drafting" (rule_to_transform / rule_to_conditional / rule_validate are pure computations — no network, no disk writes); submission / promotion / publish authority returns to humans (the console-cloud approval flow). Truly confidential enterprises usually run in-house intranet models where data never leaves the intranet; the default does not interfere with their fully-on shape.
 
