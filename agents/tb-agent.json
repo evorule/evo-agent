@@ -33,7 +33,9 @@
     "rule_update",
     "knowledge_datasets",
     "knowledge_search",
-    "knowledge_entry_get"
+    "knowledge_entry_get",
+    "export_*",
+    "template_*"
   ],
   "memory": {
     "type": "persistent",
