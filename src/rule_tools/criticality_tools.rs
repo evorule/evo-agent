@@ -4,12 +4,14 @@
 #![forbid(unsafe_code)]
 //! 临界机验证工具（工具面统一架构，rule_tools 族新件）：
 //! `criticality_verify` —— 测量命题 → server `POST /v1/criticality/verify`
-//! 确定性三态判定回路。
+//! 确定性四态判定回路。
 //!
 //! # 语义纪律（判定只读铁律的 agent 侧镜像）
-//! - 工具**只读回判定**：`stable` = 数值主张与参照系相容可放行；
-//!   `alert` / `contradiction` = 主张与常量/定律参照系不符，须回炉重生成
-//!   或转人工提案，**不得**将 verdict 写入任何持久状态替代人工闸；
+//! - 工具**只读回判定**：`stable` = 数值主张与参照系相容可放行（至少一次
+//!   实际容差/区间判定执行）；`alert` / `contradiction` = 主张与常量/定律
+//!   参照系不符，须回炉重生成或转人工提案；`unverifiable` = 零次实际评估
+//!   （全部跳过或无候选），如实上报「无法验证」**不得**当作已验证放行，
+//!   也不得将 verdict 写入任何持久状态替代人工闸；
 //! - server 未装配参照系（503 `law_host_not_configured`）时如实告知
 //!   「本环境无参照系」不猜不编造；422 结构化拒因原样透传（agent 据此
 //!   修正主张形态后可重试）；
@@ -189,10 +191,13 @@ pub fn specs() -> Vec<ToolSpec> {
                       reference frame (laws + constants) via the deterministic criticality \
                       pipeline. Returns verdict `stable` (claim consistent — may proceed), \
                       `alert` (constant out of bounds — do NOT persist; surface the proposal \
-                      package to the user for human review), or `contradiction` (law violated \
-                      — regenerate or revise the claim). The verdict is advisory evidence for \
-                      a human gate: never write it into durable state as a substitute for \
-                      human approval. If the response carries error_code \
+                      package to the user for human review), `contradiction` (law violated \
+                      — regenerate or revise the claim), or `unverifiable` (no tolerance or \
+                      interval judgment could be executed — report honestly that the claim \
+                      is unverified, never treat it as verified; gather the missing inputs \
+                      such as uncertainty declarations and retry). The verdict is advisory \
+                      evidence for a human gate: never write it into durable state as a \
+                      substitute for human approval. If the response carries error_code \
                       `law_host_not_configured`, honestly report that no reference frame is \
                       assembled in this environment; on 422 rejections, fix the claim shape \
                       per `detail` and retry. Read-only."
@@ -344,6 +349,10 @@ mod tests {
         assert!(
             s.description.contains("never write it into durable state"),
             "判定只读语义应进描述"
+        );
+        assert!(
+            s.description.contains("`unverifiable`"),
+            "第四态判定语义应进描述"
         );
     }
 }

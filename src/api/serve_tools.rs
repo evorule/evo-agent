@@ -88,7 +88,7 @@ const RULE_TOOL_NAMES: &[&str] = &[
     "explain_denial",
     "causal_order",
     "lineage_of",
-    // 临界机验证 (1,测量命题确定性三态判定回路,判定只读)
+    // 临界机验证 (1,测量命题确定性四态判定回路,判定只读)
     "criticality_verify",
 ];
 

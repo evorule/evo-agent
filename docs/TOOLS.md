@@ -52,7 +52,7 @@ Assembled via `rule_management_toolkit` / `full_rule_toolkit`, used by the `rule
 | meta | 1 | meta_summary (constraint-list summary) |
 | evolution | 2 | evolution_signals (evolution-signal pull) + rule_promote (constraint-layer promotion nomination) |
 | why/order | 3 | explain_denial (denial-reason explanation + reconciliation against the rule original; the io_guard retained-value denial closes the loop on itself via the fact's hit record) + causal_order (causal ordering of two facts, chained-hash order) + lineage_of (rule lineage = version chain + promotion ledger), all read-only |
-| criticality | 1 | criticality_verify (deterministic three-state verdict for measurement claims via the server criticality pipeline; read-only) |
+| criticality | 1 | criticality_verify (deterministic four-state verdict for measurement claims via the server criticality pipeline; read-only) |
 
 ## Criticality verification (numeric claims must be verified)
 
@@ -64,9 +64,10 @@ discipline:
 
 | Verdict | Meaning | Agent behavior |
 |---------|---------|----------------|
-| `stable` | Claim consistent with the reference frame within tolerance | May proceed (evidence attached) |
+| `stable` | Claim consistent with the reference frame within tolerance (at least one tolerance/interval judgment executed) | May proceed (evidence attached) |
 | `alert` | Constant out of bounds (proposal package attached) | Send back for regeneration/revision; surface the proposal package to the user — **never** persist the verdict as a substitute for the human governance gate |
 | `contradiction` | Law violated | Send back for regeneration/revision (revise the claim or the law) |
+| `unverifiable` | Zero tolerance/interval judgments executed (all steps skipped or no candidates) | Report honestly that the claim could not be verified (e.g. missing uncertainty declarations); **never** treat it as "verified" — gather the missing inputs and retry, or escalate to a human |
 | error / no reference frame | `law_host_not_configured` (503) or 422 rejection | Report honestly ("no reference frame in this environment" / fix claim shape per `detail`); never fabricate a verdict |
 
 The verdict is **advisory evidence for a human gate**: judgments are
