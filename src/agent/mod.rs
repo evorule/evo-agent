@@ -43,6 +43,7 @@ pub mod memory_tool;
 pub mod output_validator;
 pub mod pipeline;
 pub mod recipe;
+pub mod reconcile;
 pub mod replan;
 pub mod repo_map;
 pub mod runner;

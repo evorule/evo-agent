@@ -40,10 +40,25 @@
 //! touch paths when the model's anchors leave part of the projected touch
 //! surface uncovered (report credibility signal). Passing a None report
 //! (non-long-horizon mode) keeps behavior byte-identical.
+//!
+//! Cross-source reconciliation extension (long-horizon mode): when the
+//! caller hands in the journal-projected ledger face
+//! ([`crate::agent::reconcile::LedgerFace`]), the three sources speak
+//! before admission — the model's anchor assertions (`task_done`
+//! `params.anchors`), the machine ledger window, and the fresh criteria
+//! run are cross-checked by pure functions. An inconsistent report
+//! refuses the submission with every discrepancy itemized (fail-visible;
+//! the errata count is stated as-is, nothing folded, nothing silently
+//! repaired), and a consistent report defers to the write-off
+//! conjunction verdict, with the structured record injected into
+//! runner-owned `task_done` params (overwrite semantics) so it rides the
+//! existing journaled call/result surfaces (zero new events). Passing
+//! None (non-long-horizon mode) keeps behavior byte-identical.
 
 use serde_json::Value;
 
 use crate::agent::acceptance_evidence::{self, IntegrityVerdict, TouchReport};
+use crate::agent::reconcile;
 use crate::agent::writeoff::{self, CriteriaState, JournalPieces, WriteoffVerdict};
 
 /// 门禁结果
@@ -70,11 +85,23 @@ pub enum GateOutcome {
 /// verdict joins the admission decision, the criteria command runs twice
 /// under the bit-identical discipline, and every refusal names the
 /// unreferenced touch paths when coverage is incomplete.
+///
+/// `reconcile_ledger`: journal-projected machine ledger face for the
+/// cross-source reconciliation ([`reconcile::LedgerFace`]; runner-computed,
+/// model never supplies it). None = non-long-horizon mode — no
+/// reconciliation, byte identical legacy behavior. When Some on a
+/// `task_done`, the three sources are cross-checked before the write-off
+/// conjunction: an inconsistent report refuses with every discrepancy
+/// itemized (assertion↔ledger rows are the red class, ledger↔criteria
+/// rows are the unresolved class — unknown is not pass), and a consistent
+/// report defers to the conjunction with the record injected into the
+/// admitted params.
 pub async fn apply_acceptance_gate(
     acceptance_command: Option<&str>,
     args: &Value,
     writeoff_pieces: Option<&JournalPieces>,
     runner_report: Option<&TouchReport>,
+    reconcile_ledger: Option<&reconcile::LedgerFace>,
 ) -> GateOutcome {
     let itype = args
         .get("instruction_type")
@@ -101,6 +128,28 @@ pub async fn apply_acceptance_gate(
                 // criteria piece cannot be established, so the conjunction
                 // evaluation reports it honestly (unknown is not pass).
                 // Non-conjunction mode keeps the legacy allow.
+                // Reconciliation still runs on the faces it can compare
+                // (the external criteria face is unconfigured here — the
+                // ledger↔criteria comparison is vacuous, the
+                // assertion↔ledger comparison is not). Order matters: an
+                // inconsistent report refuses first; conjunction mode then
+                // always refuses (the unknown criteria piece is not pass);
+                // only the legacy criteria-free allow carries the record.
+                let mut reconciliation: Option<reconcile::ReconcileReport> = None;
+                if let Some(ledger) = reconcile_ledger {
+                    let report = reconcile::reconcile_sources(
+                        &reconcile::extract_assertion_face(args),
+                        ledger,
+                        &reconcile::CriteriaFace::Unconfigured,
+                    );
+                    if !report.consistent {
+                        return GateOutcome::Reject(append_coverage(
+                            reconcile_refusal(&report),
+                            runner_report,
+                        ));
+                    }
+                    reconciliation = Some(report);
+                }
                 if let Some(pieces) = writeoff_pieces {
                     let verdict =
                         writeoff::evaluate_conjunction(CriteriaState::Unconfigured, pieces);
@@ -108,6 +157,11 @@ pub async fn apply_acceptance_gate(
                         writeoff_refusal(&verdict),
                         runner_report,
                     ));
+                }
+                if let Some(report) = reconciliation {
+                    if let Some(args) = inject_reconciliation(args, &report) {
+                        return GateOutcome::Allow(args);
+                    }
                 }
                 return GateOutcome::Allow(args.clone());
             };
@@ -175,6 +229,32 @@ pub async fn apply_acceptance_gate(
                     }
                 }
             };
+            // Cross-source reconciliation (long-horizon mode): the model's
+            // anchor assertions, the machine ledger window, and the fresh
+            // criteria run are cross-checked before the conjunction. An
+            // inconsistent report refuses with every discrepancy itemized
+            // (fail-visible; the errata count rides the refusal as-is); a
+            // consistent report defers to the conjunction and its record
+            // rides the admitted params.
+            let mut reconciliation: Option<reconcile::ReconcileReport> = None;
+            if let Some(ledger) = reconcile_ledger {
+                let criteria = reconcile::CriteriaFace::FreshRun {
+                    passed,
+                    detail: detail.clone(),
+                };
+                let report = reconcile::reconcile_sources(
+                    &reconcile::extract_assertion_face(args),
+                    ledger,
+                    &criteria,
+                );
+                if !report.consistent {
+                    return GateOutcome::Reject(append_coverage(
+                        reconcile_refusal(&report),
+                        runner_report,
+                    ));
+                }
+                reconciliation = Some(report);
+            }
             if let Some(pieces) = writeoff_pieces {
                 // Conjunction mode: the criteria result enters the
                 // three-piece verdict; both Reject and Unknown refuse the
@@ -202,6 +282,15 @@ pub async fn apply_acceptance_gate(
                     p.insert("acceptance_passed".to_string(), serde_json::json!(passed));
                     if !passed {
                         p.insert("acceptance_detail".to_string(), serde_json::json!(detail));
+                    }
+                    // Consistent reconciliation record (long-horizon mode):
+                    // rides the admitted params under the runner-owned key
+                    // so the audit surfaces journal it without new events.
+                    if let Some(report) = &reconciliation {
+                        p.insert(
+                            "reconciliation".to_string(),
+                            serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({})),
+                        );
                     }
                 }
             }
@@ -234,6 +323,44 @@ pub async fn apply_acceptance_gate(
         }
         _ => GateOutcome::Allow(args.clone()),
     }
+}
+
+/// Build the refusal detail for an inconsistent reconciliation report.
+/// The class word names which faces cannot be trusted: a report holding
+/// an assertion↔ledger row is a hard contradiction (red); a report whose
+/// rows are all ledger↔criteria polarity noise is unresolved — the
+/// ledger and the fresh criteria run disagree, so the true state is
+/// unknowable here (unknown is not pass). The rows ride itemized with
+/// the errata count stated as-is (nothing folded, nothing repaired).
+fn reconcile_refusal(report: &reconcile::ReconcileReport) -> String {
+    if reconcile::is_contradiction(report) {
+        format!(
+            "task_done refused by cross-source reconciliation (red — the asserted face contradicts the machine ledger): {}",
+            reconcile::rejection_line(report)
+        )
+    } else {
+        format!(
+            "task_done refused by cross-source reconciliation (unresolved — the machine ledger and the fresh criteria run disagree; unknown is not pass, single-source noise counted): {}",
+            reconcile::rejection_line(report)
+        )
+    }
+}
+
+/// Inject a consistent reconciliation record into `task_done` params
+/// under the runner-owned `reconciliation` key (overwrite semantics — a
+/// model-supplied value there is replaced). Returns None when the args
+/// are not an object with a params map (nothing to inject into; the
+/// caller falls back to the untouched args).
+fn inject_reconciliation(args: &Value, report: &reconcile::ReconcileReport) -> Option<Value> {
+    let mut args = args.clone();
+    let obj = args.as_object_mut()?;
+    let params = obj.entry("params").or_insert_with(|| serde_json::json!({}));
+    let p = params.as_object_mut()?;
+    p.insert(
+        "reconciliation".to_string(),
+        serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({})),
+    );
+    Some(args)
 }
 
 /// Build the refusal detail for a non-Pass write-off verdict. Both verdict
@@ -487,7 +614,7 @@ mod tests {
             "instruction_type": "task_done",
             "params": { "milestone_current": 3 }
         });
-        match apply_acceptance_gate(Some("exit 0"), &args, None, None).await {
+        match apply_acceptance_gate(Some("exit 0"), &args, None, None, None).await {
             GateOutcome::Allow(a) => {
                 assert_eq!(a["params"]["acceptance_passed"], serde_json::json!(true));
                 // 原有 params 字段保留
@@ -503,7 +630,7 @@ mod tests {
             "instruction_type": "task_done",
             "params": {}
         });
-        match apply_acceptance_gate(Some("exit 3"), &args, None, None).await {
+        match apply_acceptance_gate(Some("exit 3"), &args, None, None, None).await {
             GateOutcome::Reject(d) => {
                 assert!(d.contains("验收判据未通过"));
                 // 拒绝不改写原 args 的语义:注入发生在 Allow 路径,此处 detail 已含原因
@@ -516,7 +643,7 @@ mod tests {
     async fn test_gate_unconfigured_allows_task_done() {
         let args = serde_json::json!({ "instruction_type": "task_done", "params": {} });
         assert!(matches!(
-            apply_acceptance_gate(None, &args, None, None).await,
+            apply_acceptance_gate(None, &args, None, None, None).await,
             GateOutcome::Allow(_)
         ));
     }
@@ -525,7 +652,7 @@ mod tests {
     async fn test_gate_task_blocked_requires_reason() {
         let no_reason = serde_json::json!({ "instruction_type": "task_blocked", "params": {} });
         assert!(matches!(
-            apply_acceptance_gate(None, &no_reason, None, None).await,
+            apply_acceptance_gate(None, &no_reason, None, None, None).await,
             GateOutcome::Reject(_)
         ));
         let with_reason = serde_json::json!({
@@ -533,7 +660,7 @@ mod tests {
             "params": { "reason": "deps unavailable, fail-visible" }
         });
         assert!(matches!(
-            apply_acceptance_gate(None, &with_reason, None, None).await,
+            apply_acceptance_gate(None, &with_reason, None, None, None).await,
             GateOutcome::Allow(_)
         ));
     }
@@ -542,7 +669,7 @@ mod tests {
     async fn test_gate_passthrough_other_instructions() {
         let args = serde_json::json!({ "instruction_type": "task_start", "params": {} });
         assert!(matches!(
-            apply_acceptance_gate(Some("exit 1"), &args, None, None).await,
+            apply_acceptance_gate(Some("exit 1"), &args, None, None, None).await,
             GateOutcome::Allow(_)
         ));
     }
@@ -631,7 +758,7 @@ mod tests {
             },
             FreshnessState::Fresh,
         );
-        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), None).await {
+        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), None, None).await {
             GateOutcome::Allow(a) => {
                 assert_eq!(a["params"]["acceptance_passed"], serde_json::json!(true));
             }
@@ -654,7 +781,7 @@ mod tests {
             },
             FreshnessState::Fresh,
         );
-        match apply_acceptance_gate(Some("exit 7"), &args, Some(&p), None).await {
+        match apply_acceptance_gate(Some("exit 7"), &args, Some(&p), None, None).await {
             GateOutcome::Reject(d) => {
                 assert!(d.contains("缺项明细"), "{d}");
                 assert!(d.contains("acceptance criteria not met"), "{d}");
@@ -688,7 +815,7 @@ mod tests {
         ];
         for (evidence, freshness, needle) in cases {
             let p = pieces(evidence, freshness);
-            match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), None).await {
+            match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), None, None).await {
                 GateOutcome::Reject(d) => {
                     assert!(d.contains(needle), "case `{needle}` detail: {d}");
                 }
@@ -699,7 +826,7 @@ mod tests {
         }
         // All-missing case: every failing piece listed in one detail.
         let p = pieces(EvidenceState::Missing, FreshnessState::Missing);
-        match apply_acceptance_gate(Some("exit 3"), &done_args(), Some(&p), None).await {
+        match apply_acceptance_gate(Some("exit 3"), &done_args(), Some(&p), None, None).await {
             GateOutcome::Reject(d) => {
                 assert!(d.contains("acceptance criteria not met"), "{d}");
                 assert!(d.contains("committed evidence missing"), "{d}");
@@ -714,7 +841,7 @@ mod tests {
         // Journal disabled/unreadable: both journal pieces are Unknown.
         // Unknown must refuse done — it must never degrade to a pass.
         let p = pieces(EvidenceState::Unknown, FreshnessState::Unknown);
-        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), None).await {
+        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), None, None).await {
             GateOutcome::Reject(d) => {
                 assert!(d.contains("unknown 不假装通过"), "{d}");
                 assert!(d.contains("cannot be established"), "{d}");
@@ -734,7 +861,7 @@ mod tests {
             },
             FreshnessState::Fresh,
         );
-        match apply_acceptance_gate(None, &done_args(), Some(&p), None).await {
+        match apply_acceptance_gate(None, &done_args(), Some(&p), None, None).await {
             GateOutcome::Reject(d) => {
                 assert!(d.contains("cannot be established"), "{d}");
             }
@@ -751,11 +878,11 @@ mod tests {
         // all, and an unconfigured command still allows — the pieces that
         // would reject in conjunction mode are simply not consulted.
         assert!(matches!(
-            apply_acceptance_gate(Some("exit 0"), &done_args(), None, None).await,
+            apply_acceptance_gate(Some("exit 0"), &done_args(), None, None, None).await,
             GateOutcome::Allow(_)
         ));
         assert!(matches!(
-            apply_acceptance_gate(None, &done_args(), None, None).await,
+            apply_acceptance_gate(None, &done_args(), None, None, None).await,
             GateOutcome::Allow(_)
         ));
         // Legacy forged-flag negative still holds without the conjunction.
@@ -764,7 +891,7 @@ mod tests {
             "params": { "acceptance_passed": true }
         });
         assert!(matches!(
-            apply_acceptance_gate(Some("exit 3"), &args, None, None).await,
+            apply_acceptance_gate(Some("exit 3"), &args, None, None, None).await,
             GateOutcome::Reject(_)
         ));
     }
@@ -777,7 +904,7 @@ mod tests {
         let p = pieces(EvidenceState::Unknown, FreshnessState::Unknown);
         let blocked = serde_json::json!({ "instruction_type": "task_blocked", "params": {} });
         assert!(matches!(
-            apply_acceptance_gate(None, &blocked, Some(&p), None).await,
+            apply_acceptance_gate(None, &blocked, Some(&p), None, None).await,
             GateOutcome::Reject(_)
         ));
         let blocked_ok = serde_json::json!({
@@ -785,12 +912,12 @@ mod tests {
             "params": { "reason": "honest exit" }
         });
         assert!(matches!(
-            apply_acceptance_gate(None, &blocked_ok, Some(&p), None).await,
+            apply_acceptance_gate(None, &blocked_ok, Some(&p), None, None).await,
             GateOutcome::Allow(_)
         ));
         let start = serde_json::json!({ "instruction_type": "task_start", "params": {} });
         assert!(matches!(
-            apply_acceptance_gate(Some("exit 1"), &start, Some(&p), None).await,
+            apply_acceptance_gate(Some("exit 1"), &start, Some(&p), None, None).await,
             GateOutcome::Allow(_)
         ));
     }
@@ -869,7 +996,7 @@ mod tests {
             },
             FreshnessState::Fresh,
         );
-        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), None).await {
+        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), None, None).await {
             GateOutcome::Allow(a) => {
                 assert_eq!(a["params"]["acceptance_passed"], serde_json::json!(true));
             }
@@ -894,7 +1021,7 @@ mod tests {
             },
             FreshnessState::Fresh,
         );
-        match apply_acceptance_gate(Some(nondet), &done_args(), Some(&p), None).await {
+        match apply_acceptance_gate(Some(nondet), &done_args(), Some(&p), None, None).await {
             GateOutcome::Reject(d) => {
                 assert!(d.contains("non-deterministic"), "{d}");
                 assert!(d.contains("dual-run"), "{d}");
@@ -913,7 +1040,7 @@ mod tests {
         let counter = dir.join("counter.txt");
         let cmd = append_counter_cmd(&counter);
         let t0 = std::time::Instant::now();
-        match apply_acceptance_gate(Some(&cmd), &done_args(), None, None).await {
+        match apply_acceptance_gate(Some(&cmd), &done_args(), None, None, None).await {
             GateOutcome::Allow(a) => {
                 assert_eq!(a["params"]["acceptance_passed"], serde_json::json!(true));
             }
@@ -940,7 +1067,7 @@ mod tests {
             },
             FreshnessState::Fresh,
         );
-        match apply_acceptance_gate(Some(&cmd2), &done_args(), Some(&p), None).await {
+        match apply_acceptance_gate(Some(&cmd2), &done_args(), Some(&p), None, None).await {
             GateOutcome::Allow(_) => {}
             GateOutcome::Reject(d) => {
                 panic!("deterministic criterion must allow in mode-on too: {d}")
@@ -969,7 +1096,9 @@ mod tests {
         // Honest store: evidence face ok, admission granted.
         let report = report_for(&dir, &surface, &["a.txt"]);
         assert_eq!(report.coverage.ratio_pct, 100);
-        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), Some(&report)).await {
+        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), Some(&report), None)
+            .await
+        {
             GateOutcome::Allow(_) => {}
             GateOutcome::Reject(d) => panic!("honest evidence must allow: {d}"),
         }
@@ -981,7 +1110,15 @@ mod tests {
             .join(hash.strip_prefix("blake3:").unwrap());
         std::fs::write(&blob, b"artifact-byteZ").unwrap();
         let tampered = report_for(&dir, &surface, &["a.txt"]);
-        match apply_acceptance_gate(Some("exit 0"), &done_args(), Some(&p), Some(&tampered)).await {
+        match apply_acceptance_gate(
+            Some("exit 0"),
+            &done_args(),
+            Some(&p),
+            Some(&tampered),
+            None,
+        )
+        .await
+        {
             GateOutcome::Reject(d) => {
                 assert!(d.contains("evidence recomputation"), "{d}");
                 assert!(d.contains("a.txt"), "{d}");
@@ -1029,7 +1166,9 @@ mod tests {
             },
             FreshnessState::Fresh,
         );
-        match apply_acceptance_gate(Some("exit 1"), &done_args(), Some(&p), Some(&report)).await {
+        match apply_acceptance_gate(Some("exit 1"), &done_args(), Some(&p), Some(&report), None)
+            .await
+        {
             GateOutcome::Reject(d) => {
                 assert!(d.contains("acceptance criteria not met"), "{d}");
                 assert!(d.contains("3/5"), "{d}");
@@ -1037,6 +1176,210 @@ mod tests {
                 assert!(d.contains("p4") && d.contains("p5"), "{d}");
             }
             GateOutcome::Allow(_) => panic!("failing criterion must refuse"),
+        }
+    }
+
+    // ===== Cross-source reconciliation gate wiring (long-horizon mode) =====
+
+    /// Ledger-face shorthand for the reconciliation gate tests: projected
+    /// window with the given anchor map and verify tail.
+    fn ledger_face(
+        anchors: &[(&str, &str)],
+        verify: Option<(&str, &str)>,
+    ) -> reconcile::LedgerFace {
+        reconcile::LedgerFace::Projected(reconcile::ProjectedLedger {
+            anchors: anchors
+                .iter()
+                .map(|(p, h)| (p.to_string(), h.to_string()))
+                .collect(),
+            verify_tail: verify.map(|(n, v)| reconcile::VerifyTail {
+                name: n.to_string(),
+                verdict: v.to_string(),
+            }),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_consistent_allows_and_records() {
+        // ① Three consistent sources: admission granted, the structured
+        // record rides the admitted params, and a model-supplied value
+        // under the runner-owned key is overwritten.
+        let args = serde_json::json!({
+            "instruction_type": "task_done",
+            "params": {
+                "anchors": ["src/a.txt = blake3:aaa"],
+                "reconciliation": "FORGED-BY-MODEL"
+            }
+        });
+        let ledger = ledger_face(&[("src/a.txt", "blake3:aaa")], Some(("check", "pass")));
+        let p = pieces(
+            EvidenceState::Present {
+                digest: "d".to_string(),
+            },
+            FreshnessState::Fresh,
+        );
+        match apply_acceptance_gate(Some("exit 0"), &args, Some(&p), None, Some(&ledger)).await {
+            GateOutcome::Allow(a) => {
+                assert_eq!(a["params"]["acceptance_passed"], serde_json::json!(true));
+                assert_eq!(
+                    a["params"]["reconciliation"]["consistent"],
+                    serde_json::json!(true),
+                    "the forged value is replaced by the runner-computed report"
+                );
+                assert_eq!(
+                    a["params"]["reconciliation"]["discrepancies"],
+                    serde_json::json!([]),
+                    "consistent report carries zero rows"
+                );
+            }
+            GateOutcome::Reject(d) => panic!("consistent sources must allow: {d}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_off_ledger_anchor_refuses_red() {
+        // ③ Off-ledger anchor: refused, red class named, the exact anchor
+        // path listed, errata count stated.
+        let args = serde_json::json!({
+            "instruction_type": "task_done",
+            "params": { "anchors": ["ghost.txt = blake3:zzz"] }
+        });
+        let ledger = ledger_face(&[("src/a.txt", "blake3:aaa")], Some(("check", "pass")));
+        let p = pieces(
+            EvidenceState::Present {
+                digest: "d".to_string(),
+            },
+            FreshnessState::Fresh,
+        );
+        match apply_acceptance_gate(Some("exit 0"), &args, Some(&p), None, Some(&ledger)).await {
+            GateOutcome::Reject(d) => {
+                assert!(d.contains("cross-source reconciliation"), "{d}");
+                assert!(d.contains("red"), "{d}");
+                assert!(d.contains("ghost.txt"), "the anchor path is named: {d}");
+                assert!(d.contains("1 discrepancy"), "{d}");
+            }
+            GateOutcome::Allow(_) => panic!("off-ledger anchor must refuse"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_itemized_not_folded() {
+        // ②+④ Two contradicted claims: both rows itemized (never folded
+        // into a summary), the count stated, claim and ledger fact carried
+        // verbatim.
+        let args = serde_json::json!({
+            "instruction_type": "task_done",
+            "params": { "anchors": ["a.txt = blake3:stale", "b.txt"] }
+        });
+        let ledger = ledger_face(&[("a.txt", "blake3:real")], None);
+        let p = pieces(
+            EvidenceState::Present {
+                digest: "d".to_string(),
+            },
+            FreshnessState::Fresh,
+        );
+        match apply_acceptance_gate(Some("exit 0"), &args, Some(&p), None, Some(&ledger)).await {
+            GateOutcome::Reject(d) => {
+                assert!(d.contains("2 discrepancies"), "{d}");
+                assert!(d.contains("[1]") && d.contains("[2]"), "{d}");
+                assert!(
+                    d.contains("blake3:stale") && d.contains("blake3:real"),
+                    "claim and ledger fact carried verbatim: {d}"
+                );
+                assert!(d.contains("b.txt"), "the off-ledger path is named: {d}");
+            }
+            GateOutcome::Allow(_) => panic!("contradicted anchors must refuse"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_criteria_green_verify_red_unknown_not_pass() {
+        // Green criterion over a red verify window: single-source noise —
+        // the refusal names the unresolved class (unknown is not pass) and
+        // counts the erratum as-is instead of pretending a pass.
+        let args = serde_json::json!({ "instruction_type": "task_done", "params": {} });
+        let ledger = ledger_face(&[], Some(("check", "fail")));
+        let p = pieces(
+            EvidenceState::Present {
+                digest: "d".to_string(),
+            },
+            FreshnessState::Fresh,
+        );
+        match apply_acceptance_gate(Some("exit 0"), &args, Some(&p), None, Some(&ledger)).await {
+            GateOutcome::Reject(d) => {
+                assert!(d.contains("unresolved"), "{d}");
+                assert!(d.contains("unknown is not pass"), "{d}");
+                assert!(d.contains("1 discrepancy"), "{d}");
+                assert!(d.contains("verify_verdict"), "{d}");
+            }
+            GateOutcome::Allow(_) => panic!("green-over-red must not pass"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_unconfigured_criteria_checks_assertions() {
+        // No acceptance command: the external face is unconfigured (the
+        // ledger↔criteria comparison is vacuous) but the assertion↔ledger
+        // comparison still refuses an off-ledger anchor; consistent
+        // assertions defer to the conjunction, whose unknown criteria
+        // piece refuses on its own (reconciliation does not bypass it).
+        let bad = serde_json::json!({
+            "instruction_type": "task_done",
+            "params": { "anchors": ["ghost.txt"] }
+        });
+        let clean = serde_json::json!({ "instruction_type": "task_done", "params": {} });
+        let ledger = ledger_face(&[], None);
+        let p = pieces(EvidenceState::Missing, FreshnessState::Missing);
+        match apply_acceptance_gate(None, &bad, Some(&p), None, Some(&ledger)).await {
+            GateOutcome::Reject(d) => {
+                assert!(d.contains("cross-source reconciliation"), "{d}");
+                assert!(d.contains("ghost.txt"), "{d}");
+            }
+            GateOutcome::Allow(_) => panic!("off-ledger anchor must refuse"),
+        }
+        match apply_acceptance_gate(None, &clean, Some(&p), None, Some(&ledger)).await {
+            GateOutcome::Reject(d) => {
+                assert!(
+                    d.contains("unknown"),
+                    "the conjunction unknown refuses here, not the reconciliation: {d}"
+                );
+                assert!(!d.contains("cross-source reconciliation"), "{d}");
+            }
+            GateOutcome::Allow(_) => {
+                panic!("unconfigured criteria must refuse in conjunction mode")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_non_task_done_and_mode_off_untouched() {
+        // ⑤ Non-long-horizon default invariant: other instructions pass
+        // through unmodified even with a ledger face supplied, and a
+        // task_done with no ledger face keeps the exact legacy admission
+        // (no runner-owned record key on either path).
+        let other = serde_json::json!({ "instruction_type": "other", "params": {} });
+        let ledger = ledger_face(&[], Some(("check", "fail")));
+        match apply_acceptance_gate(Some("exit 0"), &other, None, None, Some(&ledger)).await {
+            GateOutcome::Allow(a) => {
+                assert!(
+                    a["params"].get("reconciliation").is_none(),
+                    "non-task_done passes through without the record"
+                );
+            }
+            GateOutcome::Reject(d) => panic!("other instructions must pass: {d}"),
+        }
+        let legacy = serde_json::json!({
+            "instruction_type": "task_done",
+            "params": { "anchors": ["ghost.txt"] }
+        });
+        match apply_acceptance_gate(Some("exit 0"), &legacy, None, None, None).await {
+            GateOutcome::Allow(a) => {
+                assert!(
+                    a["params"].get("reconciliation").is_none(),
+                    "mode off = legacy behavior, no record key"
+                );
+            }
+            GateOutcome::Reject(d) => panic!("legacy criteria-only must allow: {d}"),
         }
     }
 }
