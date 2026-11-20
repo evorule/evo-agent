@@ -12,7 +12,7 @@
 //! - 3 个查账 why/order 工具（explain_denial / causal_order / lineage_of，
 //!   PR-11b）→ `why_tools`（因果查询面，只读）；
 //! - 1 个临界机验证工具（criticality_verify，判定只读回路）→
-//!   `criticality_tools`（确定性三态判定注入面，只读）。
+//!   `criticality_tools`（确定性四态判定注入面，只读）。
 
 pub mod adapter;
 pub mod criticality_tools;
@@ -307,7 +307,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             "explain_denial",
             "causal_order",
             "lineage_of",
-            // 临界机 1（测量命题确定性三态判定回路，判定只读）
+            // 临界机 1（测量命题确定性四态判定回路，判定只读）
             "criticality_verify",
         ];
         assert_eq!(all_tools.len(), 59);
