@@ -21,7 +21,10 @@ try {
         if (Test-OpsProbe -Probe $svc.probe) { continue }
         Write-OpsLog -LogDir $cfg.log_dir -Message "[watchdog] $name 探活失败, 执行拉起..."
         try {
-            & (Join-Path $OpsDir $starters[$name]) *>> (Join-Path $cfg.log_dir 'watchdog.log')
+            # revive 日志按服务独立——禁写 watchdog.log 自身：父重定向句柄
+            # 持锁期间启动器内 Write-OpsLog 追加同一文件即文件占用崩死
+            # （2026-11-20 实录：server/serve 每轮拉起失败、永不自愈）。
+            & (Join-Path $OpsDir $starters[$name]) *>> (Join-Path $cfg.log_dir ("revive-" + $name + ".log"))
         } catch {
             Write-OpsLog -LogDir $cfg.log_dir -Message "[watchdog] $name 拉起失败: $($_.Exception.Message)"
         }

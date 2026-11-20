@@ -107,7 +107,9 @@ function Repair-OpsStaleBinary {
     $env:CARGO_BUILD_JOBS = '2'
     $ok = $false
     try {
-        & $buildScript -Repo $RepoPath -Exe $ExePath -StopServe *>> (Join-Path $LogDir 'autobuild.log')
+        # autobuild 日志按服务独立——并行重建(手动+watchdog 轮)同写一个
+        # autobuild.log 会重演 watchdog.log 文件占用锁（2026-11-20 实录）。
+        & $buildScript -Repo $RepoPath -Exe $ExePath -StopServe *>> (Join-Path $LogDir ("autobuild-" + $SvcName + ".log"))
         $ok = ($LASTEXITCODE -eq 0)
     } catch {
         Write-OpsLog -LogDir $LogDir -Message "[watchdog] $SvcName 自动重建异常: $($_.Exception.Message)"
@@ -117,7 +119,7 @@ function Repair-OpsStaleBinary {
     if ($ok) {
         Write-OpsLog -LogDir $LogDir -Message "[watchdog] $SvcName 自动重建完成, 复核新鲜度后继续"
     } else {
-        Write-OpsLog -LogDir $LogDir -Message "[watchdog] $SvcName 自动重建失败 — 详见 autobuild.log, 拒绝拉起"
+        Write-OpsLog -LogDir $LogDir -Message "[watchdog] $SvcName 自动重建失败 — 详见 autobuild-$SvcName.log, 拒绝拉起"
     }
     return $ok
 }
