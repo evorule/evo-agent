@@ -319,7 +319,7 @@ async fn handle_ws(
                                        // spawn task:转发事件流到 channel(转发泵保证
                                        // 客户端必收终态帧,见 forward_turn_events)
                                        let tx = event_tx.clone();
-                                       tokio::spawn(forward_turn_events(tx, event_stream));
+                                       spawn_turn_event_forwarder(tx, event_stream);
                                    }
                                    Ok(ClientMessage::Interrupt) => {
                                        if let Some(cancel) = &current_cancel {
@@ -431,7 +431,7 @@ async fn handle_ws(
                                                info!(session_id = %sid, "G16: crash-resume turn");
                                                let event_stream = runner.resume_crashed(sid);
                                                let tx = event_tx.clone();
-                                               tokio::spawn(forward_turn_events(tx, event_stream));
+                                               spawn_turn_event_forwarder(tx, event_stream);
                                            }
                                            None => {
                                                let _ = send_ws_json(
@@ -540,9 +540,16 @@ async fn handle_ws(
                                        }
                                    }
                                }
+                               let terminal_frame = matches!(json["type"].as_str(), Some("Done" | "Error"));
                                if send_ws_json(&mut sender, json).await.is_err() {
                                    warn!("G16: failed to send WS frame, client may have disconnected");
                                    break;
+                               }
+                               if terminal_frame {
+                                   // The client may answer immediately; do not make acceptance
+                                   // depend on a later select! pass over the TurnDone marker.
+                                   turn_active = false;
+                                   current_cancel = None;
                                }
                            }
                            Some(WsEvent::TurnDone) => {
@@ -653,13 +660,37 @@ async fn handle_ws(
 // 辅助函数
 // =============================================================================
 
-/// 轮次事件流转发泵：把 runner 事件流逐个转发到 WS 主循环通道，流收尾时
-/// 保证「客户端必收恰一个终态帧」不变式——若整条流从未产出 Done/Error
-/// 终态事件，合成一帧失败 Done 补发。无终态帧时前端「运行中」永挂、输入
-/// 被禁，用户失去全部处置抓手；合成帧让前端以诚实失败复位（轮次循环若
-/// 真在跑，下一帧到达时前端状态自然重同步）。合成时 warn 留痕（含会话
-/// 线索与已转发事件数），供现场按日志回捕静默收尾路径。
-/// 收尾信号按既有口径：TurnDone 先行放行下一轮，TurnEnd 供索引/快照善后。
+/// Supervise the forwarding task so a stream panic cannot strand an active turn.
+fn spawn_turn_event_forwarder(
+    tx: tokio::sync::mpsc::Sender<WsEvent>,
+    stream: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<AgentEvent, AgentError>> + Send>,
+    >,
+) {
+    tokio::spawn(async move {
+        let result = tokio::spawn(forward_turn_events(tx.clone(), stream)).await;
+        if let Err(error) = result {
+            warn!(error = %error, "turn event forwarding task failed");
+            let terminal = WsEvent::Agent(Ok(AgentEvent::Done(
+                crate::agent::runner::AgentResult::error(
+                    "turn event forwarding task failed".to_string(),
+                    0,
+                    0,
+                ),
+            )));
+            if tx.send(terminal).await.is_err() {
+                return;
+            }
+            if tx.send(WsEvent::TurnDone).await.is_err() {
+                return;
+            }
+            let _ = tx.send(WsEvent::TurnEnd).await;
+        }
+    });
+}
+
+/// Forward runner events and guarantee a terminal frame if the stream ends
+/// without one. TurnDone releases the next turn; TurnEnd drives deferred cleanup.
 async fn forward_turn_events(
     tx: tokio::sync::mpsc::Sender<WsEvent>,
     mut stream: std::pin::Pin<
@@ -667,22 +698,30 @@ async fn forward_turn_events(
     >,
 ) {
     let mut terminal_seen = false;
+    let mut turn_done_sent = false;
     let mut forwarded = 0usize;
     let mut session_hint: Option<String> = None;
     while let Some(ev) = stream.next().await {
-        match &ev {
-            Ok(AgentEvent::SessionCreated { session_id, .. }) => {
-                session_hint = Some(session_id.clone());
-            }
-            Ok(AgentEvent::Done(_)) | Ok(AgentEvent::Error(_)) | Err(_) => {
-                terminal_seen = true;
-            }
-            _ => {}
+        let terminal = matches!(
+            &ev,
+            Ok(AgentEvent::Done(_)) | Ok(AgentEvent::Error(_)) | Err(_)
+        );
+        if let Ok(AgentEvent::SessionCreated { session_id, .. }) = &ev {
+            session_hint = Some(session_id.clone());
         }
+        terminal_seen |= terminal;
         forwarded += 1;
         if tx.send(WsEvent::Agent(ev)).await.is_err() {
             // 主循环已退出(receiver drop),停止转发
             return;
+        }
+        if terminal {
+            // Release the next message as soon as the terminal event is queued;
+            // post-terminal stream cleanup must not hold the turn gate.
+            if tx.send(WsEvent::TurnDone).await.is_err() {
+                return;
+            }
+            turn_done_sent = true;
         }
     }
     if !terminal_seen {
@@ -700,10 +739,11 @@ async fn forward_turn_events(
             ))))
             .await;
     }
-    // 终端态先行放行:Done/Error 帧已转发,新消息即刻可入;
-    // 索引/快照善后随 TurnEnd 异步完成
-    if let Err(e) = tx.send(WsEvent::TurnDone).await {
-        debug!(error = %e, "TurnDone send failed; main ws loop already exited");
+    // A synthetic terminal also releases the turn; a real terminal already did.
+    if !turn_done_sent {
+        if let Err(e) = tx.send(WsEvent::TurnDone).await {
+            debug!(error = %e, "TurnDone send failed; main ws loop already exited");
+        }
     }
     // 事件流结束 → 发 TurnEnd 信号
     if let Err(e) = tx.send(WsEvent::TurnEnd).await {
@@ -1654,6 +1694,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_done_emits_turn_done_before_stream_end() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WsEvent>(16);
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let stream = Box::pin(async_stream::stream! {
+            yield Ok(AgentEvent::Done(
+                crate::agent::runner::AgentResult::success("ok".to_string(), 1, 100, vec![]),
+            ));
+            let _ = finish_rx.await;
+        });
+        tokio::spawn(forward_turn_events(tx, stream));
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(WsEvent::Agent(Ok(AgentEvent::Done(_))))
+        ));
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .expect("terminal delivery must not wait for stream cleanup"),
+            Some(WsEvent::TurnDone)
+        ));
+
+        let _ = finish_tx.send(());
+        assert!(matches!(rx.recv().await, Some(WsEvent::TurnEnd)));
+    }
+
+    #[tokio::test]
     async fn turn_stream_ending_with_error_event_counts_as_terminal() {
         // 流级错误(Err)也是终态帧:收尾不追加合成帧,Error 原样转发
         let (tx, mut rx) = tokio::sync::mpsc::channel::<WsEvent>(16);
@@ -1673,6 +1740,42 @@ mod tests {
         }
         assert_eq!(error_frames, 1);
         assert_eq!(done_frames, 0, "error is terminal; no synthetic frame");
+    }
+
+    #[tokio::test]
+    async fn panicking_turn_stream_still_releases_the_turn() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WsEvent>(16);
+        let stream = Box::pin(futures_util::stream::poll_fn(|_| {
+            panic!("injected turn stream panic")
+        }));
+        spawn_turn_event_forwarder(tx, stream);
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("panic must produce a terminal frame")
+            .expect("forwarder channel must stay open");
+        match terminal {
+            WsEvent::Agent(Ok(AgentEvent::Done(result))) => {
+                assert!(!result.success);
+                assert_eq!(
+                    result.error.as_deref(),
+                    Some("turn event forwarding task failed")
+                );
+            }
+            _ => panic!("expected synthetic failed Done"),
+        }
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .expect("panic must release the turn"),
+            Some(WsEvent::TurnDone)
+        ));
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .expect("panic must finish turn cleanup"),
+            Some(WsEvent::TurnEnd)
+        ));
     }
 
     // ===== 审批档位解析单源测试(定义级优先/设置键回落/未知值保守) =====

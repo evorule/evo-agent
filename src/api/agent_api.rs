@@ -2198,6 +2198,80 @@ async fn run_plan_execute_request(
     }))
 }
 
+const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+async fn next_sse_event(
+    event_stream: &mut std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<AgentEvent, AgentError>> + Send>,
+    >,
+    idle_timeout: std::time::Duration,
+) -> Result<Option<Result<AgentEvent, AgentError>>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(idle_timeout, event_stream.next()).await
+}
+
+fn sse_events_with_idle_timeout(
+    mut event_stream: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<AgentEvent, AgentError>> + Send>,
+    >,
+    store: SessionStore,
+    cancel_token: CancellationToken,
+    idle_timeout: std::time::Duration,
+) -> impl futures_util::Stream<Item = Result<AgentEvent, AgentError>> + Send {
+    async_stream::stream! {
+        let mut current_session: Option<String> = None;
+        loop {
+            match next_sse_event(&mut event_stream, idle_timeout).await {
+                Ok(Some(result)) => {
+                    let terminal = matches!(
+                        &result,
+                        Ok(AgentEvent::Done(_)) | Ok(AgentEvent::Error(_)) | Err(_)
+                    );
+                    match &result {
+                        Ok(AgentEvent::SessionCreated { session_id, .. }) => {
+                            current_session = Some(session_id.clone());
+                            if let Ok(mut map) = store.lock() {
+                                map.insert(session_id.clone(), cancel_token.clone());
+                            }
+                        }
+                        Ok(AgentEvent::Done(_)) | Ok(AgentEvent::Error(_)) | Err(_) => {
+                            if let Some(sid) = current_session.take() {
+                                if let Ok(mut map) = store.lock() {
+                                    map.remove(&sid);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    yield result;
+                    if terminal {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    if let Some(sid) = current_session.take() {
+                        if let Ok(mut map) = store.lock() {
+                            map.remove(&sid);
+                        }
+                    }
+                    break;
+                }
+                Err(_) => {
+                    cancel_token.cancel();
+                    if let Some(sid) = current_session.take() {
+                        if let Ok(mut map) = store.lock() {
+                            map.remove(&sid);
+                        }
+                    }
+                    yield Err(AgentError::Internal(
+                        "agent event stream idle timeout".to_string(),
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// G4:流式执行 agent — 把 `AgentEvent` 流逐个转成 SSE 帧
 ///
 /// 路由:`POST /agents/{agent_type}/run/stream`
@@ -2417,36 +2491,26 @@ async fn run_agent_stream(
     let agent_type_for_index = agent_type.clone();
     let sse_stream = async_stream::stream! {
         let _sse_guard = SseConnectionGuard::new(sse_metrics);
-        let mut event_stream = runner.run_streaming(req.goal, Vec::new());
+        let event_stream = sse_events_with_idle_timeout(
+            runner.run_streaming(req.goal, Vec::new()),
+            store,
+            cancel_token,
+            SSE_IDLE_TIMEOUT,
+        );
+        let mut event_stream = Box::pin(event_stream);
 
-        // G6:在 map 中拦截 SessionCreated(注册 token)/ Done / Error / Err(注销 token)
-        let mut current_session: Option<String> = None;
         while let Some(result) = event_stream.next().await {
-            match &result {
-                Ok(AgentEvent::SessionCreated { session_id, .. }) => {
-                    current_session = Some(session_id.clone());
-                    if let Ok(mut map) = store.lock() {
-                        map.insert(session_id.clone(), cancel_token.clone());
-                    }
-                    // 会话索引落一行(fail-soft,仅展示辅助)
-                    state.session_index().record(
-                        &crate::api::session_index::SessionIndexEntry {
-                            session_id: session_id.clone(),
-                            agent_type: agent_type_for_index.clone(),
-                            created_at: crate::api::session_index::unix_now(),
-                            last_active: crate::api::session_index::unix_now(),
-                            title: index_title.clone(),
-                        },
-                    );
-                }
-                Ok(AgentEvent::Done(_)) | Ok(AgentEvent::Error(_)) | Err(_) => {
-                    if let Some(sid) = current_session.take() {
-                        if let Ok(mut map) = store.lock() {
-                            map.remove(&sid);
-                        }
-                    }
-                }
-                _ => {}
+            if let Ok(AgentEvent::SessionCreated { session_id, .. }) = &result {
+                // 会话索引落一行(fail-soft,仅展示辅助)
+                state.session_index().record(
+                    &crate::api::session_index::SessionIndexEntry {
+                        session_id: session_id.clone(),
+                        agent_type: agent_type_for_index.clone(),
+                        created_at: crate::api::session_index::unix_now(),
+                        last_active: crate::api::session_index::unix_now(),
+                        title: index_title.clone(),
+                    },
+                );
             }
             yield agent_event_to_sse(result);
         }
@@ -5927,6 +5991,48 @@ mod tests {
         let s = format!("{:?}", ev);
         assert!(s.contains("error"));
         assert!(s.contains("stream broke"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sse_idle_timeout_emits_error_cancels_and_cleans_running_session() {
+        let store: SessionStore = std::sync::Arc::new(Mutex::new(HashMap::new()));
+        let cancel_token = CancellationToken::new();
+        let source = async_stream::stream! {
+            yield Ok(AgentEvent::SessionCreated {
+                session_id: "idle-session".to_string(),
+                memory_enabled: false,
+                constitution: None,
+                model: None,
+                temperature: None,
+            });
+            std::future::pending::<()>().await;
+        };
+        let mut stream = Box::pin(sse_events_with_idle_timeout(
+            Box::pin(source),
+            store.clone(),
+            cancel_token.clone(),
+            std::time::Duration::from_secs(10),
+        ));
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(AgentEvent::SessionCreated { .. }))
+        ));
+        assert!(store.lock().unwrap().contains_key("idle-session"));
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(20), stream.next())
+            .await
+            .expect("idle stream must terminate")
+            .expect("idle timeout must produce a terminal error");
+        match terminal {
+            Err(AgentError::Internal(message)) => {
+                assert_eq!(message, "agent event stream idle timeout");
+            }
+            _ => panic!("expected idle timeout error"),
+        }
+        assert!(cancel_token.is_cancelled());
+        assert!(store.lock().unwrap().is_empty());
+        assert!(stream.next().await.is_none());
     }
 
     #[test]

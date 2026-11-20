@@ -5040,6 +5040,101 @@ fn test_unattended_runaway_allows_500_and_pauses_501() {
     assert!(guard.bump(), "第 501 次必须触发既有 Runaway 暂停");
 }
 
+#[tokio::test]
+async fn test_non_streaming_runaway_guard_pauses_before_over_quota_tool() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct CountingTool(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::io_handlers::tool_handler::ToolFunction for CountingTool {
+        async fn call(&self, _args: &serde_json::Value) -> crate::io_handler::IoResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::Value::from("echo"))
+        }
+    }
+
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut handler = ToolHandler::new();
+    let mut manifest = crate::agent::tool_manifest::dynamic_manifest(
+        "echo",
+        crate::agent::tool_manifest::ToolSource::Mcp,
+        "test counting tool".to_string(),
+        serde_json::json!({"type": "object", "properties": {}}),
+    )
+    .expect("test manifest");
+    manifest.adjudication_class = crate::agent::tool_manifest::AdjudicationClass::Standard;
+    handler.register(manifest, Arc::new(CountingTool(executions.clone())));
+
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"session_id": 99}"#)
+        .create_async()
+        .await;
+    server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"/api/shared/facts.*".into()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("[]")
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/api/sessions/99/events")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(concat!(
+            "data: {\"type\":\"IoRequest\",\"id\":1,\"io_type\":\"call_service\",\"params\":{\"tool_name\":\"echo\",\"args\":{}}}\n\n",
+            "data: {\"type\":\"IoRequest\",\"id\":2,\"io_type\":\"call_service\",\"params\":{\"tool_name\":\"echo\",\"args\":{}}}\n\n",
+        ))
+        .create_async()
+        .await;
+    server
+        .mock("POST", "/api/sessions/99/command")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    server
+        .mock("POST", "/api/sessions/99/payload")
+        .with_status(200)
+        .with_body(r#"{"fact_id":1}"#)
+        .create_async()
+        .await;
+    server
+        .mock("POST", "/api/sessions/99/io_response")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let mut runner =
+        AgentRunner::new(AgentConfig::default(), client).with_runaway_policy(Some(RunawayPolicy {
+            max_actions_per_run: 1,
+            restate_conditions: Vec::new(),
+        }));
+    runner.tool_handler = handler;
+
+    let result = runner.run("goal").await.expect("run result");
+    assert!(!result.success, "over-quota action must pause the run");
+    let error = result.error.as_deref().unwrap_or("");
+    assert!(
+        error.contains("Runaway guard tripped") && error.contains("was NOT executed"),
+        "unexpected terminal error: {error}"
+    );
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        1,
+        "the over-quota tool call must not execute"
+    );
+}
+
 #[test]
 fn test_runaway_guard_restored_from_journal_count() {
     // 跨重启回填(修订⑦):按 journal 回填值恢复累计数,阈值不变;
@@ -6764,6 +6859,108 @@ async fn test_non_payload_error_no_trim_no_retry() {
         "现行错误透传面保持: {:?}",
         done.error
     );
+}
+
+#[tokio::test]
+async fn test_cancel_during_llm_stream_commits_turn_end_and_sediment() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let session_id = "s-cancel-llm";
+    let _state = server
+        .mock("GET", format!("/api/sessions/{session_id}/state").as_str())
+        .with_status(200)
+        .with_body(r#"{"payload":{}}"#)
+        .create_async()
+        .await;
+    let digest = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/payload").as_str(),
+        )
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "path": format!("shared.default.work.journal.{session_id}")
+        })))
+        .with_status(200)
+        .with_body(r#"{"fact_id":1}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let _payload = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/payload").as_str(),
+        )
+        .with_status(200)
+        .with_body(r#"{"fact_id":1}"#)
+        .create_async()
+        .await;
+    let _command = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/command").as_str(),
+        )
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    let _events = server
+        .mock("GET", format!("/api/sessions/{session_id}/events").as_str())
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("data: {\"type\":\"IoRequest\",\"id\":1,\"io_type\":\"call_external\",\"params\":{}}\n\n")
+        .create_async()
+        .await;
+    let _io_response = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/io_response").as_str(),
+        )
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create_async()
+        .await;
+    let _llm = server
+        .mock("POST", "/llm/execute-stream")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_chunked_body(|_w| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            Ok(())
+        })
+        .create_async()
+        .await;
+
+    let journal_dir = tempfile::tempdir().unwrap();
+    let llm = LlmHandler::new("mock", &format!("{}/llm/execute", server.url()));
+    let mut runner = AgentRunner::new(AgentConfig::default(), client.clone())
+        .with_llm_handler(llm)
+        .with_memory(crate::agent::memory::MemoryManager::new("default", client))
+        .with_journal_dir(journal_dir.path().to_path_buf());
+    runner.sediment_config.enable_journal_digest = true;
+    let cancel = runner.cancel_token().clone();
+    let mut stream = runner.run_continuation(
+        session_id.to_string(),
+        "cancel while the model is streaming".to_string(),
+        Vec::new(),
+    );
+    let mut done = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(AgentEvent::Step { .. }) => cancel.cancel(),
+            Ok(AgentEvent::Done(result)) => done = Some(result),
+            Err(error) => panic!("cancellation must use Error+Done, got stream Err: {error:?}"),
+            _ => {}
+        }
+    }
+
+    assert!(done.expect("cancellation must emit Done").cancelled);
+    let journal_path =
+        crate::agent::journal::JournalWriter::path_for(journal_dir.path(), session_id);
+    let journal = std::fs::read_to_string(journal_path).expect("read cancellation journal");
+    assert!(journal.contains("\"status\":\"cancelled\""), "{journal}");
+    assert!(!journal.contains("\"status\":\"aborted\""), "{journal}");
+    digest.assert_async().await;
 }
 
 /// H3 墙钟预算是 ReAct 回喂循环顶的看门狗，不是任意 await 的硬 deadline。
