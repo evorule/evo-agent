@@ -270,6 +270,7 @@ pub const SANDBOX_CAPABLE_TOOLS: &[&str] = &[
     "image_load",
     "code_search",
     "read_back",
+    "test_impact",
     "file_write",
     "edit_file",
     "apply_patch",
