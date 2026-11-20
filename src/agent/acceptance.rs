@@ -1039,18 +1039,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let counter = dir.join("counter.txt");
         let cmd = append_counter_cmd(&counter);
-        let t0 = std::time::Instant::now();
         match apply_acceptance_gate(Some(&cmd), &done_args(), None, None, None).await {
             GateOutcome::Allow(a) => {
                 assert_eq!(a["params"]["acceptance_passed"], serde_json::json!(true));
             }
             GateOutcome::Reject(d) => panic!("deterministic criterion must allow: {d}"),
         }
-        assert!(
-            t0.elapsed() >= std::time::Duration::from_millis(1),
-            "criterion must really run (elapsed {:?})",
-            t0.elapsed()
-        );
+        // Execution proof is the side effect below, never a wall-clock
+        // lower bound: spawning the criterion can legitimately finish in
+        // under one millisecond on Linux (~650us for a /bin/sh append), so
+        // an elapsed >= 1ms guard misfires on fast runners. If the gate
+        // returned Allow without running the command, read_to_string
+        // fails here and the test still goes red.
         let content = std::fs::read_to_string(&counter).unwrap();
         let runs = content.lines().filter(|l| !l.trim().is_empty()).count();
         assert_eq!(
