@@ -602,7 +602,7 @@ pub async fn run_assembly_selfproof() -> AssemblySelfProof {
         "instruction_type": "task_done",
         "params": { "acceptance_passed": true }
     });
-    match apply_acceptance_gate(Some("exit 7"), &forged, Some(&pieces), None).await {
+    match apply_acceptance_gate(Some("exit 7"), &forged, Some(&pieces), None, None).await {
         GateOutcome::Reject(_) => sp.forged_flag_rejected = true,
         GateOutcome::Allow(_) => sp.failures.push(
             "probe 1 (forged pass flag): the gate allowed a task_done whose criterion exits non-zero — runner-filled truth was not enforced"
@@ -611,7 +611,7 @@ pub async fn run_assembly_selfproof() -> AssemblySelfProof {
     }
     // Probe 2: a deliberately broken criterion must actually go red.
     let clean = serde_json::json!({ "instruction_type": "task_done", "params": {} });
-    match apply_acceptance_gate(Some("exit 1"), &clean, Some(&pieces), None).await {
+    match apply_acceptance_gate(Some("exit 1"), &clean, Some(&pieces), None, None).await {
         GateOutcome::Reject(d) if d.contains("acceptance criteria not met") => {
             sp.known_bad_criteria_red = true;
         }
@@ -625,7 +625,7 @@ pub async fn run_assembly_selfproof() -> AssemblySelfProof {
     }
     // Probe 3: a non-deterministic criterion must be captured by the dual
     // run and honestly refused.
-    match apply_acceptance_gate(Some(NONDETERMINISTIC_PROBE_CMD), &clean, Some(&pieces), None).await
+    match apply_acceptance_gate(Some(NONDETERMINISTIC_PROBE_CMD), &clean, Some(&pieces), None, None).await
     {
         GateOutcome::Reject(d) if d.contains("non-deterministic") => {
             sp.nondeterminism_captured = true;
