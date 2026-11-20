@@ -856,7 +856,18 @@ mod tests {
         let out = render_service_catalog().expect("注册表非空应渲染");
         assert!(out.contains("## 服务能力目录"));
         assert!(out.contains("zzcat_only"));
-        assert_eq!(out, render_service_catalog().unwrap());
+        // 逐字节一致性以同一注册表快照为输入断言（全局面两次渲染各自读全局
+        // 表，并发用例的注册写落在两次渲染之间即假红——稳定性语义本指
+        // 「同一输入逐字节同输出」，与并发注册面解耦）
+        let snapshot: Vec<String> = {
+            let map = descriptions().read().unwrap();
+            map.keys().cloned().collect()
+        };
+        let refs: Vec<&str> = snapshot.iter().map(String::as_str).collect();
+        assert_eq!(
+            render_service_catalog_from(&refs),
+            render_service_catalog_from(&refs)
+        );
     }
 
     #[test]
@@ -948,10 +959,122 @@ mod tests {
             out.contains("- companion: 规则集 vA 已认证 clean（链 seq=42）"),
             "证书事实行在场: {out}"
         );
-        assert_eq!(out, render_service_catalog().unwrap(), "两次调用逐字节一致");
+        // 逐字节一致性以同一注册表快照为输入断言（全局面两次渲染各自读全局
+        // 表，并发用例的注册写落在两次渲染之间即假红——稳定性语义本指
+        // 「同一输入逐字节同输出」，与并发注册面解耦）
+        let snapshot_cert: Vec<String> = {
+            let map = descriptions().read().unwrap();
+            map.keys().cloned().collect()
+        };
+        let refs_cert: Vec<&str> = snapshot_cert.iter().map(String::as_str).collect();
+        assert_eq!(
+            render_service_catalog_from(&refs_cert),
+            render_service_catalog_from(&refs_cert),
+            "两次调用逐字节一致"
+        );
         // 清槽：未观测语义=目录段不出现证书行
         store_companion_cert_line(None);
         let out = render_service_catalog().unwrap();
         assert!(!out.contains("伴跑证书"), "清槽后证书段退场: {out}");
+    }
+
+    #[test]
+    fn deliverable_services_register_with_registry_contract_and_invoke() {
+        // 确定性交付物管线四件（模板渲染 + 报告/工作簿/文档三导出）按服务
+        // 对账清单的真实契约形态注册：必填参数面随注册缓存（LLM schema 由此
+        // 透出）；直调形状 = POST /api/services/{name}/invoke 且 args 原样透传；
+        // 对账清单未声明参数契约的服务如实降级（不伪造契约）。
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let registry = concat!(
+            r#"[{"name":"template_render","source":"native","sensitive":false,"plugin":"template-services","#,
+            r#""description":"模板渲染(上下文+模板→JSON/Markdown/纯文本,{{}} 家族语法,if/for 最小集,确定性纯函数)","#,
+            r#""parameters":{"type":"object","properties":{"template":{"type":"string","minLength":1,"description":"模板字符串,{{path}} 变量替换+if/for 最小控制流"},"context":{"type":"object","description":"模板变量取值来源对象"},"format":{"type":"string","enum":["text","markdown","json"]}},"required":["template"]}},"#,
+            r#"{"name":"export_report_pdf","source":"native","sensitive":false,"plugin":"export-services","#,
+            r#""description":"报告PDF导出(审计/业务数据→纯Rust文本型PDF渲染→落盘导出目录,返回绝对路径与字节数及blake3内容哈希,幂等覆写)","#,
+            r#""parameters":{"type":"object","properties":{"content_type":{"type":"string","description":"内容类型(必填)"},"business_data":{"description":"业务数据块"},"raw_data":{"type":"array","description":"事实/数据数组"},"meta":{"type":"object","description":"元信息"}},"required":["content_type"]}},"#,
+            r#"{"name":"export_workbook_xlsx","source":"native","sensitive":false,"plugin":"export-services","#,
+            r#""description":"工作簿xlsx导出(多表+表头/整数字符串值域→rust_xlsxwriter确定性渲染,固定文档时间戳,落盘导出目录,返回绝对路径与字节数及blake3内容哈希,幂等覆写)","#,
+            r#""parameters":{"type":"object","properties":{"sheets":{"type":"array","description":"数据表列表"},"provenance":{"type":"array","description":"溯源清单(断言出自哪个服务/入参/信封摘要)"},"filename":{"type":"string","description":"导出文件名"},"title":{"type":"string","description":"工作簿标题"}},"required":["sheets"]}},"#,
+            r#"{"name":"export_document_docx","source":"native","sensitive":false,"plugin":"export-services","#,
+            r#""description":"文档docx导出(标题+段落+表格+溯源表→docx-rs确定性渲染(零时间戳内嵌),落盘导出目录,返回绝对路径与字节数及blake3内容哈希,幂等覆写)"}]"#,
+        );
+        let (base, captured) = spawn_http_fixture(vec![
+            (200, registry),
+            (200, r#"{"status":"ok","data":{"rendered":"Hello world"}}"#),
+        ]);
+        let mut handler = ToolHandler::new();
+        let ev = EvoruleApiClient::new(&base);
+        let all: Vec<String> = [
+            "template_render",
+            "export_report_pdf",
+            "export_workbook_xlsx",
+            "export_document_docx",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let n = rt
+            .block_on(register_service_tools(&mut handler, &ev, &all))
+            .unwrap();
+        assert_eq!(n, 4, "四件交付物服务都应注册为代理工具");
+        for name in &all {
+            assert!(handler.has_tool(name), "服务工具应在场: {name}");
+        }
+
+        // 描述与参数契约随注册缓存（runner 动态 schema 数据源）
+        assert_eq!(
+            service_description("template_render").as_deref(),
+            Some("模板渲染(上下文+模板→JSON/Markdown/纯文本,{{}} 家族语法,if/for 最小集,确定性纯函数)")
+        );
+        assert_eq!(
+            service_parameters("template_render").expect("模板渲染应缓存参数契约")["required"],
+            serde_json::json!(["template"]),
+            "模板渲染必填参数=template"
+        );
+        assert_eq!(
+            service_parameters("export_report_pdf").expect("报告导出应缓存参数契约")["required"],
+            serde_json::json!(["content_type"]),
+            "报告导出必填参数=content_type"
+        );
+        assert_eq!(
+            service_parameters("export_workbook_xlsx").expect("工作簿导出应缓存参数契约")
+                ["required"],
+            serde_json::json!(["sheets"]),
+            "工作簿导出必填参数=sheets"
+        );
+        assert!(
+            service_parameters("export_document_docx").is_none(),
+            "对账清单未声明参数契约的服务不应有伪造契约"
+        );
+
+        // 直调路径：args 原样透传为 invoke 请求体，响应原样返回
+        let args = serde_json::json!({
+            "template": "Hello {{name}}",
+            "context": { "name": "world" },
+            "format": "text"
+        });
+        let out = rt
+            .block_on(handler.execute_by_name("template_render", &args))
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({"status":"ok","data":{"rendered":"Hello world"}})
+        );
+        let cap = captured.lock().unwrap();
+        assert_eq!(cap[0].path, "/api/services", "第一次请求应为服务发现");
+        assert_eq!(
+            cap[1].path, "/api/services/template_render/invoke",
+            "第二次请求应为模板渲染服务直调"
+        );
+        assert_eq!(
+            // serde_json 对象键序为排序序（BTreeMap），args 原样透传的断言
+            // 按序列化后的规范形态比对
+            cap[1].body,
+            r#"{"context":{"name":"world"},"format":"text","template":"Hello {{name}}"}"#,
+            "args 应原样透传为 invoke 请求体"
+        );
     }
 }

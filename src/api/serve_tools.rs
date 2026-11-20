@@ -1530,7 +1530,7 @@ mod tests {
                 let cfg: toml::Value = toml::from_str(
                     r#"
 [evorule]
-service_tools = ["config_persist", "rule_sandbox"]
+service_tools = ["config_persist", "rule_sandbox", "template_render", "export_report_pdf", "export_workbook_xlsx", "export_document_docx"]
 "#,
                 )
                 .unwrap();

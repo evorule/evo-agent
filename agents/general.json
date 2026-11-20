@@ -62,6 +62,8 @@
     "browser_*",
     "mcp_*",
     "inference_*",
+    "export_*",
+    "template_*",
     "edit_file",
     "workspace_undo",
     "web_fetch",

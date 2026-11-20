@@ -21,6 +21,20 @@ base_url = "http://localhost:18080"
 # evorule API key(留空 = evorule 本身无鉴权)
 api_key = ""
 timeout_secs = 30
+# 服务工具白名单:启动时经 GET /api/services 发现,仅注册本列表内的
+# server 插件服务为 agent 代理工具(执行经 POST /api/services/{name}/invoke)。
+# 空列表 = 不注册任何服务工具(安全默认)。
+# 下面是确定性交付物管线推荐白名单:
+# - template_render     模板渲染(上下文+模板→JSON/Markdown/纯文本,确定性纯函数)
+# - export_report_pdf   报告 PDF 导出(纯 Rust 渲染,返回路径/字节数/blake3 内容哈希)
+# - export_workbook_xlsx 工作簿 xlsx 导出(多表+溯源表,固定文档时间戳)
+# - export_document_docx 文档 docx 导出(标题/段落/表格,零时间戳内嵌)
+service_tools = [
+  "template_render",
+  "export_report_pdf",
+  "export_workbook_xlsx",
+  "export_document_docx",
+]
 
 [logging]
 # trace | debug | info | warn | error

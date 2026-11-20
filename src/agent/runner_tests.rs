@@ -588,6 +588,129 @@ async fn test_openai_tools_payload_dynamic_service_schema_carries_parameters() {
     );
 }
 
+#[tokio::test]
+async fn test_openai_tools_payload_deliverable_services_contract_shapes() {
+    // 确定性交付物管线四件进 LLM 契约面：服务对账清单的必填参数与描述
+    // 经服务消费桥注册表透出为动态 schema——模型可带参直调（渲染与三导出）。
+    // 对账清单未声明参数契约的导出服务如实降级空 object（不伪造契约）。
+    let mut server = mockito::Server::new_async().await;
+    let services = serde_json::json!([
+        {
+            "name": "template_render",
+            "source": "native",
+            "plugin": "template-services",
+            "description": "模板渲染(上下文+模板→JSON/Markdown/纯文本,{{}} 家族语法,if/for 最小集,确定性纯函数)",
+            "sensitive": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "template": { "type": "string", "description": "模板字符串" },
+                    "context": { "type": "object", "description": "模板变量取值来源对象" },
+                    "format": { "type": "string", "enum": ["text", "markdown", "json"] }
+                },
+                "required": ["template"]
+            }
+        },
+        {
+            "name": "export_report_pdf",
+            "source": "native",
+            "plugin": "export-services",
+            "description": "报告PDF导出(纯Rust文本型PDF渲染,返回路径/字节数/blake3内容哈希)",
+            "sensitive": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content_type": { "type": "string", "description": "内容类型(必填)" },
+                    "raw_data": { "type": "array", "description": "事实/数据数组" }
+                },
+                "required": ["content_type"]
+            }
+        },
+        {
+            "name": "export_workbook_xlsx",
+            "source": "native",
+            "plugin": "export-services",
+            "description": "工作簿xlsx导出(多表+溯源表,固定文档时间戳)",
+            "sensitive": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sheets": { "type": "array", "description": "数据表列表" },
+                    "provenance": { "type": "array", "description": "溯源清单" }
+                },
+                "required": ["sheets"]
+            }
+        },
+        {
+            "name": "export_document_docx",
+            "source": "native",
+            "plugin": "export-services",
+            "description": "文档docx导出(标题+段落+表格+溯源表,零时间戳内嵌)",
+            "sensitive": false
+        }
+    ])
+    .to_string();
+    server
+        .mock("GET", "/api/services")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(&services)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let mut runner = AgentRunner::new(AgentConfig::default(), client.clone());
+    let names: Vec<String> = [
+        "template_render",
+        "export_report_pdf",
+        "export_workbook_xlsx",
+        "export_document_docx",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let n = crate::service_tools::register_service_tools(&mut runner.tool_handler, &client, &names)
+        .await
+        .unwrap();
+    assert_eq!(n, 4, "四件交付物服务都应注册为代理工具");
+
+    let payload = runner
+        .openai_tools_payload()
+        .expect("注册了动态工具后 tools schema 应存在");
+    let find = |name: &str| {
+        payload
+            .iter()
+            .find(|t| t["function"]["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("schema 应含 {name}"))
+    };
+
+    let tpl = find("template_render");
+    assert_eq!(
+        tpl["function"]["parameters"]["required"],
+        serde_json::json!(["template"]),
+        "模板渲染 schema 必填参数=template"
+    );
+    let pdf = find("export_report_pdf");
+    assert_eq!(
+        pdf["function"]["parameters"]["required"],
+        serde_json::json!(["content_type"]),
+        "报告导出 schema 必填参数=content_type"
+    );
+    let xlsx = find("export_workbook_xlsx");
+    assert_eq!(
+        xlsx["function"]["parameters"]["required"],
+        serde_json::json!(["sheets"]),
+        "工作簿导出 schema 必填参数=sheets"
+    );
+    let docx = find("export_document_docx");
+    assert_eq!(
+        docx["function"]["parameters"],
+        serde_json::json!({ "type": "object", "properties": {} }),
+        "无参数声明的导出服务如实降级空 object"
+    );
+}
+
 // === 清债批(2026-10-25):未接线占位不进 LLM 契约面 ===
 //
 // openai_tools_payload 以 wired_tool_names 为源:占位(unwired)实例从模型
