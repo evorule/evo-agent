@@ -446,6 +446,29 @@ impl EvoruleApiClient {
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
+    /// POST /v1/criticality/verify —— 测量命题验证（临界机判定注入面）。
+    ///
+    /// 请求体 = verify_request/v1.0 命题文档；成功响应 = 三态判定报告
+    /// `{verdict, steps, proposals}`。422（结构化拒因）与 503（law_host
+    /// 未装配）是**业务结果**而非传输错误：body 原样返回（形态
+    /// `{"error":{code,message,detail}}`），调用方按 `error` 键分流；
+    /// 其余非 2xx 走统一错误通道（错误体取 `error` 键，统一口径）。
+    /// 鉴权沿用本 client 现行 token 机制（D3：不新增凭据面）。
+    pub async fn verify_criticality(&self, body: &Value) -> Result<Value, ApiError> {
+        let url = self.core.url("/v1/criticality/verify");
+        let resp = self
+            .core
+            .auth_header(self.core.client().post(&url))
+            .json(body)
+            .send()
+            .await?;
+        let resp = self
+            .core
+            .check_response_full_accept(resp, &[422, 503])
+            .await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
     /// POST /api/admin/shared/compaction —— 服务端共享事实账压实调度（marker 面）
     ///
     /// `mode`: `"archive"`(归档落盘 server 侧 wal_dir) | `"discard"`(仅摘要存根)。
@@ -2253,6 +2276,115 @@ mod tests {
                 );
             }
             other => panic!("应为 ApiError::ApiError{{400,..}}，得到: {other:?}"),
+        }
+        m.assert_async().await;
+    }
+
+    // ===== criticality verify（判定注入面客户端接线）=====
+
+    fn criticality_ok_body() -> &'static str {
+        r#"{"verdict":"stable","steps":[{"step":1,"kind":"law_substitution","target":"newton_second@F","outcome":"consistent","detail":"ok"}]}"#
+    }
+
+    #[tokio::test]
+    async fn test_verify_criticality_passes_report_through() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/v1/criticality/verify")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(criticality_ok_body())
+            .create_async()
+            .await;
+        let client = EvoruleApiClient::new(&server.url());
+        let body = serde_json::json!({"$schema": "https://evorule.org/schemas/criticality/verify_request/v1.0.json"});
+        let report = client
+            .verify_criticality(&body)
+            .await
+            .expect("report must pass through");
+        assert_eq!(report["verdict"], serde_json::json!("stable"));
+        assert_eq!(
+            report["steps"][0]["kind"],
+            serde_json::json!("law_substitution")
+        );
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_verify_criticality_422_structured_error_body_returned_as_is() {
+        // 422 = 结构化拒因（业务结果非传输错误）：body 原样返回，error 键在
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/v1/criticality/verify")
+            .with_status(422)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"error":{"code":"verify_rejected","message":"命题结构拒收（1 项）","detail":{"errors":["主张 `F` 的 si_unit 不可解析"]}}}"#,
+            )
+            .create_async()
+            .await;
+        let client = EvoruleApiClient::new(&server.url());
+        let body = serde_json::json!({"$schema": "https://evorule.org/schemas/criticality/verify_request/v1.0.json"});
+        let report = client
+            .verify_criticality(&body)
+            .await
+            .expect("422 is a business result, not a transport error");
+        assert_eq!(
+            report["error"]["code"],
+            serde_json::json!("verify_rejected")
+        );
+        assert_eq!(
+            report["error"]["detail"]["errors"][0],
+            serde_json::json!("主张 `F` 的 si_unit 不可解析")
+        );
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_verify_criticality_503_law_host_body_returned_as_is() {
+        // 503 = law_host 未装配（业务结果）：可读错误透传给调用方分流
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/v1/criticality/verify")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"error":{"code":"law_host_not_configured","message":"law_set 装配未配置","detail":null}}"#,
+            )
+            .create_async()
+            .await;
+        let client = EvoruleApiClient::new(&server.url());
+        let body = serde_json::json!({"$schema": "https://evorule.org/schemas/criticality/verify_request/v1.0.json"});
+        let report = client
+            .verify_criticality(&body)
+            .await
+            .expect("503 is a business result, not a transport error");
+        assert_eq!(
+            report["error"]["code"],
+            serde_json::json!("law_host_not_configured")
+        );
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_verify_criticality_401_surfaces_error_key() {
+        // 401 走统一错误通道：错误体取 `error` 键（统一口径）
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/v1/criticality/verify")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"unauthorized"}"#)
+            .create_async()
+            .await;
+        let client = EvoruleApiClient::new(&server.url());
+        let body = serde_json::json!({"$schema": "https://evorule.org/schemas/criticality/verify_request/v1.0.json"});
+        match client.verify_criticality(&body).await {
+            Err(ApiError::ApiError { status, message }) => {
+                assert_eq!(status, 401);
+                assert_eq!(message, "unauthorized", "error 键文案应透出");
+            }
+            other => panic!("应为 ApiError::ApiError{{401,..}}，得到: {other:?}"),
         }
         m.assert_async().await;
     }

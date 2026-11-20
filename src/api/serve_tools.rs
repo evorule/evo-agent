@@ -88,9 +88,11 @@ const RULE_TOOL_NAMES: &[&str] = &[
     "explain_denial",
     "causal_order",
     "lineage_of",
+    // 临界机验证 (1,测量命题确定性三态判定回路,判定只读)
+    "criticality_verify",
 ];
 
-/// 构建 union toolkit(内置 17 + 规则 45 = 62 工具,启动时一次组装)
+/// 构建 union toolkit(内置 17 + 规则 46 = 63 工具,启动时一次组装)
 ///
 /// 在 `cmd_serve` 启动时调用一次,结果存入 `AgentApiState.toolkit`。
 pub fn build_union_toolkit(
@@ -1264,7 +1266,7 @@ mod tests {
         let (ws, ev) = make_clients();
         let union = build_union_toolkit(Path::new("."), &ws, &ev);
         let all = all_rule_tool_names();
-        assert_eq!(all.len(), 60, "rule tool spec count drift");
+        assert_eq!(all.len(), 61, "rule tool spec count drift");
         let mut settings = serde_json::Map::new();
         settings.insert(
             "agentTools.governanceWrite".to_string(),
@@ -1284,8 +1286,8 @@ mod tests {
             .collect();
         assert_eq!(
             keep.len(),
-            38,
-            "readonly surface must keep exactly 38 tools"
+            39,
+            "readonly surface must keep exactly 39 tools"
         );
         // 37 只读 spec 中不在 serve union 面者本就不被 serve(与开关无关),
         // 只断言 union 内只读工具全保留
@@ -1412,7 +1414,7 @@ mod tests {
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 69, "expected 69 total tool names");
+        assert_eq!(all_names.len(), 70, "expected 70 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),

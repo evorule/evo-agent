@@ -210,7 +210,7 @@ port = 8081
 - [docs/API.md](docs/API.md) — full HTTP API reference (endpoints, WebSocket, auth model)
 - [docs/WORKBENCH_API.md](docs/WORKBENCH_API.md) — Web IDE workbench protocol
 - [docs/CLI.md](docs/CLI.md) — complete CLI reference: run/repl/replay/patrol/workflow semantics, DSL versions, replan/plan-execute
-- [docs/TOOLS.md](docs/TOOLS.md) — complete tool-system reference: 3-tier security model, built-in 15, rule-management toolkit (52), source switches and adjudication tiers, per-agent whitelists
+- [docs/TOOLS.md](docs/TOOLS.md) — complete tool-system reference: 3-tier security model, built-in 15, rule-management toolkit (53), source switches and adjudication tiers, per-agent whitelists
 - [docs/SKILLS.md](docs/SKILLS.md) — skills system reference: governed supply chain (declared + registered paths), three-state ledger with journal and boot-scoped signing, approval gates, freshness stamps, operations and troubleshooting
 - [docs/approval-policy.md](docs/approval-policy.md) — tool approval policy
 - [docs/security/THREAT_MODEL.md](docs/security/THREAT_MODEL.md) — threat model
@@ -230,7 +230,7 @@ port = 8081
 | **CANDIDATE** | LLM wants it → proposal → user approval → executes | rm, mv, sed, chmod and 20 shell commands; any public HTTP host |
 | **BLOCKED** | never approved | sudo, python, bash, curl, kill and 35 escape-class commands; SSRF blacklisted IP ranges |
 
-Additional layers: working-directory sandbox for all file tools (rejects `..` / absolute paths / symlink escapes), SSRF protection on HTTP, source-level switches for dynamic tools (MCP / service proxy) with independent adjudication tiers (default `sensitive`: every call is intent-adjudicated by governance rules and leaves an account entry — see [docs/TOOLS.md](docs/TOOLS.md)), and a governance-write switch that can take all 21 rule-write tools offline for sensitive deployments. Tool totals: 60 by spec count (test-locked); the default serve surface exposes 63 = 17 built-in + 46 rule tools.
+Additional layers: working-directory sandbox for all file tools (rejects `..` / absolute paths / symlink escapes), SSRF protection on HTTP, source-level switches for dynamic tools (MCP / service proxy) with independent adjudication tiers (default `sensitive`: every call is intent-adjudicated by governance rules and leaves an account entry — see [docs/TOOLS.md](docs/TOOLS.md)), and a governance-write switch that can take all 21 rule-write tools offline for sensitive deployments. Tool totals: 61 by spec count (test-locked); the default serve surface exposes 64 = 17 built-in + 47 rule tools.
 
 **Zero unsafe**: `#![forbid(unsafe_code)]` is enforced in all modules.
 
