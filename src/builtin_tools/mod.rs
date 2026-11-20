@@ -94,6 +94,7 @@ pub mod search_files;
 pub mod shell_exec;
 pub mod shell_net_guard;
 pub mod skill_read;
+pub mod test_impact;
 pub mod todo;
 pub mod tool_result_fetch;
 pub mod web_fetch;
@@ -347,6 +348,12 @@ fn default_safe_toolkit_core(
     handler.register_static(
         env_doctor::ENV_DOCTOR_TOOL,
         Arc::new(env_doctor::EnvDoctorTool::new(workdir_buf.clone())),
+    );
+    // 变更→测试建议(只读;惯例映射+磁盘存在性核实,只建议不执行——
+    // 执行仍走 build_check/shell_exec 审批链)
+    handler.register_static(
+        test_impact::TEST_IMPACT_TOOL,
+        Arc::new(test_impact::TestImpactTool::new(workdir_buf.clone())),
     );
     // dev-feedback P0a 余量:后台作业轮询面(与 shell_exec background=true
     // 启动面配对;同一进程级注册表;零新命令执行面)
@@ -1246,6 +1253,20 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
             name: "env_doctor".to_string(),
             description: crate::builtin_tools::env_doctor::env_doctor_description(),
             parameters: vec![],
+        },
+        ToolSpec {
+            name: "test_impact".to_string(),
+            description: crate::builtin_tools::test_impact::test_impact_description(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "paths".to_string(),
+                    r#type: "array".to_string(),
+                    description: "Changed file paths relative to the workspace root \
+                                  (supported: .py, .rs, .ts/.tsx/.js/.jsx; cap 20)."
+                        .to_string(),
+                    required: true,
+                },
+            ],
         },
         ToolSpec {
             name: "http_get".to_string(),

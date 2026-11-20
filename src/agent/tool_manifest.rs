@@ -523,6 +523,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 编程环境预检(只读探针矩阵:cargo/rustc/git/python/pytest/node
         // 版本查询零写面,ReadOnly 显式标定;环境缺口动手前显式暴露)
         b("env_doctor", vec![Process]),
+        // 变更→测试建议(只读;惯例映射+磁盘存在性,只建议不执行——模型
+        // 给路径不给命令,执行面在 build_check/shell_exec 审批链)
+        b("test_impact", vec![FsRead]),
         // dev-feedback P2: 多 worktree 自动化(并行任务隔离的机制化承载;
         // 建仓检出保护/脏树 fail-visible/分支名白名单;GitWrite 域,
         // 审批走基线档)
@@ -657,7 +660,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             | "code_search" | "codegraph" | "chain_status" | "git_status" | "git_diff"
             | "git_log" | "query_journal" | "query_trace" | "read_back" | "diff_runs"
             | "read_skill" | "memory_recall" | "audit_query" | "audit_summary" | "todo_read"
-            | "handover_read" | "web_search" | "lsp" | "env_doctor" => {
+            | "handover_read" | "web_search" | "lsp" | "env_doctor" | "test_impact" => {
                 m.side_effect = EffectClass::ReadOnly;
             }
             _ => {}
@@ -1203,9 +1206,9 @@ mod tests {
         //     数量锁 116→117，server 不在 PATH=fail-visible 带安装指引）
         //   （编程环境预检 env_doctor +1：Process 域 ReadOnly 标定，
         //     数量锁 117→118，版本查询探针零写面）
-        assert_eq!(builtin_manifests().len(), 50);
+        assert_eq!(builtin_manifests().len(), 51);
         assert_eq!(rule_manifests().len(), 60);
-        assert_eq!(all().len(), 118);
+        assert_eq!(all().len(), 119);
     }
 
     #[test]
@@ -1248,7 +1251,7 @@ mod tests {
         names.extend(memory_manifests().iter().map(|m| m.name.clone()));
         // 数量锁(与模块头「内置+规则+delegate+memory」演进同源;计数漂移
         // 此处当场红)
-        assert_eq!(names.len(), 118, "static manifest count lock");
+        assert_eq!(names.len(), 119, "static manifest count lock");
         let mut sorted = names.clone();
         sorted.sort();
         let before = sorted.len();
@@ -1387,7 +1390,7 @@ mod tests {
             .filter(|m| m.side_effect == EffectClass::ReadOnly)
             .map(|m| m.name.as_str())
             .collect();
-        assert_eq!(readonly.len(), 32, "ReadOnly 标定数锁: {:?}", readonly);
+        assert_eq!(readonly.len(), 33, "ReadOnly 标定数锁: {:?}", readonly);
         let look = |n: &str| lookup_static(n).unwrap().side_effect;
         // 内置只读族抽样
         assert_eq!(look("file_read"), EffectClass::ReadOnly);
