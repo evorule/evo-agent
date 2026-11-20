@@ -38,8 +38,23 @@ if ($freshProp) {
     }
 }
 
+$extra = @{}
+if ($svc.env_file -and (Test-Path $svc.env_file)) {
+    foreach ($line in Get-Content $svc.env_file -Encoding utf8) {
+        if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$') {
+            $val = $Matches[2]
+            if (($val.StartsWith('"') -and $val.EndsWith('"') -and $val.Length -ge 2) -or
+                ($val.StartsWith("'") -and $val.EndsWith("'") -and $val.Length -ge 2)) {
+                $val = $val.Substring(1, $val.Length - 2)
+            }
+            $extra[$Matches[1]] = $val
+        }
+    }
+    Write-Host ("[ops] 已从 {0} 注入环境变量(仅键名): {1}" -f $svc.env_file, (($extra.Keys | Sort-Object) -join ', '))
+}
+
 $p = Start-OpsDetached -Exe $svc.exe -ArgLine $svc.args -Workdir $svc.workdir `
-    -StdoutLog (Join-Path $cfg.log_dir 'evorule-server.log')
+    -StdoutLog (Join-Path $cfg.log_dir 'evorule-server.log') -ExtraEnv $extra
 Start-Sleep -Seconds 1
 if (Wait-OpsProbe -Probe $svc.probe -TimeoutSec 10) {
     Write-Host "[ops] evorule-server 已启动 pid=$($p.Id), 探活通过"
