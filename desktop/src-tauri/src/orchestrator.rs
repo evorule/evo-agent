@@ -72,6 +72,8 @@ pub struct LaunchContext<'a> {
     /// 双侧，不落盘/不进命令行/不进日志——sediment 受信通道写受保护域用；
     /// serve 侧捕获后即从自身 env 面清除，工作区子进程不可见）
     pub service_token: &'a str,
+    /// 独立桌面 worker 令牌；仅 shell 与 serve 经 env 持有，不进入通用鉴权列表。
+    pub desktop_worker_token: &'a str,
     pub version: &'a str,
     pub job: &'a Arc<JobHandle>,
     /// 自收编是否成功（决定子进程要不要逐个收编）
@@ -811,6 +813,7 @@ fn spawn_serve(
         ctx.engine_token,
         ctx.executor_token,
         ctx.service_token,
+        ctx.desktop_worker_token,
     );
     serve_cmd
         .stdout(Stdio::from(serve_log))
@@ -828,7 +831,7 @@ fn spawn_serve(
 /// serve 命令构造（与拉起分离，供契约测试检视参数面/env 面）：鉴权令牌
 /// 只经 env 载体传递——命令行对本机所有进程可读，令牌上账面即暴露；
 /// serve 侧固化进 auth_config 后即清除自身 env 副本（引擎令牌同款纪律）。
-#[allow(clippy::too_many_arguments)] // 令牌四枚+端口三枚均为编排必需，结构体化反增噪音
+#[allow(clippy::too_many_arguments)] // 令牌五枚+端口三枚均为编排必需，结构体化反增噪音
 fn build_serve_command(
     paths: &ResolvedPaths,
     serve_port: u16,
@@ -839,6 +842,7 @@ fn build_serve_command(
     engine_token: &str,
     executor_token: &str,
     service_token: &str,
+    desktop_worker_token: &str,
 ) -> Command {
     // 38 号方案 X:agent 能力边界根(用户工作文件夹)与编排 workdir(runtime)
     // 解耦——用户文件夹缺省自动创建,用户在向导/设置里改过则以偏好为准
@@ -872,6 +876,8 @@ fn build_serve_command(
         // 以此写 evorule；serve 启动期捕获进 ApiCore 后即从 env 面清除，
         // python_exec/shell_exec 等工作区子进程不可见
         .env("EVORULE_SERVICE_TOKEN", service_token)
+        // 桌面 worker 独立令牌：仅用于内部反向长轮询，绝不并入通用鉴权列表。
+        .env("EVO_AGENT_DESKTOP__WORKER_TOKEN", desktop_worker_token)
         // serve 鉴权令牌：经 env 载体传递，命令行零出现（serve 侧读入
         // auth_config 后即从 env 面清除，子进程不可见）。token 拓扑面：
         // 两把令牌——serve_token（UI 令牌,注入 webview,特权类）+ ops_token
@@ -1417,6 +1423,7 @@ mod tests {
             "engine-token-secret",
             "exec-token-secret",
             "svc-token-secret",
+            "desktop-worker-token-secret",
         );
         let args: Vec<String> = cmd
             .get_args()
@@ -1451,6 +1458,13 @@ mod tests {
             env_val("EVORULE_LLM_EXECUTOR_TOKEN").as_deref(),
             Some("exec-token-secret")
         );
+        assert_eq!(
+            env_val("EVO_AGENT_DESKTOP__WORKER_TOKEN").as_deref(),
+            Some("desktop-worker-token-secret")
+        );
+        assert!(!env_val("EVO_AGENT_AUTH__TOKENS")
+            .unwrap()
+            .contains("desktop-worker-token-secret"));
         std::fs::remove_dir_all(&paths.data_dir).ok();
     }
 
@@ -1643,7 +1657,9 @@ mod tests {
         assert!(providers[0]["models"].as_array().unwrap().len() >= 1);
         assert_eq!(providers[1]["name"], "kimi");
         // 目录模型描述随路由节透传（deepseek/kimi 目录成员各带定位副标题）
-        let desc = v["model_descriptions"].as_object().expect("descriptions emitted");
+        let desc = v["model_descriptions"]
+            .as_object()
+            .expect("descriptions emitted");
         assert!(desc.contains_key("deepseek-chat"));
         assert!(desc.contains_key("kimi-k3.1-pro"));
         // 零落盘红线延伸：路由节同样不得出现 key 本体
@@ -1666,10 +1682,7 @@ mod tests {
         let raw = std::fs::read_to_string(paths.runtime_dir.join("ai-plugin.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(v.get("llm_providers").is_none(), "无 key 不生成路由节");
-        assert!(
-            v.get("model_descriptions").is_none(),
-            "无 key 不生成描述节"
-        );
+        assert!(v.get("model_descriptions").is_none(), "无 key 不生成描述节");
         assert!(read_primary_llm_key(&paths).is_none());
         std::fs::remove_dir_all(&paths.data_dir).ok();
     }

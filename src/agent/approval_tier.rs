@@ -648,6 +648,10 @@ impl TieredApproval {
 #[async_trait]
 impl ApprovalCallback for TieredApproval {
     async fn request_approval(&self, req: &ApprovalRequest) -> ApprovalDecision {
+        // 桌面控制不消费工作区清单，命中任何条目仍逐次询问。
+        if req.tool_name == "desktop_act" {
+            return self.inner.request_approval(req).await;
+        }
         // ===== 判据②（设计 §3.2 T0 判据②）：工作区内写面默认 T0 =====
         // 默认规则不依赖 allowlist 配置（文件缺失时依然生效——本批行为变更
         // 点：默认档下工作区内写由「弹卡」变「静默」，项目方开工令授权）；
@@ -1254,6 +1258,22 @@ mod tests {
         assert_eq!(d.approver, "workspace-allowlist");
         assert!(d.reason.contains("T0"));
         assert!(!d.auto_rejected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_decorator_desktop_act_ignores_allow_hit() {
+        let dir = std::env::temp_dir().join(format!("evo-al-dec-desktop-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".evo")).unwrap();
+        std::fs::write(
+            dir.join(".evo").join("approval-allowlist.json"),
+            r#"{"version":1,"allow":[{"tool":"desktop_act","prefix":"invoke"}]}"#,
+        )
+        .unwrap();
+        let dec = TieredApproval::new(Arc::new(DenyAll), &dir);
+        let d = dec.request_approval(&req("desktop_act", "invoke")).await;
+        assert!(!d.approved);
+        assert_ne!(d.approver, "workspace-allowlist");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

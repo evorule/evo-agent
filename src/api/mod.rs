@@ -12,6 +12,7 @@ pub mod completion_api;
 pub mod console_proxy;
 pub mod console_sidecar;
 pub mod dap_api;
+pub mod desktop_bridge;
 pub mod equilibrium_api;
 pub mod evorule_client;
 pub mod file_api;
