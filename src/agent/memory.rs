@@ -3569,6 +3569,11 @@ impl MemoryManager {
         self.recipe = Some(recipe);
     }
 
+    /// D8 错误→经验蒸馏配置读取（门在 recipe；None/未启用=关）
+    pub fn error_distill_config(&self) -> Option<crate::agent::recipe::ErrorDistill> {
+        self.recipe.as_ref().and_then(|r| r.error_distill.clone())
+    }
+
     /// R1:检索策略上下文——召回入口单点构造
     /// (Recipe 在位=三因子加权;None=词法 legacy,行为与历史逐字节一致)
     pub(crate) fn recipe_policy(&self) -> crate::agent::recipe::RetrievalPolicy {

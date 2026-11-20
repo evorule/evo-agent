@@ -475,6 +475,9 @@ pub struct MemoryRecipe {
     /// 跨源检索源启用开关（注册规格策略面；缺省=全关，既有 agent 零影响）
     #[serde(default)]
     pub sources: SourcesSection,
+    /// 错误→经验自动蒸馏（工具族设计档 D8；缺省关=既有 agent 零影响）
+    #[serde(default)]
+    pub error_distill: Option<ErrorDistill>,
     /// 矛盾裁决配置（F-612；缺省 enabled=false 既有 agent 零影响）
     #[serde(default)]
     pub adjudication: AdjudicationConfig,
@@ -531,6 +534,7 @@ impl Default for MemoryRecipe {
             },
             tools: ToolsSection::default(),
             sources: SourcesSection::default(),
+            error_distill: None,
             adjudication: AdjudicationConfig::default(),
             promote_gate: PromoteGateConfig::default(),
             lex_ttl_secs: None,
@@ -602,6 +606,28 @@ pub struct RetrievalPolicy {
     pub staleness_decay: Option<StalenessDecay>,
     /// 族帽（工具族设计档 A3；None=关态零变化）
     pub family_cap: Option<u32>,
+}
+
+/// 错误→经验自动蒸馏配置（D8）：同工作区「红→绿」检查循环经 runner
+/// 蒸馏为 stable fact（键 `llm.errorfix.<sig>`，带 as_of）。缺省关=零变化。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ErrorDistill {
+    /// 是否启用
+    pub enabled: bool,
+    /// 蒸馏事实环形帽（本进程队列上限；超出丢弃最旧待蒸馏候选）
+    #[serde(default = "default_error_distill_cap")]
+    pub cap: usize,
+}
+
+fn default_error_distill_cap() -> usize {
+    5
+}
+
+/// D8 门（工具侧消费口）：策略在位且启用才返回配置，否则 None=关。
+pub fn error_distill_gate() -> Option<ErrorDistill> {
+    current_published_recipe()
+        .and_then(|r| r.error_distill)
+        .filter(|d| d.enabled)
 }
 
 impl RetrievalPolicy {
@@ -914,5 +940,25 @@ mod tests {
         // 缺字段 → 红（形状不完整显式拒绝，不静默）
         let err = verify_snapshot_against(&serde_json::json!({}), &local).unwrap_err();
         assert!(err.contains("recipe_version"), "{err}");
+    }
+
+    #[test]
+    fn error_distill_defaults_off_and_absent_field_parses() {
+        // 缺省不变式:default recipe 无 error_distill(=关=现行为零变化)
+        let r = MemoryRecipe::default();
+        assert!(r.error_distill.is_none());
+        // 反序列化缺字段 = None(serde Option 免 attr 口径,同 family_cap)
+        let v = serde_json::json!({"sources": {}});
+        let parsed: MemoryRecipe = serde_json::from_value(v).unwrap();
+        assert!(parsed.error_distill.is_none());
+        // 显式启用形态可读
+        let v2 = serde_json::json!({
+            "sources": {},
+            "error_distill": {"enabled": true, "cap": 3},
+        });
+        let parsed2: MemoryRecipe = serde_json::from_value(v2).unwrap();
+        let cfg = parsed2.error_distill.expect("enabled form parses");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.cap, 3);
     }
 }

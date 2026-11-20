@@ -22,6 +22,7 @@ pub mod context_window;
 pub mod definition;
 pub mod delegate;
 pub mod driver;
+pub mod error_distill;
 pub mod event_ledger;
 pub mod evid;
 pub mod governance;
