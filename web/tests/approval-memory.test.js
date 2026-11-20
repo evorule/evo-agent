@@ -100,6 +100,14 @@ describe('会话记忆三档判定', () => {
     clearSessionMemory();
     expect(autoApprovalVerdict('shell_exec', 'find x', [])).toBe('ask');
   });
+
+  it('桌面控制不记录会话放行,会话与工作区记忆均恒拒绝自动批准', () => {
+    recordSessionAllow('desktop_act', 'invoke');
+    expect(autoApprovalVerdict('desktop_act', 'invoke', [])).toBe('deny');
+    expect(
+      autoApprovalVerdict('desktop_act', 'invoke', [{ tool: 'desktop_act', prefix: 'invoke' }]),
+    ).toBe('deny');
+  });
 });
 
 describe('工作区放行清单读写', () => {
@@ -139,6 +147,15 @@ describe('工作区放行清单读写', () => {
     await addWorkspaceAllow('python_exec', 'python scripts/x.py');
     expect(writeFile).toHaveBeenCalledTimes(2);
     expect(JSON.parse(disk[ALLOWLIST_PATH]).allow.length).toBe(2);
+  });
+
+  it('桌面控制拒绝写入工作区放行清单', async () => {
+    await expect(addWorkspaceAllow('desktop_act', 'invoke')).rejects.toThrow(
+      '桌面控制仅支持逐次人工批准',
+    );
+    expect(readFile).not.toHaveBeenCalled();
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(get(workspaceAllowlist)).toEqual([]);
   });
 
   it('addWorkspaceAllow:读-改-写保全未知字段(deny/tier/workspace_root 原样回写)', async () => {

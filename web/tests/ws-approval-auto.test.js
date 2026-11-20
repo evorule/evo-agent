@@ -167,6 +167,24 @@ describe('自动批准 POST 409 no_pending_item 静默收卡(后端 T0 已决)',
   });
 });
 
+describe('桌面控制逐次人工审批', () => {
+  it('命中工作区清单仍只建人工待批卡,不自动提交批准', async () => {
+    workspaceAllowlist.set([{ tool: 'desktop_act', prefix: 'invoke' }]);
+    MockWebSocket.last.deliver({
+      type: 'ApprovalRequired',
+      tool_name: 'desktop_act',
+      command: 'invoke',
+      risk: 'high',
+      proposal_id: 'p-desktop-manual',
+    });
+    await flush();
+    expect(approveProposal).not.toHaveBeenCalled();
+    const cards = msgOf('approval');
+    expect(cards).toHaveLength(1);
+    expect(cards[0].proposalId).toBe('p-desktop-manual');
+  });
+});
+
 describe('approver=workspace-allowlist 回执映射(后端 T0 静默批准)', () => {
   it('pending 卡收场转「已批准(工作区清单)」回执,信息条不再双写', async () => {
     // 清单镜像为空(未加载/加载失败)→ 前端判 ask 推待批卡,后端 T0 已决;

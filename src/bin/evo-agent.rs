@@ -3158,6 +3158,11 @@ fn cmd_serve(
     use tower_http::cors::CorsLayer;
     use tower_http::limit::RequestBodyLimitLayer;
 
+    // Capture and scrub the dedicated worker credential before any child process
+    // can inherit it. This token is never added to the general API token set.
+    let desktop_bridge =
+        evo_agent::api::desktop_bridge::DesktopBridge::from_env().map(std::sync::Arc::new);
+
     // 1. 加载配置(宽松模式:server 启动不需要 LLM API key,只在 run 时才需要)
     //    (.env 已在 main 入口统一加载,serve 不再单独处理)
     let mut config = match evo_agent::config::Config::load_lenient(workdir) {
@@ -3411,6 +3416,9 @@ fn cmd_serve(
         &workspace_client,
         &evorule_client,
     );
+    if let Some(bridge) = desktop_bridge.clone() {
+        evo_agent::builtin_tools::desktop::rebind_desktop_tools(&mut toolkit, bridge);
+    }
     // 多线程 runtime 提前到启动期注册/连接之前构建——service-tools
     // 注册与 MCP 连接直接在本 runtime 上 block_on 驱动（本函数整体运行在
     // 16MB 大栈线程，见 main() 的 run_with_big_stack 包装），连接产物（含
@@ -3666,6 +3674,9 @@ fn cmd_serve(
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
     );
+    if let Some(bridge) = desktop_bridge.clone() {
+        state = state.with_desktop_bridge(bridge);
+    }
     // 状态根接线:read-root / agent-root 独立注入(桌面壳只传 --agent-root,
     // 注入不得被 read-root 缺席阻断;缺省 None=零变化)
     state = evo_agent::api::agent_api::wire_state_roots(state, read_root_buf, agent_root_buf);
@@ -3952,7 +3963,13 @@ fn cmd_serve(
         .layer(RequestBodyLimitLayer::new(1024 * 1024))
         // S4 附件上传面:全局 1MB 钳制之后 merge 注入(后 merge 的路由不受
         // 既有 layer 约束),子路由自带 14MB 限层与同款 G7 鉴权
-        .merge(agent_api::upload_router_with_auth(state, auth_config).layer(cors_layer));
+        .merge(agent_api::upload_router_with_auth(state, auth_config).layer(cors_layer.clone()));
+    // The internal worker surface has independent authentication and a 4 MiB
+    // completion limit. It must remain outside both general auth and the 1 MiB layer.
+    let app = match desktop_bridge {
+        Some(bridge) => app.merge(evo_agent::api::desktop_bridge::router(bridge).layer(cors_layer)),
+        None => app,
+    };
 
     // serve 面限流(对标 evorule-server 生产档 200 req/s per-IP;--no-rate-limit
     // 豁免)。GovernorLayer 泛型不可存 Option 变量,server 同款 match 分支装配;

@@ -11,6 +11,7 @@
 //   6. 关窗缺省最小化到托盘（shell.toml [ui].close_directly 可配直接退出）；
 //      退出走两段式优雅停（Ctrl+C → 5s 超时强杀）+ KILL_ON_JOB_CLOSE 兜底
 
+mod desktop_worker;
 mod health;
 mod job;
 mod orchestrator;

@@ -562,6 +562,7 @@ impl AutoDecisionGuardApproval {
 impl ApprovalCallback for AutoDecisionGuardApproval {
     async fn request_approval(&self, req: &ApprovalRequest) -> ApprovalDecision {
         let guarded = match req.tool_name.as_str() {
+            "desktop_act" => true,
             "python_exec" => {
                 let code = req.args.get("code").and_then(|v| v.as_str()).unwrap_or("");
                 crate::agent::approval_tier::hits_escape_intent(code)
@@ -1075,6 +1076,21 @@ mod tests {
             .request_approval(&guard_req("shell_exec", json!({}), ""))
             .await;
         assert!(!d.approved);
+    }
+
+    #[tokio::test]
+    async fn test_auto_decision_guard_desktop_act_always_uses_manual() {
+        let cb = AutoDecisionGuardApproval::new(Arc::new(PolicyApproval), Arc::new(DenyAll));
+        let d = cb
+            .request_approval(&guard_req(
+                "desktop_act",
+                json!({"observation_id": "obs-1", "target_id": "target-1", "action": "invoke"}),
+                "invoke",
+            ))
+            .await;
+        assert!(!d.approved);
+        assert_eq!(d.approver, "auto");
+        assert!(d.reason.contains("auto_decision_guard"));
     }
 
     #[tokio::test]

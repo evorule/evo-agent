@@ -70,6 +70,7 @@ const sessionAllows = new Set(); // 键:`${tool}|${prefix}`
 
 /** 登记会话内放行(用户点「本会话内允许」时调用) */
 export function recordSessionAllow(tool, command) {
+  if (tool === 'desktop_act') return;
   const prefix = commandPrefix(command);
   if (tool && prefix) sessionAllows.add(`${tool}|${prefix}`);
 }
@@ -155,6 +156,7 @@ export async function loadAllowlist() {
 /** 追加工作区放行项并落盘(读-改-写保真:deny/tier/workspace_root 等未知
  *  字段原样回写;同项幂等;失败抛错由调用方留痕) */
 export async function addWorkspaceAllow(tool, command) {
+  if (tool === 'desktop_act') throw new Error('桌面控制仅支持逐次人工批准');
   const prefix = commandPrefix(command);
   if (!tool || !prefix) throw new Error('放行项不完整:工具与前缀均不可为空');
   const doc = await readAllowlistDoc();
@@ -179,6 +181,7 @@ export async function addWorkspaceAllow(tool, command) {
 /** 自动批准判定(纯函数版,清单由调用方注入):返回
  *  'deny'(守卫命中,必问) | 'session' | 'workspace' | 'ask'(必问)。 */
 export function autoApprovalVerdict(tool, command, allowEntries) {
+  if (tool === 'desktop_act') return 'deny';
   if (isAutoDeny(command)) return 'deny';
   const prefix = commandPrefix(command);
   if (!prefix) return 'deny';

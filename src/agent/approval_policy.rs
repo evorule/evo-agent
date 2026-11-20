@@ -299,6 +299,10 @@ impl PolicyReview {
 #[async_trait]
 impl ApprovalCallback for PolicyReview {
     async fn request_approval(&self, req: &ApprovalRequest) -> ApprovalDecision {
+        // 桌面控制只允许逐次人工批准，条件、机械评审、LLM 评审与豁免均不可放行。
+        if req.tool_name == "desktop_act" {
+            return self.fallback.request_approval(req).await;
+        }
         // 1. 红线豁免：默认任何档位强制人工；用户显式关闭（override=true）
         //    仅解除强制，评审留痕必须携带 exemption_overridden 标记
         let red_line = hits_red_line_for_request(req);
@@ -1960,6 +1964,30 @@ max_actions_per_run = 200
         .await;
         assert!(!d.approved);
         assert_eq!(d.approver, "manual-fallback");
+    }
+
+    #[tokio::test]
+    async fn desktop_act_falls_back_before_review_even_with_exemption_override() {
+        let invoker = MockInvoker::new(vec![]);
+        let fallback = FallbackSpy::new();
+        let review = PolicyReview::new(
+            policy_with_conditions(3),
+            invoker.clone(),
+            fallback.clone(),
+            true,
+            None,
+        );
+        let d = review
+            .request_approval(&review_req(
+                "desktop_act",
+                "invoke",
+                serde_json::json!({"observation_id": "obs-1", "target_id": "target-1"}),
+            ))
+            .await;
+        assert!(!d.approved);
+        assert_eq!(d.approver, "manual-fallback");
+        assert_eq!(fallback.count(), 1);
+        assert_eq!(invoker.count(), 0);
     }
 
     #[tokio::test]

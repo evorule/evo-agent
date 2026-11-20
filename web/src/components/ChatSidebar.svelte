@@ -1272,6 +1272,7 @@
   // 工作区放行清单跨会话生效)。决策即离场:提交瞬间卡片原位转为单行
   // 回执(不置灰不折叠),失败回退为待批卡。
   function decideApproval(m, approved, scope = 'once') {
+    if (m.toolName === 'desktop_act') scope = 'once';
     // 终态卡(超时自动拒绝/随轮次失效)不可再提交;sending/sent 防重复提交
     if (!m.proposalId || m.decision === 'sending' || m.decision === 'sent' ||
         m.decision === 'timeout' || m.decision === 'expired') return;
@@ -1861,8 +1862,8 @@
               <button class="ap-btn approve" onclick={() => decideApproval(m, true)}>批准</button>
               <button class="ap-btn reject" onclick={() => decideApproval(m, false)}>拒绝</button>
             </div>
-            {#if m.guardDeny}
-              <div class="ap-alt">含删除/推送/网络外发等危险子命令,仅支持本次决策,不做会话/工作区记忆。</div>
+            {#if m.guardDeny || m.toolName === 'desktop_act'}
+              <div class="ap-alt">此操作仅支持本次人工决策,不做会话/工作区记忆。</div>
             {:else}
               <div class="ap-scope-row">
                 <span class="ap-scope-hint">重复同类命令免批:</span>

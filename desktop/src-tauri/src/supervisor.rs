@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use tauri::{Manager, Url, WebviewWindow};
 
+use crate::desktop_worker::DesktopWorker;
 use crate::health;
 use crate::job::JobHandle;
 use crate::orchestrator::{self, LaunchContext, Runtime};
@@ -69,6 +70,8 @@ pub struct Supervisor {
     /// service 身份令牌（sediment 受信通道写受保护域用；仅 env 注入
     /// server+serve，与执行体令牌同款纪律）
     pub service_token: String,
+    desktop_worker_token: String,
+    desktop_worker: DesktopWorker,
     pub version: String,
     pub job: Arc<JobHandle>,
     pub window: WebviewWindow,
@@ -98,6 +101,8 @@ impl Supervisor {
         nav_port: Arc<RwLock<Option<u16>>>,
     ) -> Result<Arc<Self>, String> {
         let job = Arc::new(JobHandle::create()?);
+        let desktop_worker_token = orchestrator::gen_token();
+        let desktop_worker = DesktopWorker::start(desktop_worker_token.clone(), nav_port.clone())?;
         // 壳不自收编（M4.1 教训）：updater install 时 ShellExecuteW 启动的
         // NSIS 安装器同为壳子进程，若壳自收编，install 末尾壳 exit(0) 会经
         // KILL_ON_JOB_CLOSE 顺杀安装器，覆盖安装被中断。改为 serve/engine
@@ -116,6 +121,8 @@ impl Supervisor {
             engine_token,
             executor_token,
             service_token,
+            desktop_worker_token,
+            desktop_worker,
             version,
             job,
             window,
@@ -142,6 +149,7 @@ impl Supervisor {
             engine_token: &self.engine_token,
             executor_token: &self.executor_token,
             service_token: &self.service_token,
+            desktop_worker_token: &self.desktop_worker_token,
             version: &self.version,
             job: &self.job,
             self_assigned: self.self_assigned,
@@ -466,6 +474,7 @@ impl Supervisor {
             st.shutting_down = true;
         }
         self.log_line("[guard] stop for update (graceful two-phase)");
+        self.desktop_worker.stop();
         let mut runtime = self.state.lock().unwrap().runtime.take();
         if let Some(rt) = runtime.as_mut() {
             orchestrator::graceful_stop(
@@ -491,6 +500,7 @@ impl Supervisor {
             st.shutting_down = true;
         }
         self.log_line("[guard] shutdown begin (graceful two-phase)");
+        self.desktop_worker.stop();
         let mut runtime = self.state.lock().unwrap().runtime.take();
         if let Some(rt) = runtime.as_mut() {
             orchestrator::graceful_stop(

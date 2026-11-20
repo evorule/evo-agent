@@ -68,6 +68,7 @@ pub mod codegraph;
 pub mod companion_observe;
 pub mod delegate_many;
 pub mod delegate_tool;
+pub mod desktop;
 pub mod edit_file;
 pub mod env_doctor;
 pub mod exfil_scan;

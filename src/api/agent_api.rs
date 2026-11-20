@@ -274,6 +274,8 @@ pub struct AgentApiState {
     /// 新工具;读路径(白名单过滤/工具查询)取读锁,写路径(mcp_api 端点)
     /// 取写锁,临界区内无 await。
     toolkit: Arc<std::sync::RwLock<ToolHandler>>,
+    /// Deterministic desktop bridge, absent when no worker token was configured.
+    desktop_bridge: Option<Arc<crate::api::desktop_bridge::DesktopBridge>>,
     /// LLM 配置脱敏快照(凭据可视化状态端点;不含任何密钥内容)
     ///
     /// S5 模型切换:切换端点写回新 model 后同步更新快照 model 字段,
@@ -480,6 +482,7 @@ impl AgentApiState {
             agent_root: None,
             workspace_client,
             toolkit,
+            desktop_bridge: None,
             llm_status: Arc::new(std::sync::RwLock::new(LlmStatusSnapshot::unconfigured())),
             // 默认态:api_key 置空(SG-1 件1 key 归边后 handler 不消费此字段,
             // 仅配置层脱敏回显保留),待 cmd_serve 注入经统一解析的完整配置
@@ -765,6 +768,20 @@ impl AgentApiState {
     /// B23:MCP server 暴露面开关(缺省 false)
     pub fn mcp_server_enabled(&self) -> bool {
         self.mcp_server_enabled
+    }
+
+    /// Inject the deterministic desktop bridge after its token has been captured.
+    pub fn with_desktop_bridge(
+        mut self,
+        bridge: Arc<crate::api::desktop_bridge::DesktopBridge>,
+    ) -> Self {
+        self.desktop_bridge = Some(bridge);
+        self
+    }
+
+    /// Deterministic desktop bridge, or `None` when the worker is unavailable.
+    pub fn desktop_bridge(&self) -> Option<&Arc<crate::api::desktop_bridge::DesktopBridge>> {
+        self.desktop_bridge.as_ref()
     }
 
     /// B16:获取 union toolkit 底层锁(mcp_api 写路径 PUT/reload/restart
@@ -2586,16 +2603,34 @@ async fn approve_agent(
         }
     }
 
+    // 桌面控制只能逐次人工批准；伪造的会话/工作区或未知 scope 均拒绝并恢复待审。
+    let desktop_scope_valid = matches!(
+        req.decision_scope.as_deref(),
+        None | Some("manual") | Some("once")
+    );
+    if req.approved && pending.request.tool_name == "desktop_act" && !desktop_scope_valid {
+        let body = serde_json::json!({
+            "error": "desktop_act_requires_manual_once",
+            "session_id": req.session_id,
+            "tool_name": pending.request.tool_name,
+        });
+        if let Ok(mut map) = state.pending_approvals.lock() {
+            map.insert(req.session_id.clone(), pending);
+        }
+        return Err((StatusCode::BAD_REQUEST, Json(body)));
+    }
+
     // 自动决策守卫:会话记忆/工作区清单自动批(auto scope)对守卫表命中的
     // 命令永不送达——客户端记忆不得旁路 T2 恒压(危险子命令守卫/逃逸意图
     // 检测,与前端会话记忆守卫同族镜像,双端同表);人工点击(缺省)不受限。
     // 拒绝时 pending 放回,审批保持等待(可人工处置),语义同 proposal_id
     // mismatch;未知 scope 值从严按 auto 处理(保守方向)。
-    let auto_scope = req
-        .decision_scope
-        .as_deref()
-        .map(|s| !s.is_empty() && s != "manual")
-        .unwrap_or(false);
+    let auto_scope = pending.request.tool_name != "desktop_act"
+        && req
+            .decision_scope
+            .as_deref()
+            .map(|s| !s.is_empty() && s != "manual")
+            .unwrap_or(false);
     if auto_scope && req.approved {
         // 守卫命中原因(类别+片段)随 400 体外发,让前端/审计知道「为何拒」
         let guard_reason: Option<(String, String)> = if pending.request.tool_name == "python_exec" {
@@ -6668,6 +6703,98 @@ mod tests {
         assert_eq!(r2.status(), StatusCode::OK);
         let decision = rx.await.unwrap();
         assert!(decision.approved);
+    }
+
+    #[tokio::test]
+    async fn test_approve_desktop_act_rejects_non_manual_scopes_and_restores_pending() {
+        for (index, scope) in [
+            "auto-session",
+            "auto-workspace",
+            "session",
+            "workspace",
+            "workspace-allowlist",
+            "unknown",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let state = make_test_state();
+            let session_id = format!("desktop-scope-reject-{index}");
+            let proposal_id = format!("ap-desktop-reject-{index}");
+            let _rx = insert_pending(
+                &state,
+                &session_id,
+                test_pending_request(&proposal_id, "desktop_act", "invoke"),
+            );
+            let app = router(state.clone());
+            let body = serde_json::json!({
+                "session_id": session_id,
+                "approved": true,
+                "proposal_id": proposal_id,
+                "decision_scope": scope,
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(http::Method::POST)
+                        .uri("/agents/general/approve")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "scope={scope}");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["error"], "desktop_act_requires_manual_once");
+            let pending = state.pending_approvals.lock().unwrap();
+            let restored = pending.get(&session_id).unwrap_or_else(|| {
+                panic!("desktop approval must remain pending for scope {scope}")
+            });
+            assert_eq!(restored.proposal_id, proposal_id);
+            assert_eq!(restored.request.tool_name, "desktop_act");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_approve_desktop_act_accepts_only_manual_once_scopes() {
+        for (index, scope) in [None, Some("manual"), Some("once")].into_iter().enumerate() {
+            let state = make_test_state();
+            let session_id = format!("desktop-scope-accept-{index}");
+            let proposal_id = format!("ap-desktop-accept-{index}");
+            let rx = insert_pending(
+                &state,
+                &session_id,
+                test_pending_request(&proposal_id, "desktop_act", "invoke"),
+            );
+            let app = router(state);
+            let mut body = serde_json::json!({
+                "session_id": session_id,
+                "approved": true,
+                "proposal_id": proposal_id,
+            });
+            if let Some(scope) = scope {
+                body["decision_scope"] = serde_json::Value::String(scope.to_string());
+            }
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(http::Method::POST)
+                        .uri("/agents/general/approve")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "scope={scope:?}");
+            let decision = rx.await.unwrap();
+            assert!(decision.approved);
+            assert!(!decision.auto_rejected);
+        }
     }
 
     // ===== 自动决策守卫(auto scope 危险命令永不自动批准) =====
