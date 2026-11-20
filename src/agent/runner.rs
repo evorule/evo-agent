@@ -3317,6 +3317,37 @@ impl AgentRunner {
         ))
     }
 
+    /// Cross-source reconciliation ledger face for the acceptance gate
+    /// (long-horizon mode). `None` = mode off — the gate skips the
+    /// reconciliation entirely (default invariant). The face is projected
+    /// from the session journal file (flushed line-append, so the read
+    /// sees every recorded event); a disabled or unreadable journal maps
+    /// to the [`crate::agent::reconcile::LedgerFace::Unestablished`] state
+    /// inside the returned face — it never flips the mode off (unknown is
+    /// not pass). Same fail-closed arming as
+    /// [`Self::writeoff_gate_input`]: a failed assembly self-proof keeps
+    /// the mode closed. The model never supplies this input (G8: gate
+    /// truth stays runner-computed).
+    fn reconcile_ledger_face(&self) -> Option<crate::agent::reconcile::LedgerFace> {
+        if !self.writeoff_enabled {
+            return None;
+        }
+        if self.writeoff_selfproof.get() == Some(&false) {
+            return None;
+        }
+        let lines = self
+            .journal_dir
+            .as_ref()
+            .zip(self.session_id.as_ref())
+            .and_then(|(dir, sid)| {
+                let path = crate::agent::journal::JournalWriter::path_for(dir, sid);
+                crate::agent::journal::read_all_tolerant(&path).ok()
+            });
+        Some(crate::agent::reconcile::ledger_face_from_journal(
+            lines.as_deref(),
+        ))
+    }
+
     /// One-shot assembly self-proof for the long-horizon mode (acceptance
     /// evidence batch). Runs the three negative probes through the real
     /// gate machinery — a forged pass flag cannot grant admission, a
@@ -6631,11 +6662,13 @@ impl AgentRunner {
         let mut args = args;
         let acceptance_report = self.prepare_acceptance_evidence(&mut args).await;
         let writeoff_pieces = self.writeoff_gate_input();
+        let reconcile_ledger = self.reconcile_ledger_face();
         let args = match apply_acceptance_gate(
             self.acceptance_command.as_deref(),
             &args,
             writeoff_pieces.as_ref(),
             acceptance_report.as_ref(),
+            reconcile_ledger.as_ref(),
         )
         .await
         {
@@ -11551,11 +11584,13 @@ impl AgentRunner {
                                                let acceptance_report =
                                                    runner.prepare_acceptance_evidence(&mut args).await;
                                                let writeoff_pieces = runner.writeoff_gate_input();
+                                               let reconcile_ledger = runner.reconcile_ledger_face();
                                                let args = match apply_acceptance_gate(
                                                    runner.acceptance_command.as_deref(),
                                                    &args,
                                                    writeoff_pieces.as_ref(),
                                                    acceptance_report.as_ref(),
+                                                   reconcile_ledger.as_ref(),
                                                )
                                                .await
                                                {

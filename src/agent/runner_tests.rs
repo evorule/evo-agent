@@ -9360,6 +9360,111 @@ async fn test_selfproof_failure_keeps_gate_input_none_fail_closed() {
     );
 }
 
+// === Cross-source reconciliation ledger face wiring (long-horizon mode) ===
+
+#[tokio::test]
+async fn test_reconcile_ledger_face_mode_off_none() {
+    // Default invariant: non-long-horizon runners build no ledger face —
+    // the gate skips the reconciliation entirely.
+    let def = make_def_with_tools(vec!["echo".to_string()]);
+    let runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap();
+    assert!(!runner.writeoff_enabled);
+    assert!(
+        runner.reconcile_ledger_face().is_none(),
+        "mode off must not build the ledger face"
+    );
+}
+
+#[tokio::test]
+async fn test_reconcile_ledger_face_projects_window() {
+    // Mode-on with a wired journal: the face projects the window (latest
+    // checkpoint hash per path + newest verify verdict in chain order).
+    let dir = std::env::temp_dir().join(format!("rt-reconcile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let session = "s-reconcile";
+    {
+        let w = crate::agent::journal::JournalWriter::open(&dir, session).unwrap();
+        w.begin_turn("g").unwrap();
+        w.file_checkpoint_taken("a.txt", "content", "h-old", 1, "file_write")
+            .unwrap();
+        w.file_checkpoint_taken("a.txt", "content", "h-new", 1, "file_write")
+            .unwrap();
+        w.verify_ran("check", "true", Some(0), 0, "d", "pass", "o")
+            .unwrap();
+    }
+    let mut def = make_def_with_tools(vec!["echo".to_string()]);
+    def.longhorizon = Some(true);
+    let mut runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap()
+            .with_journal_dir(dir.clone());
+    runner.session_id = Some(session.to_string());
+    match runner
+        .reconcile_ledger_face()
+        .expect("mode on must project")
+    {
+        crate::agent::reconcile::LedgerFace::Projected(face) => {
+            assert_eq!(face.anchors.len(), 1);
+            assert_eq!(face.anchors.get("a.txt").map(String::as_str), Some("h-new"));
+            assert_eq!(
+                face.verify_tail.as_ref().map(|t| t.verdict.as_str()),
+                Some("pass")
+            );
+        }
+        other => panic!("readable journal must project, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_reconcile_ledger_face_unestablished_when_journal_absent() {
+    // Mode-on but no journal file: the face is honestly unestablished
+    // (unknown is not pass) — never a fake-agreeing projection.
+    let dir = std::env::temp_dir().join(format!("rt-reconcile-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut def = make_def_with_tools(vec!["echo".to_string()]);
+    def.longhorizon = Some(true);
+    let mut runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap()
+            .with_journal_dir(dir.clone());
+    runner.session_id = Some("s-absent".to_string());
+    assert_eq!(
+        runner.reconcile_ledger_face().expect("mode on must answer"),
+        crate::agent::reconcile::LedgerFace::Unestablished,
+        "absent journal = unestablished ledger face"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_selfproof_failure_keeps_reconcile_face_none_fail_closed() {
+    // Fail-closed parity with the conjunction input: a failed assembly
+    // self-proof closes the mode for the ledger face too.
+    let mut def = make_def_with_tools(vec!["echo".to_string()]);
+    def.longhorizon = Some(true);
+    let runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap();
+    assert!(
+        runner.reconcile_ledger_face().is_some(),
+        "un-armed direct access keeps the face projected"
+    );
+    runner.writeoff_selfproof.set(false).unwrap();
+    assert!(
+        runner.reconcile_ledger_face().is_none(),
+        "failed self-proof must keep the ledger face none (fail-closed)"
+    );
+}
+
 #[tokio::test]
 async fn test_evidence_spot_check_limit_default_and_builder() {
     let def = make_def_with_tools(vec!["echo".to_string()]);
