@@ -1005,8 +1005,10 @@ mod tests {
         // real processes. Probe 3 can only pass if the criterion command
         // genuinely executed twice with diverging output, so a green
         // result here is itself the proof that the probes ran (fake-green
-        // guard); the timing assertion adds the elapsed-evidence guard.
-        let t0 = std::time::Instant::now();
+        // guard). Execution is proven by probe outcomes, not by a
+        // wall-clock lower bound: a real process spawn can complete in
+        // under one millisecond on Linux, which would make an elapsed
+        // guard misfire on fast runners.
         let sp = run_assembly_selfproof().await;
         assert!(
             sp.all_pass(),
@@ -1014,11 +1016,6 @@ mod tests {
             sp.failures
         );
         assert!(sp.forged_flag_rejected && sp.known_bad_criteria_red && sp.nondeterminism_captured);
-        assert!(
-            t0.elapsed() >= std::time::Duration::from_millis(1),
-            "probes must spawn real processes (elapsed {:?})",
-            t0.elapsed()
-        );
     }
 
     #[test]
