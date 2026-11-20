@@ -4646,6 +4646,10 @@ impl AgentRunner {
         let mut step_count = 0;
         let mut tool_calls: Vec<String> = Vec::new();
         let mut messages: Vec<Message> = Vec::new();
+        let mut runaway_guard = match &self.runaway_policy {
+            Some(policy) => RunawayGuard::new(policy.max_actions_per_run),
+            None => RunawayGuard::new(u32::MAX),
+        };
 
         if !system_prompt.is_empty() {
             messages.push(Message::System {
@@ -4887,6 +4891,48 @@ impl AgentRunner {
                     // 引擎 pending 预算窗口起点:从本请求开始处理到 io_response
                     // 提交完成,提交面护栏(client 层)据此判定超预算 stale 提交。
                     self.evorule_client.begin_io_step();
+                    if event.payload.get("io_type").and_then(Value::as_str) == Some("call_service")
+                        && runaway_guard.bump()
+                    {
+                        let tool_name = event
+                            .payload
+                            .get("params")
+                            .and_then(|params| params.get("tool_name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let summary = format!(
+                            "Runaway guard tripped: {} automatic actions counted (limit {}); pending op '{}' was NOT executed. Task paused for human confirmation. Goal: {}",
+                            runaway_guard.actions,
+                            runaway_guard.threshold,
+                            tool_name,
+                            goal,
+                        );
+                        warn!(%session_id, actions = runaway_guard.actions, threshold = runaway_guard.threshold, "runaway guard tripped (non-streaming call_service), pausing for human confirmation");
+                        if let Some(request_id) = event.payload.get("id").and_then(Value::as_u64) {
+                            if let Err(e) = self
+                                .evorule_client
+                                .submit_io_response(
+                                    &session_id,
+                                    request_id,
+                                    &serde_json::json!({"error": &summary}),
+                                    Some(summary.as_str()),
+                                )
+                                .await
+                            {
+                                warn!(%session_id, request_id, error = %e, "runaway guard error io_response failed; io_request may hang on engine side");
+                            }
+                        }
+                        if let Err(e) = self.flush_messages(&session_id).await {
+                            warn!(%session_id, error = %e, "flush_messages during runaway pause failed");
+                        }
+                        if let Err(e) = self.sediment_session(&session_id, &messages, None).await {
+                            warn!(%session_id, error = %e, "sediment_session during runaway pause failed");
+                        }
+                        self.submit_tool_traces(&session_id).await;
+                        self.evorule_client.end_io_step();
+                        let duration = start_time.elapsed().as_millis() as u64;
+                        return Ok(AgentResult::error(summary, step_count, duration));
+                    }
                     // G6:clone token 避免 &mut self(handle_io_request) 与 &self(cancel_token) 借用冲突
                     let cancel_token = self.cancel_token.clone();
                     let result = tokio::select! {
@@ -4940,6 +4986,9 @@ impl AgentRunner {
                             }
                             if let Err(e) = self.flush_messages(&session_id).await {
                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                            }
+                            if let Err(e) = self.sediment_session(&session_id, &messages, None).await {
+                                tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
                             }
                             self.submit_tool_traces(&session_id).await;
                             let duration = start_time.elapsed().as_millis() as u64;
@@ -9763,6 +9812,9 @@ impl AgentRunner {
                                    _ = cancel_token.cancelled() => {
                                        info!("Cancellation requested during streaming, cleaning up");
                                        let duration = start_time.elapsed().as_millis() as u64;
+                                       if let Some(g) = turn_guard.take() {
+                                           g.end("cancelled", step_count as u64, duration);
+                                       }
                                        yield Ok(AgentEvent::Error(AgentError::Internal(
                                            "cancelled by user".to_string(),
                                        )));
@@ -10302,6 +10354,9 @@ impl AgentRunner {
                                                                }
                                                            }
                                                            let duration = start_time.elapsed().as_millis() as u64;
+                                                           if let Some(g) = turn_guard.take() {
+                                                               g.end("cancelled", step_count as u64, duration);
+                                                           }
                                                            yield Ok(AgentEvent::Error(AgentError::Internal(
                                                                "cancelled by user".to_string(),
                                                            )));
@@ -10311,10 +10366,12 @@ impl AgentRunner {
                                                                duration,
                                                            )));
                                                            if let Err(e) = runner.flush_messages(&session_id).await {
-                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                       }
+                                                               tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                           }
+                                                           if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                                                               tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                                                           }
                                                            runner.submit_tool_traces(&session_id).await;
-                                                           // B21:turn_ended(cancelled)
                                                            return;
                                                        }
                                                    };
@@ -11212,6 +11269,9 @@ impl AgentRunner {
                                                            // 中断于工具执行/审批等待:规范取消收尾(future 借用已随块结束释放)
                                                            info!(%session_id, "Cancelled during tool execution, cleaning up");
                                                            let duration = start_time.elapsed().as_millis() as u64;
+                                                           if let Some(g) = turn_guard.take() {
+                                                               g.end("cancelled", step_count as u64, duration);
+                                                           }
                                                            yield Ok(AgentEvent::Error(AgentError::Internal(
                                                                "cancelled by user".to_string(),
                                                            )));
@@ -11222,6 +11282,9 @@ impl AgentRunner {
                                                            )));
                                                            if let Err(e) = runner.flush_messages(&session_id).await {
                                                                tracing::warn!(%session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                           }
+                                                           if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                                                               tracing::warn!(%session_id, error = %e, "sediment_session failed");
                                                            }
                                                            runner.submit_tool_traces(&session_id).await;
                                                            return;
@@ -11923,6 +11986,9 @@ impl AgentRunner {
                                                            let duration = start_time.elapsed().as_millis() as u64;
                                                            if let Some(g) = turn_guard.take() {
                                                                g.end("cancelled", step_count as u64, duration);
+                                                           }
+                                                           if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                                                               tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
                                                            }
                                                            yield Ok(AgentEvent::Error(AgentError::Internal(
                                                                "cancelled by user".to_string(),

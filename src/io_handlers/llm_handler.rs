@@ -714,10 +714,10 @@ impl LlmHandler {
     /// 而 done 帧带非空思考 → 补发单帧 ThinkingDelta(防 provider 仅在
     /// 终帧给思考块)。
     ///
-    /// ## 不重试
+    /// ## Transport fallback
     ///
-    /// 流式请求失败不重试。调用方收到 `Err` 后,可 fallback 到非流式
-    /// `execute()`(带 G3 重试)。
+    /// Transport failures before content fall back once to aggregate execution.
+    /// Business failures and failures after content remain fail-visible without replay.
     ///
     /// ## Mock
     ///

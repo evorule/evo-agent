@@ -448,9 +448,9 @@ pub(crate) enum FrameEnd {
 ///
 /// 产出与 relay 真流式同型 `StreamChunk` 序列;`[DONE]` 哨兵后合成完整
 /// `LlmResponse` 终帧(聚合自全部增量:content/reasoning/tool_calls 按
-/// index 聚合/finish_reason/usage)。流未含 `[DONE]` 即连接提前关闭 →
-/// fail-visible Err(与 relay 未含 done 终帧同语义)。流式请求不重试
-/// (调用方可回落非流式 `execute`,与 relay 调用方约定一致)。
+/// index 聚合/finish_reason/usage)。Transport failures before content fall
+/// back once to bounded aggregate execution. Business failures and transport
+/// failures after content remain fail-visible without replay.
 pub(crate) fn execute_stream(
     body: Value,
     cfg: DirectLlmConfig,
@@ -467,152 +467,215 @@ pub(crate) fn execute_stream(
             .timeout(std::time::Duration::from_secs(retry.request_timeout_secs))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let mut streamed_content = false;
+        let fallback_reason: String;
 
-        let resp = match client
-            .post(&cfg.api_base)
-            .bearer_auth(&cfg.api_key)
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                yield Err(format!("LLM stream request failed: {}", e));
+        'stream_attempt: {
+            let resp = match client
+                .post(&cfg.api_base)
+                .bearer_auth(&cfg.api_key)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    fallback_reason = format!("LLM stream request failed: {}", e);
+                    break 'stream_attempt;
+                }
+            };
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                yield Err(format!("LLM API error ({}): {}", status, text));
                 return;
             }
-        };
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            yield Err(format!("LLM API error ({}): {}", status, text));
-            return;
-        }
-
-        // SSE 增量解析(\n\n 切帧,残留缓冲收尾——与 relay 切帧语义对齐)
-        // o10 根因修复:字节块经流式 UTF-8 安全解码器入缓冲——多字节字符跨
-        // 网络块切分不再被 lossy 替换成 U+FFFD(坏字①型根因封死)
-        let mut decoder = crate::io_handlers::stream_text::StreamTextDecoder::new();
-        let mut buffer = String::new();
-        let mut acc_content = String::new();
-        let mut acc_reasoning = String::new();
-        let mut acc_tools: BTreeMap<usize, DirectToolAcc> = BTreeMap::new();
-        let mut acc_finish: Option<String> = None;
-        let mut acc_usage: Option<Value> = None;
-        let mut saw_done = false;
-        let mut sse = resp.bytes_stream();
-        'frames: loop {
-            while let Some(pos) = buffer.find("\n\n") {
-                let frame: String = buffer.drain(..pos + 2).collect();
+            // SSE 增量解析(\n\n 切帧,残留缓冲收尾——与 relay 切帧语义对齐)
+            // o10 根因修复:字节块经流式 UTF-8 安全解码器入缓冲——多字节字符跨
+            // 网络块切分不再被 lossy 替换成 U+FFFD(坏字①型根因封死)
+            let mut decoder = crate::io_handlers::stream_text::StreamTextDecoder::new();
+            let mut buffer = String::new();
+            let mut acc_content = String::new();
+            let mut acc_reasoning = String::new();
+            let mut acc_tools: BTreeMap<usize, DirectToolAcc> = BTreeMap::new();
+            let mut acc_finish: Option<String> = None;
+            let mut acc_usage: Option<Value> = None;
+            let mut saw_done = false;
+            let mut sse = resp.bytes_stream();
+            'frames: loop {
+                while let Some(pos) = buffer.find("\n\n") {
+                    let frame: String = buffer.drain(..pos + 2).collect();
+                    let (chunks, end) = provider_sse_frame_outcome(
+                        &frame,
+                        &mut acc_content,
+                        &mut acc_reasoning,
+                        &mut acc_tools,
+                        &mut acc_finish,
+                        &mut acc_usage,
+                    );
+                    for chunk in &chunks {
+                        if matches!(chunk, StreamChunk::Delta(_) | StreamChunk::ToolCallDelta { .. }) {
+                            streamed_content = true;
+                        }
+                    }
+                    for chunk in chunks {
+                        yield Ok(chunk);
+                    }
+                    match end {
+                        FrameEnd::Continue => {}
+                        FrameEnd::Stop => {
+                            saw_done = true;
+                            break 'frames;
+                        }
+                        FrameEnd::Fail(msg) => {
+                            yield Err(msg);
+                            return;
+                        }
+                    }
+                }
+                match sse.next().await {
+                    Some(Ok(chunk)) => match decoder.feed(&chunk) {
+                        Ok(text) => buffer.push_str(&text),
+                        Err(e) => {
+                            let msg = format!("LLM stream decode failed: {e}");
+                            if !streamed_content {
+                                fallback_reason = msg;
+                                break 'stream_attempt;
+                            }
+                            yield Err(msg);
+                            return;
+                        }
+                    },
+                    Some(Err(e)) => {
+                        let msg = format!("LLM stream read failed: {}", e);
+                        if !streamed_content {
+                            fallback_reason = msg;
+                            break 'stream_attempt;
+                        }
+                        yield Err(msg);
+                        return;
+                    }
+                    None => break 'frames,
+                }
+            }
+            // 流收尾残留缓冲(末帧无尾随空行形态)
+            let residual = std::mem::take(&mut buffer);
+            if !residual.trim().is_empty() {
                 let (chunks, end) = provider_sse_frame_outcome(
-                    &frame,
+                    &residual,
                     &mut acc_content,
                     &mut acc_reasoning,
                     &mut acc_tools,
                     &mut acc_finish,
                     &mut acc_usage,
                 );
+                for chunk in &chunks {
+                    if matches!(chunk, StreamChunk::Delta(_) | StreamChunk::ToolCallDelta { .. }) {
+                        streamed_content = true;
+                    }
+                }
                 for chunk in chunks {
                     yield Ok(chunk);
                 }
                 match end {
                     FrameEnd::Continue => {}
-                    FrameEnd::Stop => {
-                        saw_done = true;
-                        break 'frames;
-                    }
+                    FrameEnd::Stop => saw_done = true,
                     FrameEnd::Fail(msg) => {
                         yield Err(msg);
                         return;
                     }
                 }
             }
-            match sse.next().await {
-                Some(Ok(chunk)) => match decoder.feed(&chunk) {
-                    Ok(text) => buffer.push_str(&text),
-                    Err(e) => {
-                        yield Err(format!("LLM stream decode failed: {e}"));
-                        return;
-                    }
-                },
-                Some(Err(e)) => {
-                    yield Err(format!("LLM stream read failed: {}", e));
-                    return;
+            if !saw_done {
+                let msg = "direct 流式响应未含 [DONE] 终止符(连接提前关闭)".to_string();
+                if !streamed_content {
+                    fallback_reason = msg;
+                    break 'stream_attempt;
                 }
-                None => break 'frames,
+                yield Err(msg);
+                return;
             }
-        }
-        // 流收尾残留缓冲(末帧无尾随空行形态)
-        let residual = std::mem::take(&mut buffer);
-        if !residual.trim().is_empty() {
-            let (chunks, end) = provider_sse_frame_outcome(
-                &residual,
-                &mut acc_content,
-                &mut acc_reasoning,
-                &mut acc_tools,
-                &mut acc_finish,
-                &mut acc_usage,
-            );
-            for chunk in chunks {
-                yield Ok(chunk);
-            }
-            match end {
-                FrameEnd::Continue => {}
-                FrameEnd::Stop => saw_done = true,
-                FrameEnd::Fail(msg) => {
-                    yield Err(msg);
-                    return;
+
+            // === [DONE] 后合成完整 LlmResponse 终帧(聚合自全部增量) ===
+            let tool_calls = if acc_tools.is_empty() {
+                None
+            } else {
+                Some(
+                    acc_tools
+                        .into_values()
+                        .map(|acc| {
+                            let arguments: Value =
+                                serde_json::from_str(acc.arguments.trim()).unwrap_or(Value::Object(Default::default()));
+                            ToolCall {
+                                name: acc.name,
+                                arguments,
+                                id: acc.id,
+                            }
+                        })
+                        .collect::<Vec<ToolCall>>(),
+                )
+            };
+            let token_usage = acc_usage.as_ref().and_then(|u| {
+                let mut parsed: TokenUsage = serde_json::from_value(u.clone()).ok()?;
+                if parsed.cached_tokens.is_none() {
+                    // OpenAI 兼容指针优先;取不到时回落 嵌套族命中字段
+                    // cache_read_input_tokens(cache_creation_input_tokens 是缓存
+                    // 写入非命中,明确不映射)
+                    parsed.cached_tokens = u
+                        .pointer("/prompt_tokens_details/cached_tokens")
+                        .and_then(Value::as_u64)
+                        .map(|n| n as usize)
+                        .or_else(|| {
+                            u.pointer("/cache_read_input_tokens")
+                                .and_then(Value::as_u64)
+                                .map(|n| n as usize)
+                        });
                 }
-            }
-        }
-        if !saw_done {
-            yield Err("direct 流式响应未含 [DONE] 终止符(连接提前关闭)".to_string());
+                Some(parsed)
+            });
+            yield Ok(StreamChunk::Done(LlmResponse {
+                content: acc_content,
+                tool_calls,
+                finish_reason: acc_finish.or_else(|| Some("stop".to_string())),
+                token_usage,
+            }));
             return;
         }
 
-        // === [DONE] 后合成完整 LlmResponse 终帧(聚合自全部增量) ===
-        let tool_calls = if acc_tools.is_empty() {
-            None
-        } else {
-            Some(
-                acc_tools
-                    .into_values()
-                    .map(|acc| {
-                        let arguments: Value =
-                            serde_json::from_str(acc.arguments.trim()).unwrap_or(Value::Object(Default::default()));
-                        ToolCall {
-                            name: acc.name,
-                            arguments,
-                            id: acc.id,
-                        }
-                    })
-                    .collect::<Vec<ToolCall>>(),
-            )
-        };
-        let token_usage = acc_usage.as_ref().and_then(|u| {
-            let mut parsed: TokenUsage = serde_json::from_value(u.clone()).ok()?;
-            if parsed.cached_tokens.is_none() {
-                // OpenAI 兼容指针优先;取不到时回落 嵌套族命中字段
-                // cache_read_input_tokens(cache_creation_input_tokens 是缓存
-                // 写入非命中,明确不映射)
-                parsed.cached_tokens = u
-                    .pointer("/prompt_tokens_details/cached_tokens")
-                    .and_then(Value::as_u64)
-                    .map(|n| n as usize)
-                    .or_else(|| {
-                        u.pointer("/cache_read_input_tokens")
-                            .and_then(Value::as_u64)
-                            .map(|n| n as usize)
-                    });
+        warn!(reason = %fallback_reason, "direct stream transport failed before content; falling back to aggregate execution");
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("stream".to_string(), Value::Bool(false));
+        }
+        match execute(&body, &cfg, retry).await {
+            Ok(normalized) => {
+                let reasoning = normalized
+                    .get("reasoning")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !reasoning.is_empty() {
+                    yield Ok(StreamChunk::ThinkingDelta(reasoning));
+                }
+                let content = normalized
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !content.is_empty() {
+                    yield Ok(StreamChunk::Delta(content.clone()));
+                }
+                let response = serde_json::from_value(normalized).unwrap_or_else(|_| LlmResponse {
+                    content,
+                    tool_calls: None,
+                    finish_reason: Some("stop".to_string()),
+                    token_usage: None,
+                });
+                yield Ok(StreamChunk::Done(response));
             }
-            Some(parsed)
-        });
-        yield Ok(StreamChunk::Done(LlmResponse {
-            content: acc_content,
-            tool_calls,
-            finish_reason: acc_finish.or_else(|| Some("stop".to_string())),
-            token_usage,
-        }));
+            Err(e) => yield Err(e),
+        }
     })
 }
 
@@ -1116,6 +1179,143 @@ mod tests {
         assert_eq!(r.finish_reason.as_deref(), Some("stop"));
         assert_eq!(r.tool_calls, None);
         assert_eq!(r.token_usage.map(|u| u.total_tokens), Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_direct_stream_eof_before_content_falls_back_to_aggregate() {
+        let mut server = mockito::Server::new_async().await;
+        let stream_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "stream": true
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial thought\"}}]}\n\n",
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let aggregate_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "stream": false
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"choices":[{"message":{"content":"complete answer","reasoning_content":"complete thought"},"finish_reason":"stop"}],"usage":null}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let cfg = DirectLlmConfig {
+            api_key: "k".into(),
+            api_base: server.url(),
+        };
+        let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
+        let mut stream = execute_stream(body, cfg, direct_retry_params_for_test());
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("transport fallback must not terminate with an error"));
+        }
+
+        assert!(matches!(
+            chunks.last(),
+            Some(StreamChunk::Done(response)) if response.content == "complete answer"
+        ));
+        assert!(chunks
+            .iter()
+            .any(|chunk| matches!(chunk, StreamChunk::Delta(text) if text == "complete answer")));
+        stream_mock.assert_async().await;
+        aggregate_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_direct_stream_eof_after_content_does_not_fallback() {
+        let mut server = mockito::Server::new_async().await;
+        let _stream_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "stream": true
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
+            .expect(1)
+            .create_async()
+            .await;
+        let aggregate_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "stream": false
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"choices":[{"message":{"content":"duplicate"},"finish_reason":"stop"}]}"#,
+            )
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cfg = DirectLlmConfig {
+            api_key: "k".into(),
+            api_base: server.url(),
+        };
+        let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
+        let mut stream = execute_stream(body, cfg, direct_retry_params_for_test());
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamChunk::Delta(text))) if text == "partial"
+        ));
+        assert!(matches!(stream.next().await, Some(Err(_))));
+        assert!(stream.next().await.is_none());
+        aggregate_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_direct_stream_business_error_does_not_fallback() {
+        let mut server = mockito::Server::new_async().await;
+        let _stream_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "stream": true
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: {\"base_resp\":{\"status_code\":1027,\"status_msg\":\"out of quota\"},\"choices\":[]}\n\n")
+            .expect(1)
+            .create_async()
+            .await;
+        let aggregate_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "stream": false
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"choices":[{"message":{"content":"must not run"},"finish_reason":"stop"}]}"#,
+            )
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cfg = DirectLlmConfig {
+            api_key: "k".into(),
+            api_base: server.url(),
+        };
+        let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
+        let mut stream = execute_stream(body, cfg, direct_retry_params_for_test());
+        match stream.next().await {
+            Some(Err(error)) => assert!(error.contains("out of quota")),
+            other => panic!("expected business error, got {:?}", other),
+        }
+        assert!(stream.next().await.is_none());
+        aggregate_mock.assert_async().await;
     }
 
     /// direct 流式剧本:usage 为 嵌套族命中形状(cache_read_input_tokens)
