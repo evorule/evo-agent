@@ -4663,7 +4663,7 @@ fn p2_adjudication_table_matches_design() {
     // 容错 patch 批(2026-11-17):apply_patch 落地 Sentineled(file_write/
     // edit_file 同族写面——patch 落盘意图必报),集合演进 34→35(新增
     // 条目已 diff 审)。
-    // o115 manifest 对齐批(2026-11-21):desktop_act 落地 Sensitive(前台
+    // manifest 对齐批(2026-11-21):desktop_act 落地 Sensitive(前台
     // UI 动作面双闸),集合演进 35→36(新增条目已 diff 审)。
     let p2_count = crate::agent::tool_manifest::static_manifests()
         .iter()
