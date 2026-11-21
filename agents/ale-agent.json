@@ -33,7 +33,10 @@
     "knowledge_entry_get"
   ],
   "skills": [
-    "evorule-deterministic-compute"
+    {
+      "name": "evorule-deterministic-compute",
+      "path": "skills/evorule-deterministic-compute/SKILL.md"
+    }
   ],
   "memory": {
     "type": "persistent",
