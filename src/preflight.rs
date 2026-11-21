@@ -72,11 +72,20 @@ pub const HINT_AGENT_DEF: &str = "create agents/<name>.json in the agents \
 pub const HINT_WORKDIR: &str = "grant write permission on the workdir \
      (sessions and journals are written under it)";
 
+/// 模型不在执行体路由表指引(启动期可自助:换模型或扩路由表)
+pub const HINT_MODEL_ROUTES: &str = "set [llm] model in evo-agent.toml to one of the \
+     executor's routed models, or add the model to the executor's llm_providers \
+     routing table (see GET /llm/providers on the executor)";
+
+/// 执行体调用方令牌错配指引
+pub const HINT_EXECUTOR_TOKEN: &str = "set [llm] executor_token in evo-agent.toml \
+     (or env EVORULE_LLM_EXECUTOR_TOKEN) to match the executor's caller_token";
+
 /// `--no-preflight` 逃生口留痕(跳过本身必须可见)
 pub const SKIP_NOTE: &str = "skipped by --no-preflight; dependency failures will \
      surface mid-run as network errors";
 
-/// 单项探活超时(②③⑦同款;Quick 双探并行 → 总预算 ≤5s)
+/// 单项探活超时(②③⑦同款;Quick 三探并行 → 总预算 ≤5s)
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ---------------------------------------------------------------------------
@@ -179,15 +188,25 @@ pub async fn run_preflight(cfg: &Config, workdir: &Path, scope: PreflightScope) 
     checks.push(check_config(cfg));
 
     // ②③ 依赖探活:Quick 并行(≤5s 预算),Full 串行逐项
+    // provider 注册表一次探查喂两判(模型∈路由表 / provider 标签对齐)
     match scope {
         PreflightScope::Quick => {
-            let (d1, d2) = tokio::join!(probe_evorule_health(cfg), probe_executor(cfg));
+            let (d1, d2, registry) = tokio::join!(
+                probe_evorule_health(cfg),
+                probe_executor(cfg),
+                probe_provider_registry(cfg),
+            );
             checks.push(d1);
             checks.push(d2);
+            checks.push(check_model_routes(&registry, &cfg.llm.model));
+            checks.push(check_provider_label(&registry, &cfg.llm.provider));
         }
         PreflightScope::Full => {
             checks.push(probe_evorule_health(cfg).await);
             checks.push(probe_executor(cfg).await);
+            let registry = probe_provider_registry(cfg).await;
+            checks.push(check_model_routes(&registry, &cfg.llm.model));
+            checks.push(check_provider_label(&registry, &cfg.llm.provider));
         }
     }
 
@@ -306,6 +325,200 @@ async fn probe_executor(cfg: &Config) -> PreflightCheck {
             ),
         ),
         Err(e) => fail(NAME, format!("{url} unreachable: {e}"), HINT_LLM_EXECUTOR),
+    }
+}
+
+/// 执行体端点 → 插件根(剥 `/llm/execute` 后缀;与 stream_endpoint_url 同形推导)。
+/// 自托管改路径(无该后缀)返回 None——内省端点定位不了,降级信息项。
+fn executor_base_url(executor_url: &str) -> Option<String> {
+    executor_url
+        .strip_suffix("/llm/execute")
+        .map(|base| base.to_string())
+}
+
+/// provider 注册表探查产物(一次 HTTP,喂 model/label 两判)
+enum ProviderRegistryProbe {
+    /// 内省面可用:执行体回单的路由表
+    Ready {
+        single_endpoint_mode: bool,
+        /// (provider 名, 模型清单) 序列
+        providers: Vec<(String, Vec<String>)>,
+    },
+    /// 传输层不可达/端点定位不了(执行体探活项已 Fail,此处只补信息)
+    Unreachable(String),
+    /// HTTP 层不可用(404=执行体版本早于内省端点;401=调用方令牌错配)
+    Http(u16),
+    /// 回单非预期形态(解析失败)
+    Unparseable,
+}
+
+/// 探执行体 provider 注册表(`GET {base}/llm/providers`;executor_token
+/// 配置后随 Bearer 头)。内省面缺失/不可达一律降级为信息结论,不重复
+/// 执行体探活项的 Fail 语义;唯一例外 401=令牌错配(调用期必败,升级 Fail)。
+async fn probe_provider_registry(cfg: &Config) -> ProviderRegistryProbe {
+    let base = match executor_base_url(&cfg.llm.executor_url) {
+        Some(b) => b,
+        None => {
+            return ProviderRegistryProbe::Unreachable(
+                "executor url has no /llm/execute suffix (custom path); \
+                 providers endpoint location unknown"
+                    .to_string(),
+            )
+        }
+    };
+    let url = format!("{base}/llm/providers");
+    let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => return ProviderRegistryProbe::Unreachable(e.to_string()),
+    };
+    let mut req = client.get(&url);
+    if let Some(tok) = cfg.llm.executor_token.as_deref().filter(|t| !t.is_empty()) {
+        req = req.bearer_auth(tok);
+    }
+    match req.send().await {
+        Err(e) => ProviderRegistryProbe::Unreachable(e.to_string()),
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            if !resp.status().is_success() {
+                return ProviderRegistryProbe::Http(status);
+            }
+            #[derive(serde::Deserialize)]
+            struct ProvidersBody {
+                #[serde(default)]
+                single_endpoint_mode: bool,
+                #[serde(default)]
+                providers: Vec<ProviderEntry>,
+            }
+            #[derive(serde::Deserialize)]
+            struct ProviderEntry {
+                name: String,
+                #[serde(default)]
+                models: Vec<String>,
+            }
+            match resp.json::<ProvidersBody>().await {
+                Ok(b) => ProviderRegistryProbe::Ready {
+                    single_endpoint_mode: b.single_endpoint_mode,
+                    providers: b
+                        .providers
+                        .into_iter()
+                        .map(|p| (p.name, p.models))
+                        .collect(),
+                },
+                Err(_) => ProviderRegistryProbe::Unparseable,
+            }
+        }
+    }
+}
+
+/// 模型 ∈ 执行体路由表判(注册表可用时 FAIL-able:模型错配从「第一次调用
+/// 爆上游错误」提前到「启动期 FAIL+指名可用模型」;注册表不可用时降级信息项)
+fn check_model_routes(probe: &ProviderRegistryProbe, model: &str) -> PreflightCheck {
+    const NAME: &str = "llm-model-routes";
+    match probe {
+        ProviderRegistryProbe::Ready {
+            single_endpoint_mode,
+            providers,
+        } => {
+            let names: Vec<&str> = providers.iter().map(|(n, _)| n.as_str()).collect();
+            let models: Vec<&str> = providers
+                .iter()
+                .flat_map(|(_, ms)| ms.iter().map(String::as_str))
+                .collect();
+            if models.contains(&model) {
+                pass(
+                    NAME,
+                    format!(
+                        "model '{model}' routable via providers [{names}] \
+                         (single_endpoint_mode={single_endpoint_mode})",
+                        names = names.join(", "),
+                    ),
+                )
+            } else {
+                fail(
+                    NAME,
+                    format!(
+                        "model '{model}' is not in the executor's routed models: \
+                         available = [{models}] (providers: {names})",
+                        models = models.join(", "),
+                        names = names.join(", "),
+                    ),
+                    HINT_MODEL_ROUTES,
+                )
+            }
+        }
+        ProviderRegistryProbe::Unreachable(why) => warn(
+            NAME,
+            format!(
+                "providers endpoint unavailable: {why} (informational; \
+                 the llm-executor check owns reachability verdicts)"
+            ),
+        ),
+        ProviderRegistryProbe::Http(401) => fail(
+            NAME,
+            "GET /llm/providers -> 401 (caller token missing or mismatched); \
+             every LLM call would be rejected the same way"
+                .to_string(),
+            HINT_EXECUTOR_TOKEN,
+        ),
+        ProviderRegistryProbe::Http(404) => warn(
+            NAME,
+            "GET /llm/providers -> 404: executor build predates the provider \
+             introspection endpoint; model/route cross-check skipped"
+                .to_string(),
+        ),
+        ProviderRegistryProbe::Http(s) => warn(
+            NAME,
+            format!("GET /llm/providers -> HTTP {s}; model/route cross-check skipped"),
+        ),
+        ProviderRegistryProbe::Unparseable => warn(
+            NAME,
+            "providers endpoint returned an unexpected body; model/route \
+             cross-check skipped"
+                .to_string(),
+        ),
+    }
+}
+
+/// provider 标签 ∈ 执行体 provider 名判(标签是展示面,路由按模型解析——
+/// 错配只 Warn+指引,不阻断)
+fn check_provider_label(probe: &ProviderRegistryProbe, label: &str) -> PreflightCheck {
+    const NAME: &str = "llm-provider-label";
+    let label = label.trim();
+    if label.is_empty() {
+        return pass(
+            NAME,
+            "llm.provider unset (display label only; routing resolves by model)".to_string(),
+        );
+    }
+    match probe {
+        ProviderRegistryProbe::Ready { providers, .. } => {
+            let names: Vec<&str> = providers.iter().map(|(n, _)| n.as_str()).collect();
+            if names.contains(&label) {
+                pass(
+                    NAME,
+                    format!("llm.provider '{label}' matches an executor provider"),
+                )
+            } else {
+                PreflightCheck {
+                    name: NAME.to_string(),
+                    verdict: PreflightVerdict::Warn,
+                    detail: format!(
+                        "llm.provider '{label}' is not among the executor's providers \
+                         [{names}]; the label is advisory (routing resolves by model)",
+                        names = names.join(", "),
+                    ),
+                    hint: format!(
+                        "align [llm] provider with one of the executor's providers \
+                         [{names}] (or leave as-is; no routing effect)",
+                        names = names.join(", ")
+                    ),
+                }
+            }
+        }
+        _ => pass(
+            NAME,
+            "provider label not checked (providers registry unavailable this run)".to_string(),
+        ),
     }
 }
 
@@ -789,6 +1002,8 @@ mod tests {
                 "config",
                 "evorule-server",
                 "llm-executor",
+                "llm-model-routes",
+                "llm-provider-label",
                 "llm-credentials"
             ]
         );
@@ -798,7 +1013,10 @@ mod tests {
         assert!(!d1.hint.is_empty());
         let d2 = &report.checks[2];
         assert_eq!(d2.verdict, PreflightVerdict::Fail);
-        // Quick 预算:双探并行,断依赖(连接瞬拒)应在 5s 内收场
+        // 注册表探查在依赖不可达时降级信息项(不重复 Fail 语义)
+        assert_eq!(report.checks[3].verdict, PreflightVerdict::Warn);
+        assert_eq!(report.checks[4].verdict, PreflightVerdict::Pass);
+        // Quick 预算:三探并行,断依赖(连接瞬拒)应在 5s 内收场
         assert!(elapsed.as_secs() < 5, "quick preflight took {elapsed:?}");
     }
 
@@ -842,6 +1060,8 @@ mod tests {
                 "config",
                 "evorule-server",
                 "llm-executor",
+                "llm-model-routes",
+                "llm-provider-label",
                 "llm-credentials",
                 "agent-default",
                 "workdir-writable",
@@ -851,10 +1071,10 @@ mod tests {
             ]
         );
         assert!(report.has_fail());
-        // ⑥ workdir 可写:临时目录应过
-        assert_eq!(report.checks[5].verdict, PreflightVerdict::Pass);
-        // ⑧ 身份姿态:信息项,任一 verdict 都不得 Fail
-        assert_ne!(report.checks[7].verdict, PreflightVerdict::Fail);
+        // workdir 可写:临时目录应过
+        assert_eq!(report.checks[7].verdict, PreflightVerdict::Pass);
+        // 身份姿态:信息项,任一 verdict 都不得 Fail
+        assert_ne!(report.checks[9].verdict, PreflightVerdict::Fail);
     }
 
     #[test]
@@ -891,8 +1111,8 @@ mod tests {
         let workdir = std::env::temp_dir();
         let report = run_preflight(&cfg, &workdir, PreflightScope::Full).await;
         assert_eq!(report.checks[2].verdict, PreflightVerdict::Pass);
-        assert_eq!(report.checks[6].name, "llm-stream-endpoint");
-        assert_eq!(report.checks[6].verdict, PreflightVerdict::Warn);
+        assert_eq!(report.checks[8].name, "llm-stream-endpoint");
+        assert_eq!(report.checks[8].verdict, PreflightVerdict::Warn);
     }
 
     #[test]
@@ -914,8 +1134,125 @@ mod tests {
         let cfg = base_cfg();
         let report = run_preflight(&cfg, &file_path, PreflightScope::Full).await;
         std::fs::remove_file(&file_path).ok();
-        assert_eq!(report.checks[5].name, "workdir-writable");
-        assert_eq!(report.checks[5].verdict, PreflightVerdict::Fail);
-        assert_eq!(report.checks[5].hint, HINT_WORKDIR);
+        assert_eq!(report.checks[7].name, "workdir-writable");
+        assert_eq!(report.checks[7].verdict, PreflightVerdict::Fail);
+        assert_eq!(report.checks[7].hint, HINT_WORKDIR);
+    }
+
+    #[test]
+    fn test_executor_base_url_derivation() {
+        assert_eq!(
+            executor_base_url("http://127.0.0.1:9130/llm/execute"),
+            Some("http://127.0.0.1:9130".to_string())
+        );
+        // 自托管改路径:无后缀 → None(内省端点定位不了)
+        assert_eq!(executor_base_url("http://127.0.0.1:9130/custom"), None);
+    }
+
+    #[tokio::test]
+    async fn test_model_routes_pass_and_label_match() {
+        let mut executor = mockito::Server::new_async().await;
+        let body = r#"{"single_endpoint_mode":false,"default_model":"glm-5.3-flash",
+            "providers":[{"name":"zhipu","models":["glm-5.3-flash","glm-4.6"]}]}"#;
+        let _p = executor
+            .mock("GET", "/llm/providers")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut cfg = base_cfg();
+        cfg.llm.executor_url = format!("{}/llm/execute", executor.url());
+        cfg.llm.model = "glm-5.3-flash".to_string();
+        cfg.llm.provider = "zhipu".to_string();
+        let registry = probe_provider_registry(&cfg).await;
+        let routes = check_model_routes(&registry, &cfg.llm.model);
+        assert_eq!(routes.verdict, PreflightVerdict::Pass, "{}", routes.detail);
+        assert!(routes.detail.contains("zhipu"), "{}", routes.detail);
+        let label = check_provider_label(&registry, &cfg.llm.provider);
+        assert_eq!(label.verdict, PreflightVerdict::Pass, "{}", label.detail);
+    }
+
+    #[tokio::test]
+    async fn test_model_routes_fail_names_available_models() {
+        let mut executor = mockito::Server::new_async().await;
+        let body = r#"{"single_endpoint_mode":false,
+            "providers":[{"name":"zhipu","models":["glm-5.3-flash"]}]}"#;
+        let _p = executor
+            .mock("GET", "/llm/providers")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut cfg = base_cfg();
+        cfg.llm.executor_url = format!("{}/llm/execute", executor.url());
+        cfg.llm.model = "MiniMax-M2.5".to_string(); // 不在执行体路由表
+        let registry = probe_provider_registry(&cfg).await;
+        let routes = check_model_routes(&registry, &cfg.llm.model);
+        assert_eq!(routes.verdict, PreflightVerdict::Fail);
+        // 明细指名可用模型(自助修复面),指引非空且可执行
+        assert!(routes.detail.contains("glm-5.3-flash"), "{}", routes.detail);
+        assert!(!routes.hint.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_provider_registry_401_fails_with_token_hint() {
+        let mut executor = mockito::Server::new_async().await;
+        let _p = executor
+            .mock("GET", "/llm/providers")
+            .with_status(401)
+            .create_async()
+            .await;
+        let mut cfg = base_cfg();
+        cfg.llm.executor_url = format!("{}/llm/execute", executor.url());
+        let registry = probe_provider_registry(&cfg).await;
+        let routes = check_model_routes(&registry, "MiniMax-M2.5");
+        assert_eq!(routes.verdict, PreflightVerdict::Fail);
+        assert_eq!(routes.hint, HINT_EXECUTOR_TOKEN);
+    }
+
+    #[tokio::test]
+    async fn test_provider_registry_sends_bearer_token_when_set() {
+        let mut executor = mockito::Server::new_async().await;
+        let _p = executor
+            .mock("GET", "/llm/providers")
+            .match_header("authorization", "Bearer tok-1")
+            .with_status(200)
+            .with_body(r#"{"single_endpoint_mode":true,"providers":[]}"#)
+            .create_async()
+            .await;
+        let mut cfg = base_cfg();
+        cfg.llm.executor_url = format!("{}/llm/execute", executor.url());
+        cfg.llm.executor_token = Some("tok-1".to_string());
+        cfg.llm.model = "m".to_string();
+        let registry = probe_provider_registry(&cfg).await;
+        // 空路由表:模型不在表 → Fail(顺带覆盖 single_endpoint_mode=true 解析)
+        let routes = check_model_routes(&registry, "m");
+        assert_eq!(routes.verdict, PreflightVerdict::Fail, "{}", routes.detail);
+    }
+
+    #[test]
+    fn test_model_routes_warn_when_registry_unreachable() {
+        let probe = ProviderRegistryProbe::Unreachable("connection refused".to_string());
+        let routes = check_model_routes(&probe, "m");
+        assert_eq!(routes.verdict, PreflightVerdict::Warn);
+        // provider 标签判在注册表不可用时降级为信息项(不阻断)
+        let label = check_provider_label(&probe, "minimax");
+        assert_eq!(label.verdict, PreflightVerdict::Pass);
+    }
+
+    #[test]
+    fn test_provider_label_warn_on_mismatch_with_hint() {
+        let probe = ProviderRegistryProbe::Ready {
+            single_endpoint_mode: false,
+            providers: vec![("zhipu".to_string(), vec!["glm".to_string()])],
+        };
+        let label = check_provider_label(&probe, "minimax");
+        assert_eq!(label.verdict, PreflightVerdict::Warn);
+        assert!(label.hint.contains("zhipu"), "{}", label.hint);
+        // 前后空白容忍 + 命中 → Pass
+        let label_match = check_provider_label(&probe, " zhipu ");
+        assert_eq!(label_match.verdict, PreflightVerdict::Pass);
     }
 }
