@@ -13,8 +13,8 @@
 //! 1. 无 manifest 拒绝注册：[`crate::io_handlers::tool_handler::ToolHandler::register`]
 //!    接收 `(manifest, handler)`；按名查不到静态条目且非动态源（服务代理/MCP）
 //!    的注册在启动期 panic（fail-fast）。
-//! 2. 静态层锁定：内置 41 + 规则 60 + delegate 1 + memory 6 的 manifest 为
-//!    静态表（[`static_manifests`]，合计 108）；测试断言数量、名称无重叠、spec 可解析、
+//! 2. 静态层锁定：内置 53 + 规则 61 + delegate 2 + memory 6 的 manifest 为
+//!    静态表（[`static_manifests`]，合计 122）；测试断言数量、名称无重叠、spec 可解析、
 //!    派生视图与旧表快照一致——「union 42 vs 41」类注释漂移机制上不可能再现。
 //! 3. 动态层注册期补全：服务代理与 MCP 在注册期必须产出 spec
 //!    （[`SpecSource::Inline`]）；丢字段即注册失败。
@@ -649,6 +649,21 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // Interaction（申报型零文件/网络/子进程触点）；Standard 免裁决 +
         // AutoPolicy 直通，不进 EXFIL_SCAN_TOOLS。spec 常驻 default_tool_specs。
         b("plan_submit", vec![Interaction]),
+        // 桌面壳 GUI 自动化二件（B-484 装备批实现，o115 manifest 对齐批入表）：
+        // 经 desktop bridge IPC 观察用户前台桌面 UI（observe 含可选截图）/
+        // 驱动固定 UIA 动作集（act）。桥未在场的部署形态（CLI/serve）
+        // fail-visible 引导（BRIDGE_UNAVAILABLE），桌面壳装配经
+        // rebind_desktop_tools 注入 wired 执行体。spec 常驻 default_tool_specs。
+        // observe=只读观察（ReadOnly 显式标定，Standard+AutoPolicy 免裁决
+        // 同 read_skill 先例）；act=前台 UI 动作面（Process 域，双闸
+        // Sensitive+ManualDefault——用户前台 UI 写动作意图必报+人工默认
+        // 否决点，http_request 写动词同档先例）
+        {
+            let mut m = b("desktop_observe", vec![Process]);
+            m.side_effect = EffectClass::ReadOnly;
+            m
+        },
+        b("desktop_act", vec![Process]),
     ]
     .into_iter()
     .map(|mut m| {
@@ -660,7 +675,8 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             | "code_search" | "codegraph" | "chain_status" | "git_status" | "git_diff"
             | "git_log" | "query_journal" | "query_trace" | "read_back" | "diff_runs"
             | "read_skill" | "memory_recall" | "audit_query" | "audit_summary" | "todo_read"
-            | "handover_read" | "web_search" | "lsp" | "env_doctor" | "test_impact" => {
+            | "handover_read" | "web_search" | "lsp" | "env_doctor" | "test_impact"
+            | "desktop_observe" => {
                 m.side_effect = EffectClass::ReadOnly;
             }
             _ => {}
@@ -710,6 +726,13 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             // 否决点）。全批最严治理面：红线 + SSRF + exfil 横切 + 双闸
             // 四层叠加（见 http_request.rs 模块文档）
             "http_request" => {
+                m.adjudication_class = AdjudicationClass::Sensitive;
+                m.approval_policy = ApprovalPolicy::ManualDefault;
+            }
+            // desktop_act（o115 manifest 对齐批，前台 UI 动作面）：双闸同
+            // session_spawn/http_request 先例——Sensitive（用户前台 UI 写
+            // 动作意图必报）+ ManualDefault（每次调用人工默认否决点）
+            "desktop_act" => {
                 m.adjudication_class = AdjudicationClass::Sensitive;
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }
@@ -1221,9 +1244,9 @@ mod tests {
         //     版本查询探针零写面）
         //   （临界机验证 criticality_verify +1：规则 61，数量锁 118→120，
         //     Governance 域 ReadOnly 标定，判定只读回路）
-        assert_eq!(builtin_manifests().len(), 51);
+        assert_eq!(builtin_manifests().len(), 53);
         assert_eq!(rule_manifests().len(), 61);
-        assert_eq!(all().len(), 120);
+        assert_eq!(all().len(), 122);
     }
 
     #[test]
@@ -1266,7 +1289,7 @@ mod tests {
         names.extend(memory_manifests().iter().map(|m| m.name.clone()));
         // 数量锁(与模块头「内置+规则+delegate+memory」演进同源;计数漂移
         // 此处当场红)
-        assert_eq!(names.len(), 120, "static manifest count lock");
+        assert_eq!(names.len(), 122, "static manifest count lock");
         let mut sorted = names.clone();
         sorted.sort();
         let before = sorted.len();
@@ -1395,7 +1418,8 @@ mod tests {
 
     #[test]
     fn test_effect_class_calibration_locked() {
-        // 读写分级标定锁（并行调度分组判据）：只读族显式标定数=34
+        // 读写分级标定锁（并行调度分组判据）：只读族显式标定数=35
+        // （o115 manifest 对齐批 desktop_observe 只读观察 +1）
         // （审计摘要卡 audit_summary 只读小视图 +1；代码知识图谱只读查询
         // codegraph +1；语言服务器只读查询 lsp +1；编程环境预检
         // env_doctor +1；测试影响建议 test_impact +1；临界机验证
@@ -1407,7 +1431,7 @@ mod tests {
             .filter(|m| m.side_effect == EffectClass::ReadOnly)
             .map(|m| m.name.as_str())
             .collect();
-        assert_eq!(readonly.len(), 34, "ReadOnly 标定数锁: {:?}", readonly);
+        assert_eq!(readonly.len(), 35, "ReadOnly 标定数锁: {:?}", readonly);
         let look = |n: &str| lookup_static(n).unwrap().side_effect;
         // 内置只读族抽样
         assert_eq!(look("file_read"), EffectClass::ReadOnly);
@@ -1420,6 +1444,7 @@ mod tests {
         assert_eq!(look("handover_read"), EffectClass::ReadOnly);
         assert_eq!(look("web_search"), EffectClass::ReadOnly);
         assert_eq!(look("tool_result_fetch"), EffectClass::ReadOnly);
+        assert_eq!(look("desktop_observe"), EffectClass::ReadOnly);
         // memory 只读两件
         assert_eq!(
             look(crate::agent::memory_tool::MEMORY_SEARCH_TOOL),
@@ -1498,6 +1523,9 @@ mod tests {
         "memory_tombstone",
         // 批K 段5:HTTP 写动词（双闸 Sensitive+ManualDefault——写动词意图必报）
         "http_request",
+        // o115 manifest 对齐批:desktop_act 落地 Sensitive（前台 UI 动作面
+        // 双闸，桥未在场 fail-visible 不影响裁决集语义）→ 36 条（快照重录 diff 审）
+        "desktop_act",
     ];
 
     #[test]
