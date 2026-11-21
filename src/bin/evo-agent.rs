@@ -54,7 +54,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueHint};
+use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 
 use evo_agent::agent::definition::AgentDefinitionManager;
 use evo_agent::agent::delegate::DelegateContext;
@@ -99,6 +99,16 @@ struct Cli {
     command: Command,
 }
 
+/// Session coding profile for `run --profile` (argparse-enforced enum;
+/// invalid values are rejected at parse time with the usage exit code).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SessionProfile {
+    /// Coding profile on (workspace map, background index warm-up)
+    Coding,
+    /// Legacy opt-out: profile off, behavior identical to pre-default runs
+    Manual,
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// 跑 agent(给一个 goal)
@@ -127,6 +137,15 @@ enum Command {
         /// JSON 事件流缩进输出(隐含 --json;人读检视用,机器消费用 --json)
         #[arg(long)]
         json_pretty: bool,
+
+        /// Session coding profile override: 'coding' forces the coding
+        /// profile on, 'manual' restores the legacy profile-off behavior
+        /// (byte-identical to runs before the coding-entry default). Wins
+        /// over the workspace settings `session.profile` value; without
+        /// this flag the settings value is validated fail-fast (invalid
+        /// values abort with the usage/config exit code)
+        #[arg(long, value_enum)]
+        profile: Option<SessionProfile>,
 
         /// 39 号项 A:生成项目 AGENTS.md 骨架到 {workdir}/AGENTS.md
         /// (扫描顶层结构+空节模板);已存在则拒绝覆盖,不带 goal 也可运行
@@ -507,6 +526,7 @@ fn main() -> ExitCode {
             stream,
             json,
             json_pretty,
+            profile,
             init,
         } => {
             if init {
@@ -526,6 +546,7 @@ fn main() -> ExitCode {
                     json || json_pretty,
                     json_pretty,
                     cli.no_preflight,
+                    profile.map(|p| p == SessionProfile::Coding),
                 )
             })
         }
@@ -1102,6 +1123,32 @@ fn cmd_doctor(workdir: &Path, json: bool) -> ExitCode {
 // =============================================================================
 
 #[allow(clippy::too_many_arguments)]
+/// Resolve the effective coding-profile override for `run`. `Ok(Some(on))`
+/// = explicit CLI override (settings are never consumed); `Ok(None)` =
+/// defer to the runner assembly point (settings resolution / default ON);
+/// `Err` = invalid workspace `session.profile` value (fail-fast: the caller
+/// exits with the usage/config code).
+fn resolve_run_profile_override(
+    workdir: &Path,
+    cli_override: Option<bool>,
+) -> Result<Option<bool>, String> {
+    match cli_override {
+        Some(on) => Ok(Some(on)),
+        None => {
+            let raw = std::fs::read_to_string(workdir.join(".evo").join("settings.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|v| {
+                    v.get("session.profile")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string)
+                });
+            evo_agent::agent::runner::resolve_session_profile(raw.as_deref()).map(|_| None)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_run(
     workdir: &Path,
     goal: &str,
@@ -1111,7 +1158,20 @@ fn cmd_run(
     json: bool,
     json_pretty: bool,
     no_preflight: bool,
+    profile_override: Option<bool>,
 ) -> ExitCode {
+    // 0. Session coding profile resolution (run entry surface, fail-fast):
+    // the CLI flag wins over workspace settings; without the flag the
+    // workspace `session.profile` value is validated here — an invalid
+    // value aborts with the usage/config exit code instead of being
+    // guessed at runner assembly time.
+    let profile_override = match resolve_run_profile_override(workdir, profile_override) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
     // 1. 加载配置
     let config = match evo_agent::config::Config::load(workdir) {
         Ok(c) => c,
@@ -1409,6 +1469,9 @@ fn cmd_run(
                 // journal=None(子轨迹无账)——CLI/serve 不对称。
                 // 治理段:CLI 主路径无 S2 段,子代理同口径 None(delegate
                 // 字段文档口径);serve 三面才存在治理段下放。
+                // 编码入口档:--profile 显式覆盖 > workspace settings >
+                // 缺省开(解析语义见 with_journal_dir 单点)
+                .with_session_profile_override(profile_override)
                 .with_journal_dir(workdir.join("data").join("sessions"))
                 .with_workspace_checkpoint(workdir)
                 .with_delegate_context({
@@ -5475,6 +5538,68 @@ fn evidence_mark(
 mod tests {
     use super::*;
     use evo_agent::{EventSource, EventType, MemoryEvent};
+
+    // === Coding profile run-entry resolution contract ===
+
+    #[test]
+    fn run_profile_invalid_settings_value_is_fail_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".evo")).unwrap();
+        std::fs::write(
+            dir.path().join(".evo").join("settings.json"),
+            r#"{"session.profile": "turbo"}"#,
+        )
+        .unwrap();
+        let err = resolve_run_profile_override(dir.path(), None).unwrap_err();
+        assert!(err.contains("invalid session.profile"), "{err}");
+    }
+
+    #[test]
+    fn run_profile_valid_settings_values_defer_to_runner() {
+        for value in ["coding", "manual"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".evo")).unwrap();
+            std::fs::write(
+                dir.path().join(".evo").join("settings.json"),
+                format!(r#"{{"session.profile": "{value}"}}"#),
+            )
+            .unwrap();
+            assert_eq!(
+                resolve_run_profile_override(dir.path(), None).unwrap(),
+                None,
+                "valid settings value {value} defers to the runner assembly point"
+            );
+        }
+    }
+
+    #[test]
+    fn run_profile_absent_settings_defer_to_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_run_profile_override(dir.path(), None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn run_profile_cli_flag_wins_without_touching_settings() {
+        // The explicit CLI override wins even over an invalid settings file.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".evo")).unwrap();
+        std::fs::write(
+            dir.path().join(".evo").join("settings.json"),
+            r#"{"session.profile": "turbo"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_run_profile_override(dir.path(), Some(false)).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_run_profile_override(dir.path(), Some(true)).unwrap(),
+            Some(true)
+        );
+    }
 
     fn make_event(id: &str, fact_id: Option<u64>) -> MemoryEvent {
         let mut e =

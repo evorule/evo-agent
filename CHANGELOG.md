@@ -36,6 +36,29 @@
 
 ## [Unreleased]
 
+### Coding entry default + headless run contract
+
+- 🔄 Changed: the coding profile is now **ON by default** for every session
+  (run/serve): the workspace map renders into the persistent service-catalog
+  slot, a background code-index warm-up is scheduled (fail-soft), and the
+  service-catalog segment is replaced accordingly. Opt-out channels restore
+  the previous behavior exactly: `run --profile manual` (CLI) or
+  `session.profile = "manual"` in `{workdir}/.evo/settings.json` (workspace).
+  Settings semantics: missing key / null = on, `"coding"` = on,
+  `"manual"` = off; any other value is a configuration error — the run
+  command aborts with exit code `2` instead of guessing.
+- 🆕 Added: `run --profile <coding|manual>` explicit override (CLI wins over
+  workspace settings; invalid enum values are rejected at parse time).
+- 🆕 Added: `agents/coder.json` — a coding-domain agent definition
+  (select with `--agent coder`): read-before-edit / minimal-diff /
+  verify-after-change discipline, repository navigation and git tools, plus
+  read-only rule/knowledge lookups. `apply_patch` and the rule write family
+  are deliberately not exposed.
+- 🆕 Added: `docs/headless-ci.md` — machine-facing contract for `run --json`
+  (NDJSON stdout stream) and the exit-code table (0 success, 1 agent
+  failure, 2 usage/config error; 3 reserved for the planned output-schema
+  validation), with a minimal GitHub Actions recipe.
+
 ### Extraction-side variant merging (opt-in)
 
 - 🆕 新增:提取端写前归并（D2-二期）——sediment 稳定事实落库前按

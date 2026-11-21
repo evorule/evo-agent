@@ -9731,7 +9731,7 @@ mod g8_rejection_payload_tests {
     }
 }
 
-// === P2 coding profile:workspace 层 session.profile 激活链 ===
+// === Coding profile:workspace 层 session.profile 解析链(缺省开+manual 退出档) ===
 
 #[test]
 fn coding_profile_activates_map_and_flag_via_workspace_settings() {
@@ -9750,29 +9750,148 @@ fn coding_profile_activates_map_and_flag_via_workspace_settings() {
         .with_journal_dir(ws.join("data").join("sessions"));
     assert!(
         runner.session_coding_profile_for_test(),
-        "coding 档旗标激活"
+        "coding profile flag active"
     );
     let seg = runner
         .coding_repo_map_segment_for_test()
         .expect("repo map rendered");
     assert!(seg.contains("## Workspace Map"));
-    assert!(seg.contains("src_main.rs"), "地图含工作区条目: {seg}");
+    assert!(
+        seg.contains("src_main.rs"),
+        "map contains workspace entry: {seg}"
+    );
 }
 
 #[test]
-fn coding_profile_absent_defaults_manual_zero_change() {
-    // 缺省不变式:缺文件/缺键/非法值 = manual = 零旗标零地图
+fn coding_profile_defaults_on_without_settings() {
+    // Product default: no settings file (or missing key/null value) = coding
+    // profile ON — same assembly shape as the explicit settings=coding path.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("data").join("sessions")).unwrap();
+    std::fs::write(ws.join("src_main.rs"), b"").unwrap();
+
+    let runner = AgentRunner::new(AgentConfig::default(), make_test_client())
+        .with_journal_dir(ws.join("data").join("sessions"));
+    assert!(
+        runner.session_coding_profile_for_test(),
+        "default = coding profile ON"
+    );
+    let seg = runner
+        .coding_repo_map_segment_for_test()
+        .expect("repo map rendered on default path");
+    assert!(seg.contains("## Workspace Map"));
+    assert!(seg.contains("src_main.rs"));
+}
+
+#[test]
+fn coding_profile_null_value_defaults_on() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path();
     std::fs::create_dir_all(ws.join("data").join("sessions")).unwrap();
     std::fs::create_dir_all(ws.join(".evo")).unwrap();
-    // 非法 JSON 也如实降 manual
-    std::fs::write(ws.join(".evo").join("settings.json"), b"{broken").unwrap();
+    std::fs::write(
+        ws.join(".evo").join("settings.json"),
+        r#"{"session.profile": null}"#,
+    )
+    .unwrap();
+
+    let runner = AgentRunner::new(AgentConfig::default(), make_test_client())
+        .with_journal_dir(ws.join("data").join("sessions"));
+    assert!(runner.session_coding_profile_for_test(), "null = ON");
+}
+
+#[test]
+fn coding_profile_manual_settings_restore_legacy_default() {
+    // Compat anchor: settings "manual" (and the CLI `--profile manual` exit
+    // hatch) must reproduce the legacy byte-for-byte behavior = flag off,
+    // no workspace map, S2d slot keeps the persistent service catalog.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("data").join("sessions")).unwrap();
+    std::fs::create_dir_all(ws.join(".evo")).unwrap();
+    std::fs::write(
+        ws.join(".evo").join("settings.json"),
+        r#"{"session.profile": "manual"}"#,
+    )
+    .unwrap();
+    std::fs::write(ws.join("src_main.rs"), b"").unwrap();
+
+    let runner = AgentRunner::new(AgentConfig::default(), make_test_client())
+        .with_journal_dir(ws.join("data").join("sessions"));
+    assert!(
+        !runner.session_coding_profile_for_test(),
+        "manual = legacy behavior"
+    );
+    assert!(runner.coding_repo_map_segment_for_test().is_none());
+}
+
+#[test]
+fn coding_profile_cli_override_wins_over_settings() {
+    // CLI > settings priority in both directions.
+    for (settings_value, override_on, expected) in
+        [("coding", false, false), ("manual", true, true)]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("data").join("sessions")).unwrap();
+        std::fs::create_dir_all(ws.join(".evo")).unwrap();
+        std::fs::write(
+            ws.join(".evo").join("settings.json"),
+            format!(r#"{{"session.profile": "{settings_value}"}}"#),
+        )
+        .unwrap();
+
+        let runner = AgentRunner::new(AgentConfig::default(), make_test_client())
+            .with_session_profile_override(Some(override_on))
+            .with_journal_dir(ws.join("data").join("sessions"));
+        assert_eq!(
+            runner.session_coding_profile_for_test(),
+            expected,
+            "override Some({override_on}) must win over settings={settings_value}"
+        );
+    }
+}
+
+#[test]
+fn coding_profile_invalid_settings_value_falls_back_manual_visibly() {
+    // Runner-level contract for an invalid settings value: the run entry
+    // point exits fail-fast; the runner itself reports the error visibly and
+    // falls back to the manual profile instead of guessing.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("data").join("sessions")).unwrap();
+    std::fs::create_dir_all(ws.join(".evo")).unwrap();
+    std::fs::write(
+        ws.join(".evo").join("settings.json"),
+        r#"{"session.profile": "turbo"}"#,
+    )
+    .unwrap();
 
     let runner = AgentRunner::new(AgentConfig::default(), make_test_client())
         .with_journal_dir(ws.join("data").join("sessions"));
     assert!(!runner.session_coding_profile_for_test());
     assert!(runner.coding_repo_map_segment_for_test().is_none());
+}
+
+#[test]
+fn resolve_session_profile_contract() {
+    // Value-domain contract (shared by the run entry point and the runner
+    // assembly point): missing/null=ON, coding=ON, manual=OFF, other=error.
+    assert_eq!(
+        crate::agent::runner::resolve_session_profile(None),
+        Ok(true)
+    );
+    assert_eq!(
+        crate::agent::runner::resolve_session_profile(Some("coding")),
+        Ok(true)
+    );
+    assert_eq!(
+        crate::agent::runner::resolve_session_profile(Some("manual")),
+        Ok(false)
+    );
+    assert!(crate::agent::runner::resolve_session_profile(Some("turbo")).is_err());
+    assert!(crate::agent::runner::resolve_session_profile(Some("Coding")).is_err());
 }
 
 // === Acceptance evidence (long-horizon batch): projection injection,

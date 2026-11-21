@@ -1,0 +1,89 @@
+{
+  "agent_type": "coder",
+  "version": "0.1.0",
+  "description": "Coding-domain agent — read-before-edit implementation, minimal diffs, build/test verification, repository navigation, and delegated sub-agent work",
+  "license": "AGPL-3.0-or-later",
+  "system_prompt": "You are a disciplined coding agent. Software-engineering discipline: before editing any file, read it first (read-before-edit); produce the minimal diff that satisfies the goal instead of rewriting surrounding code; after every change verify it (run build_check or the project test commands, and fix what they surface before reporting done); follow the AGENTS.md conventions of the workspace you are working in; keep command usage inside the approved tool surface and never attempt to escape it. Repository navigation: prefer file_read/file_list/search_files/grep_files/code_search to locate code, git_status/git_diff/git_log to understand state, and edit_file/file_write/file_create for changes (workspace_undo reverts mistakes). For broader edits consider delegating focused subtasks with delegate. http_get/web_fetch/web_search and the browser_* family are available for read-only information gathering. Rule and knowledge lookups (rule_list/rule_get/rule_validate/knowledge_search/knowledge_entry_get/audit_get) are available when the workspace carries governance rules — consult them when asked, without letting governance narrative dominate coding work.",
+  "model": "MiniMax-M3",
+  "temperature": 0.3,
+  "max_steps": 500,
+  "context_window_tokens": 1000000,
+  "wall_clock_budget_secs": 28800,
+  "step_timeout_secs": 3600,
+  "max_chain_depth": 5,
+  "tools": [
+    "file_read",
+    "file_list",
+    "file_write",
+    "file_create",
+    "file_move",
+    "file_delete",
+    "edit_file",
+    "workspace_undo",
+    "read_back",
+    "search_files",
+    "grep_files",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_stage",
+    "git_commit",
+    "shell_exec",
+    "build_check",
+    "http_get",
+    "python_exec",
+    "todo_write",
+    "todo_read",
+    "code_search",
+    "web_fetch",
+    "web_search",
+    "delegate",
+    "tool_result_fetch",
+    "diff_runs",
+    "rule_list",
+    "rule_get",
+    "rule_versions",
+    "rule_version_get",
+    "rule_validate",
+    "knowledge_datasets",
+    "knowledge_search",
+    "knowledge_entry_get",
+    "audit_get",
+    "mcp_*",
+    "browser_*"
+  ],
+  "memory": {
+    "type": "persistent",
+    "namespace": "coder",
+    "message_persist": {
+      "mode": "every_message"
+    },
+    "max_session_summaries": 3,
+    "max_injected_events": 5,
+    "enable_event_extraction": true,
+    "summary_model": "MiniMax-M3",
+    "lex_store": "data/lex/coder.db",
+    "recipe": {
+      "retrieval": {
+        "variant_dedupe": true,
+        "normalize_attributes": true
+      },
+      "tools": {
+        "expose": ["memory_search", "memory_get"]
+      },
+      "adjudication": {
+        "enabled": true
+      }
+    }
+  },
+  "verify": {
+    "commands": [
+      {
+        "name": "cargo-check",
+        "command": "cargo check --message-format=short",
+        "matcher": "$rustc",
+        "timeout_secs": 120
+      }
+    ]
+  }
+}

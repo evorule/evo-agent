@@ -1366,6 +1366,24 @@ fn push_context_signal(
     true
 }
 
+/// Resolve the session coding profile from the raw `session.profile`
+/// settings value. Semantics (coding-entry product ruling): missing key or
+/// JSON null = ON, `"coding"` = ON, `"manual"` = OFF (legacy opt-out), any
+/// other non-null value = configuration error (fail-fast; never guessed).
+/// Callers decide how to surface `Err` (the run entry point exits with the
+/// usage/config code; the runner assembly point falls back to the manual
+/// profile with a visible warning).
+pub fn resolve_session_profile(raw: Option<&str>) -> Result<bool, String> {
+    match raw {
+        None => Ok(true),
+        Some("coding") => Ok(true),
+        Some("manual") => Ok(false),
+        Some(other) => Err(format!(
+            "invalid session.profile value '{other}' (expected \"coding\" or \"manual\")"
+        )),
+    }
+}
+
 /// TODO: doc
 pub struct AgentRunner {
     /// 项目记忆段(AGENTS.md 层级注入;启动/构造时算好,组装期追加到 system prompt 尾段)
@@ -1550,10 +1568,20 @@ pub struct AgentRunner {
     /// 坑账本注入段(装载期按触及面关键词过滤+预算帽渲染一次;None=不注入,
     /// 治理段槽位与现行为逐字节一致)
     governance_pit_segment: Option<String>,
-    /// P2 coding profile 旗标(workspace 层 `.evo/settings.json` 的
-    /// `session.profile=coding` 激活;false=manual=现状零变化)。效果=常驻
-    /// 服务目录槽位内容替换为工作区地图(裁剪治理常驻目录+注入 repo map)
+    /// Coding profile flag (S2d slot content replacement: persistent
+    /// service catalog replaced by the workspace map). Resolution happens
+    /// once at the [`Self::with_journal_dir`] assembly point: explicit CLI
+    /// override wins, then the workspace `.evo/settings.json`
+    /// `session.profile` value ("coding"=on, "manual"=off), then the
+    /// product default = ON. Constructions that never reach the assembly
+    /// point (sub-agent spawn, bare test constructors) keep `false` =
+    /// legacy behavior.
     session_coding_profile: bool,
+    /// Explicit CLI override for the coding profile (`--profile coding` /
+    /// `--profile manual`). `Some` wins over workspace settings and the
+    /// default-on ruling; `None` = resolve from workspace settings, then
+    /// default ON. Set only by the run entry point.
+    session_profile_override: Option<bool>,
     /// 工作区地图段(装载期确定性渲染一次的会话开工快照;None=未激活)
     coding_repo_map_segment: Option<String>,
     /// 会话执行环境 profile 标记(serve 请求级>定义级、CLI 定义级
@@ -1801,6 +1829,7 @@ impl AgentRunner {
             governance_workspace: None,
             governance_pit_segment: None,
             session_coding_profile: false,
+            session_profile_override: None,
             coding_repo_map_segment: None,
             execution_profile: None,
             compaction_policy: None,
@@ -2678,25 +2707,66 @@ impl AgentRunner {
                 }
             }
         }
-        // P2 coding profile:workspace 层设置直读(`.evo/settings.json`=
-        // 合并语义中最高优先级的人工文件面;CLI/serve 全路径共用本单点;
-        // 缺文件/键/非法值=manual=现状零变化)。repo map 会话开工快照
-        // 同点渲染(coding 档下 S2d 槽位内容替换为工作区地图)。
+        // Coding profile resolution (single assembly point, CLI/serve
+        // shared). Priority: explicit CLI override > workspace
+        // `.evo/settings.json` `session.profile` > product default ON.
+        // Settings resolution: "coding"=on, "manual"=off, missing/null=on,
+        // any other value = configuration error — the run entry point
+        // exits fail-fast on it; here (long-lived serve paths) the error
+        // is reported visibly and the session falls back to the manual
+        // profile instead of guessing. Unreadable/unparseable settings
+        // files count as unset (default ON) with a visible warning.
+        // When the profile resolves ON, the workspace map snapshot renders
+        // at the same point (S2d slot content replacement) plus the
+        // fail-soft background index warm-up.
         if let Some(ws) = dir.parent().and_then(std::path::Path::parent) {
             let settings_path = ws.join(".evo").join("settings.json");
-            if let Ok(text) = std::fs::read_to_string(&settings_path) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if v.get("session.profile").and_then(|s| s.as_str()) == Some("coding") {
-                        self.session_coding_profile = true;
-                        self.coding_repo_map_segment =
-                            crate::agent::repo_map::render_workspace_map(ws);
-                        // 索引预热(coding 档):后台一次性 ensure_index,fail-soft
-                        // (桥不可达/无运行时静默跳过;状态经 codegraph status 查)
-                        crate::builtin_tools::codegraph::spawn_background_ensure_index(ws);
+            let raw = match std::fs::read_to_string(&settings_path) {
+                Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(v) => v
+                        .get("session.profile")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string),
+                    Err(e) => {
+                        eprintln!(
+                            "[settings] cannot parse {} ({e}); treating session.profile as unset",
+                            settings_path.display()
+                        );
+                        None
                     }
+                },
+                // Absent file = the common case = default ON path below.
+                Err(_) => None,
+            };
+            let resolved = match self.session_profile_override {
+                Some(on) => Ok(on),
+                None => resolve_session_profile(raw.as_deref()),
+            };
+            match resolved {
+                Ok(true) => {
+                    self.session_coding_profile = true;
+                    self.coding_repo_map_segment = crate::agent::repo_map::render_workspace_map(ws);
+                    // Index warm-up (coding profile): background one-shot
+                    // ensure_index, fail-soft (unreachable bridge / no
+                    // runtime skipped silently; state visible via
+                    // codegraph status)
+                    crate::builtin_tools::codegraph::spawn_background_ensure_index(ws);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("[settings] {e}; falling back to the manual profile");
                 }
             }
         }
+        self
+    }
+
+    /// Explicit coding-profile override (CLI `--profile coding|manual`).
+    /// `Some(true)` / `Some(false)` wins over the workspace
+    /// `session.profile` settings value and over the default-on ruling;
+    /// `None` (default) resolves from workspace settings, then defaults ON.
+    pub fn with_session_profile_override(mut self, override_on: Option<bool>) -> Self {
+        self.session_profile_override = override_on;
         self
     }
 
@@ -6011,6 +6081,7 @@ impl AgentRunner {
                 governance_pit_segment: None,
                 // coding profile:子代理不继承(会话级治理面,缺省不变式)
                 session_coding_profile: false,
+                session_profile_override: None,
                 coding_repo_map_segment: None,
                 acceptance_command: acceptance_command.clone(),
                 // G4:子代理不继承判据生成开关(生成判据=父任务开工时的内存锁态,
