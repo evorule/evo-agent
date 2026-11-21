@@ -476,7 +476,7 @@ fn default_safe_toolkit_core(
         crate::agent::audit_summary_tool::AUDIT_SUMMARY_TOOL,
         Arc::new(crate::agent::audit_summary_tool::AuditSummaryTool::unwired()),
     );
-    // 桌面壳 GUI 自动化二件（B-484 装备批实现，o115 manifest 对齐批入表）：
+    // 桌面壳 GUI 自动化二件（桌面壳装备批实现，manifest 对齐批入表）：
     // 占位执行体启动期注册（桥未在场 fail-visible 引导），桌面壳装配路径经
     // rebind_desktop_tools 注入 wired 桥执行体；治理档位见 manifest
     // （observe Standard 只读 / act Sensitive+ManualDefault 双闸）
@@ -578,7 +578,7 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                 },
             ],
         },
-        // 桌面壳 GUI 自动化二件（B-484 装备批实现，o115 manifest 对齐批入
+        // 桌面壳 GUI 自动化二件（桌面壳装备批实现，manifest 对齐批入
         // 契约面）：仅桌面壳装配环境可用（桥未在场 fail-visible 引导
         // BRIDGE_UNAVAILABLE）；act 每次调用出审批提案（Manifest 双闸）。
         // 参数契约与 desktop.rs Args 结构（deny_unknown_fields）逐字段对齐。
