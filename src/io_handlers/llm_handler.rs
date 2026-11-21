@@ -1530,6 +1530,50 @@ pub(crate) fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
 }
 
+/// 执行体分类错误体（错误面映射）：body 含 code+retryable 双键时视为
+/// 分类形态（与插件 error_response 下发形状对齐）——retryable=false 的
+/// 分类（auth/model_unknown 族）不该烧重试；缺任一键 = None（旧执行体
+/// 无分类字段，既有路径零变化）。
+#[derive(Debug, Clone)]
+pub(crate) struct ExecutorErrorClass {
+    pub code: String,
+    pub retryable: bool,
+    pub provider: Option<String>,
+    pub hint: Option<String>,
+}
+
+impl ExecutorErrorClass {
+    /// 机器可读后缀（嵌入错误消息；可按 `[code=` 检索回读）
+    pub fn suffix(&self) -> String {
+        let mut s = format!("[code={} retryable={}", self.code, self.retryable);
+        if let Some(p) = &self.provider {
+            s.push_str(&format!(" provider={p}"));
+        }
+        if let Some(h) = &self.hint {
+            s.push_str(&format!(" hint={h}"));
+        }
+        s.push(']');
+        s
+    }
+}
+
+pub(crate) fn parse_executor_error_class(text: &str) -> Option<ExecutorErrorClass> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let code = v.get("code")?.as_str()?.to_string();
+    let retryable = v.get("retryable")?.as_bool()?;
+    let provider = v
+        .get("provider")
+        .and_then(|p| p.as_str())
+        .map(str::to_string);
+    let hint = v.get("hint").and_then(|h| h.as_str()).map(str::to_string);
+    Some(ExecutorErrorClass {
+        code,
+        retryable,
+        provider,
+        hint,
+    })
+}
+
 /// G3:判断网络层错误是否值得重试(direct 档复用,同上)
 pub(crate) fn is_retryable_error(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request()
@@ -1621,14 +1665,30 @@ impl IoHandler for LlmHandler {
                     let backoff = parse_retry_after(&resp).unwrap_or_else(|| {
                         backoff_duration(attempt, self.base_backoff_secs, self.max_backoff_secs)
                     });
+                    // 消费 body 以释放连接(否则 reqwest 会泄漏 socket);同时
+                    // 分类判读先行:执行体明示不可重试(auth/model_unknown 族)
+                    // → 不烧重试立即失败,code/provider/hint 随消息上行
+                    let error_text = resp.text().await.unwrap_or_default();
+                    if let Some(class) = parse_executor_error_class(&error_text) {
+                        if !class.retryable {
+                            warn!(
+                                code = %class.code,
+                                "executor classified failure is non-retryable, failing fast"
+                            );
+                            return Err(format!(
+                                "LLM API error ({}): {} {}",
+                                status,
+                                error_text,
+                                class.suffix()
+                            ));
+                        }
+                    }
                     warn!(
                         attempt,
                         status = status.as_u16(),
                         backoff_ms = backoff.as_millis() as u64,
                         "LLM API retryable status, backing off"
                     );
-                    // 消费 body 以释放连接(否则 reqwest 会泄漏 socket)
-                    let _ = resp.text().await;
                     tokio::time::sleep(backoff).await;
                     continue;
                 }
@@ -1667,7 +1727,12 @@ impl IoHandler for LlmHandler {
                     } else {
                         warn!(status = status.as_u16(), "LLM API non-retryable error");
                     }
-                    return Err(format!("LLM API error ({}): {}", status, error_text));
+                    let mut message = format!("LLM API error ({}): {}", status, error_text);
+                    if let Some(class) = parse_executor_error_class(&error_text) {
+                        message.push(' ');
+                        message.push_str(&class.suffix());
+                    }
+                    return Err(message);
                 }
 
                 // 网络错误 + 可重试 + 还有重试次数
@@ -1720,6 +1785,32 @@ pub(crate) fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn executor_error_class_parse_and_suffix() {
+        // 分类形态（插件 error_response 下发形状）：code+retryable 双键齐 = 分类
+        let body = r#"{"error":"LLM 执行失败: x","code":"model_unknown","retryable":false,"provider":"zhipu","hint":"换模型"}"#;
+        let class = parse_executor_error_class(body).expect("双键齐应解析为分类");
+        assert_eq!(class.code, "model_unknown");
+        assert!(!class.retryable);
+        assert_eq!(class.provider.as_deref(), Some("zhipu"));
+        let sfx = class.suffix();
+        assert!(
+            sfx.starts_with("[code=model_unknown retryable=false"),
+            "{sfx}"
+        );
+        assert!(sfx.contains("provider=zhipu"), "{sfx}");
+        assert!(sfx.contains("hint=换模型"), "{sfx}");
+        // retryable=true（rate_limit 族）：既有退避重试路径不受影响
+        let rl =
+            parse_executor_error_class(r#"{"error":"x","code":"rate_limit","retryable":true}"#)
+                .unwrap();
+        assert!(rl.retryable);
+        assert!(rl.provider.is_none());
+        // 旧执行体无分类字段 / 非 JSON → None（既有路径零变化）
+        assert!(parse_executor_error_class(r#"{"error":"plain"}"#).is_none());
+        assert!(parse_executor_error_class("not json").is_none());
+    }
+
     use super::*;
     use crate::io_handler::IoHandler;
     use futures_util::StreamExt;
