@@ -4786,6 +4786,64 @@ impl AgentRunner {
                                             "heartbeat abort: terminal io_response submit failed (best-effort)");
                                     }
                                 }
+                            } else {
+                                // 断流对账采纳（o111 主层修复）：无在途 io = 引擎已消费
+                                // 我方全部 io_response——最终回复已被接受、引擎到达终态，
+                                // 仅终态事件被断流吞掉。采纳为成功（产出=缓冲的最后
+                                // assistant 消息），不以假失败掩盖已完成工作。竞态窗评估：
+                                // 本分支仅在通道重建+心跳梯尽（≥2×60s）后到达，本地确定性
+                                // 反应器的下一 io_request（若存在）早已入账并被
+                                // plan_pending_resolution 捕获——「无在途 io」=真终态。
+                                info!(%session_id, step_count,
+                                    "history reconcile: no pending io after stream loss; considering terminal-state adoption");
+                                // 采纳前 D-01 二次保险：断流可能吞掉 Violation 帧——
+                                // 先查 evolution-signals；非哨兵原样返回（命中=如实报错，
+                                // 兜底不可用=不采纳 fail-visible），仅无违规时才采纳。
+                                const ADOPT_SENTINEL: &str = "stream lost pre-terminal (no violation detected)";
+                                let enforce_err = self
+                                    .detect_enforce_after_stream_close(&session_id, ADOPT_SENTINEL)
+                                    .await;
+                                if enforce_err != ADOPT_SENTINEL {
+                                    let duration = start_time.elapsed().as_millis() as u64;
+                                    self.submit_tool_traces(&session_id).await;
+                                    return Ok(AgentResult::error(enforce_err, step_count, duration));
+                                }
+                                // 空产出防线（对齐「不以空产出伪装成功」）：采纳必须
+                                // 有实质 assistant 产出（最终回复确曾流式下行）；缓冲
+                                // 无 assistant 消息=无采纳物，fail-visible 如实报错。
+                                let adopt_content = messages.iter().rev().find_map(|m| match m {
+                                    Message::Assistant { content, .. } => Some(content.clone()),
+                                    _ => None,
+                                })
+                                .unwrap_or_default();
+                                if adopt_content.is_empty() {
+                                    let duration = start_time.elapsed().as_millis() as u64;
+                                    self.submit_tool_traces(&session_id).await;
+                                    return Ok(AgentResult::error(
+                                        "stream lost after rebuild: no pending io and no assistant content to adopt".to_string(),
+                                        step_count,
+                                        duration,
+                                    ));
+                                }
+                                info!(%session_id, step_count,
+                                    "history reconcile: adopting terminal state as success (assistant content {} chars)",
+                                    adopt_content.chars().count());
+                                let duration = start_time.elapsed().as_millis() as u64;
+                                if let Err(e) = self.flush_messages(&session_id).await {
+                                    tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                }
+                                if let Err(e) = self.sediment_session(&session_id, &messages, None).await {
+                                    tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                                }
+                                self.submit_tool_traces(&session_id).await;
+                                let mut result = AgentResult::success(
+                                    adopt_content,
+                                    step_count,
+                                    duration,
+                                    tool_calls.clone(),
+                                );
+                                result.tokens = self.usage_counter.as_ref().map(|c| c.snapshot());
+                                return Ok(result);
                             }
                         }
                         Err(e) => {
@@ -4826,7 +4884,30 @@ impl AgentRunner {
                 }
             };
             // 流结束(None)=引擎事件流自然关闭,走既有断流收尾路径
-            let Some(event) = event_opt else { break };
+            let Some(event) = event_opt else {
+                // 断流恢复梯（o111）：干净断流（流结束且无终态事件）不再直接判死。
+                // 服务端 SSE 空闲闸/网络中间层可在长 LLM 调用期优雅关闭连接，而引擎
+                // 侧回合此时可能已完成（假失败主层）。梯位：①重建一次并继续事件
+                // 等待——若引擎仍有后续事件（中途断流）则照常消费；重建后仍无事件
+                // 则由心跳梯尽进入上方对账收尾（无在途 io=采纳终态/有在途=弃轮）。
+                if !stream_rebuilt {
+                    stream_rebuilt = true;
+                    warn!(%session_id, step_count,
+                        "event stream closed cleanly without terminal event; rebuilding (stream-recovery step 1)");
+                    match self.evorule_client.subscribe_events(&session_id).await {
+                        Ok(es) => {
+                            event_stream = es;
+                            heartbeat_misses = 0;
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(%session_id, error = %e,
+                                "event stream rebuild failed; falling through to history reconcile");
+                        }
+                    }
+                }
+                break;
+            };
             // 心跳恢复:任一引擎事件到达即重置失联计数(修订⑦)
             heartbeat_misses = 0;
             // G6:取消检查(event 边界 — 即使 LLM 调用已返回,也在此处响应取消)
@@ -9693,7 +9774,36 @@ impl AgentRunner {
                                let event = tokio::select! {
                                    ev = event_stream.next() => match ev {
                                        Some(e) => e,
-                                       None => break,
+                                       None => {
+                                           // 断流恢复梯（o111，流式镜像）：干净断流
+                                           // （无终态事件）不直接弃轮——重建一次并继续
+                                           // 等待；重建后仍无事件由心跳梯尽进入对账
+                                           // 收尾（无在途 io=采纳终态/有在途=弃轮）。
+                                           if !stream_rebuilt {
+                                               stream_rebuilt = true;
+                                               warn!(%session_id, step_count,
+                                                   "event stream closed cleanly without terminal event; rebuilding (stream-recovery step 1)");
+                                               yield Ok(AgentEvent::Info(
+                                                   "event stream closed cleanly without terminal event; rebuilding engine event stream (stream-recovery step 1)".to_string(),
+                                               ));
+                                               match runner
+                                                   .evorule_client
+                                                   .subscribe_events(&session_id)
+                                                   .await
+                                               {
+                                                   Ok(es) => {
+                                                       event_stream = es;
+                                                       heartbeat_misses = 0;
+                                                       continue;
+                                                   }
+                                                   Err(e) => {
+                                                       warn!(%session_id, error = %e,
+                                                           "event stream rebuild failed; falling through to turn abort reconcile");
+                                                   }
+                                               }
+                                           }
+                                           break;
+                                       }
                                    },
                                    _ = tokio::time::sleep(Duration::from_secs(
                                        heartbeat_timeout_secs(),
@@ -9770,6 +9880,84 @@ impl AgentRunner {
                                                                    "heartbeat abort: terminal io_response submit failed (best-effort)");
                                                            }
                                                        }
+                                                   } else {
+                                                       // 断流对账采纳（o111 主层修复，流式镜像）：
+                                                       // 无在途 io=引擎已消费我方全部 io_response，
+                                                       // 终态事件被断流吞掉——采纳为成功（产出=
+                                                       // 缓冲最后 assistant 消息）。采纳前 D-01
+                                                       // 二次保险同 run() 路径。
+                                                       const ADOPT_SENTINEL: &str = "stream lost pre-terminal (no violation detected)";
+                                                       let enforce_err = runner
+                                                           .detect_enforce_after_stream_close(&session_id, ADOPT_SENTINEL)
+                                                           .await;
+                                                       if enforce_err != ADOPT_SENTINEL {
+                                                           let duration = start_time.elapsed().as_millis() as u64;
+                                                           if let Some(g) = turn_guard.take() {
+                                                               g.end_with_reason(
+                                                                   "error",
+                                                                   step_count as u64,
+                                                                   duration,
+                                                                   Some(enforce_err.as_str()),
+                                                               );
+                                                           }
+                                                           runner.submit_tool_traces(&session_id).await;
+                                                           yield Ok(AgentEvent::Error(AgentError::Internal(enforce_err.clone())));
+                                                           yield Ok(AgentEvent::Done(AgentResult::error(enforce_err, step_count, duration)));
+                                                           return;
+                                                       }
+                                                       info!(%session_id, step_count,
+                                                           "history reconcile: no pending io after stream loss; considering terminal-state adoption");
+                                                       // 空产出防线（镜像 run() 路径）：无 assistant
+                                                       // 产出=无采纳物，fail-visible 如实报错。
+                                                       let adopt_content = messages.iter().rev().find_map(|m| match m {
+                                                           Message::Assistant { content, .. } => Some(content.clone()),
+                                                           _ => None,
+                                                       })
+                                                       .unwrap_or_default();
+                                                       if adopt_content.is_empty() {
+                                                           let duration = start_time.elapsed().as_millis() as u64;
+                                                           if let Some(g) = turn_guard.take() {
+                                                               g.end_with_reason(
+                                                                   "error",
+                                                                   step_count as u64,
+                                                                   duration,
+                                                                   Some("stream lost after rebuild: no pending io and no assistant content to adopt"),
+                                                               );
+                                                           }
+                                                           runner.submit_tool_traces(&session_id).await;
+                                                           yield Ok(AgentEvent::Error(AgentError::Internal(
+                                                               "stream lost after rebuild: no pending io and no assistant content to adopt".to_string(),
+                                                           )));
+                                                           yield Ok(AgentEvent::Done(AgentResult::error(
+                                                               "stream lost after rebuild: no pending io and no assistant content to adopt".to_string(),
+                                                               step_count,
+                                                               duration,
+                                                           )));
+                                                           return;
+                                                       }
+                                                       info!(%session_id, step_count,
+                                                           "history reconcile: adopting terminal state as success (assistant content {} chars)",
+                                                           adopt_content.chars().count());
+                                                       let duration = start_time.elapsed().as_millis() as u64;
+                                                       if let Some(g) = turn_guard.take() {
+                                                           g.end("completed", step_count as u64, duration);
+                                                       }
+                                                       if let Err(e) = runner.flush_messages(&session_id).await {
+                                                           tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                       }
+                                                       if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                                                           tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                                                       }
+                                                       runner.submit_tool_traces(&session_id).await;
+                                                       let mut result = AgentResult::success(
+                                                           adopt_content,
+                                                           step_count,
+                                                           duration,
+                                                           tool_calls.clone(),
+                                                       );
+                                                       result.tokens = runner.usage_counter.as_ref().map(|c| c.snapshot());
+                                                       yield Ok(AgentEvent::Done(result));
+                                                       return;
                                                    }
                                                }
                                                Err(e) => {
