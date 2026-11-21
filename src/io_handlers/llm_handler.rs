@@ -907,6 +907,10 @@ impl LlmHandler {
                             let mut buffer = String::new();
                             let mut saw_reasoning = false;
                             let mut saw_done = false;
+                            // F3 终态归因计数：断流错误串携带「已有增量下行」量级，
+                            // 供 io_response/journal 事后可分辨（成功路径 finish_reason
+                            // 已随 done 帧入 io_response——stop/length 可分）
+                            let mut streamed_chars: usize = 0;
                             let mut sse = resp.bytes_stream();
                             'frames: loop {
                                 // 先消费缓冲内完整帧(\n\n 切帧),再读下一字节块
@@ -915,11 +919,16 @@ impl LlmHandler {
                                     let (chunks, end) =
                                         executor_sse_frame_outcome(&frame, &mut saw_reasoning, &mut saw_done);
                                     for chunk in &chunks {
-                                        if matches!(
-                                            chunk,
-                                            StreamChunk::Delta(_) | StreamChunk::ToolCallDelta { .. }
-                                        ) {
-                                            streamed_content = true;
+                                        match chunk {
+                                            StreamChunk::Delta(t) => {
+                                                streamed_content = true;
+                                                streamed_chars += t.chars().count();
+                                            }
+                                            StreamChunk::ToolCallDelta { fragment, .. } => {
+                                                streamed_content = true;
+                                                streamed_chars += fragment.chars().count();
+                                            }
+                                            _ => {}
                                         }
                                     }
                                     for chunk in chunks {
@@ -976,11 +985,16 @@ impl LlmHandler {
                                     &mut saw_done,
                                 );
                                 for chunk in &chunks {
-                                    if matches!(
-                                        chunk,
-                                        StreamChunk::Delta(_) | StreamChunk::ToolCallDelta { .. }
-                                    ) {
-                                        streamed_content = true;
+                                    match chunk {
+                                        StreamChunk::Delta(t) => {
+                                            streamed_content = true;
+                                            streamed_chars += t.chars().count();
+                                        }
+                                        StreamChunk::ToolCallDelta { fragment, .. } => {
+                                            streamed_content = true;
+                                            streamed_chars += fragment.chars().count();
+                                        }
+                                        _ => {}
                                     }
                                 }
                                 for chunk in chunks {
@@ -999,8 +1013,12 @@ impl LlmHandler {
                                 }
                             }
                             if !saw_done {
-                                let msg =
-                                    "执行体流式响应未含 done 终帧(连接提前关闭)".to_string();
+                                // F3 结构化终态归因：错误串携带增量下行量级——与
+                                // done 帧的 finish_reason(stop/length) 互补，事后可
+                                // 分辨 正常收口/长度截断/网络断流 三类
+                                let msg = format!(
+                                    "执行体流式响应未含 done 终帧(连接提前关闭; streamed_content={streamed_content}, streamed_chars={streamed_chars})"
+                                );
                                 if !fallback_disabled && !streamed_content {
                                     fallback_reason = Some(msg);
                                     break 'stream_attempt;

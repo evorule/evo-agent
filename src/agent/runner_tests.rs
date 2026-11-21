@@ -8634,6 +8634,251 @@ async fn run_heartbeat_abort_terminates_pending_io_request() {
     io_terminal.assert();
 }
 
+/// 断流恢复梯·对账采纳(o111 主层修复回归锁):干净断流(首流送出 IoRequest
+/// 后无终态事件即关闭)→重建→重建流静默→心跳梯尽→历史对账无在途 io 且
+/// enforce 兜底零命中→采纳终态成功(产出=缓冲 assistant 消息)。
+/// 修复前形态:流 None 直接 break,已完成工作被误记 "Event stream closed"
+/// success=false。
+#[tokio::test]
+async fn run_stream_close_adopts_terminal_state_after_reconcile() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mut server = mockito::Server::new_async().await;
+    let sid = "888";
+    let hist_path = format!("/api/sessions/{sid}/history");
+    let events_path = format!("/api/sessions/{sid}/events");
+    let command_path = format!("/api/sessions/{sid}/command");
+    let io_resp_path = format!("/api/sessions/{sid}/io_response");
+
+    server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"session_id": 888}"#)
+        .create_async()
+        .await;
+
+    server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"/api/shared/facts.*".into()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("[]")
+        .create_async()
+        .await;
+
+    server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"/api/sessions/(888)/invariants.*".into()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"session_id": 888, "structural_invariant_violations": []}"#)
+        .create_async()
+        .await;
+
+    // 历史:IoRequest(id=1)已由 IoResponse(request_id=1)应答——无在途 io
+    let history = serde_json::json!([
+        { "type": "IoRequest", "id": 1, "io_type": "call_external",
+          "params": {}, "version": 2 },
+        { "type": "IoResponse", "request_id": 1, "version": 3 },
+    ]);
+    server
+        .mock("GET", hist_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(history.to_string())
+        .create_async()
+        .await;
+
+    // SSE:第 1 次订阅送出 IoRequest 后干净关闭(无 Stable——断流形态);
+    // 第 2 次订阅(重建)静默挂住→心跳梯尽→对账采纳
+    let event_hits = Arc::new(AtomicUsize::new(0));
+    let event_hits_for_mock = event_hits.clone();
+    server
+        .mock("GET", events_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_chunked_body(move |w| {
+            let n = event_hits_for_mock.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                w.write_all(
+                    b"data: {\"type\":\"IoRequest\",\"io_type\":\"call_external\",\"id\":1,\"params\":{\"model\":\"m\",\"system_prompt\":\"sp\",\"goal\":\"g\",\"tool_names\":[]}}\r\n\r\n",
+                )?;
+                Ok(())
+            } else {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                Ok(())
+            }
+        })
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", command_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{\"success\":true}")
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", io_resp_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    // 采纳前 D-01 二次保险:零违规→哨兵原样返回→放行采纳
+    server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"/api/sessions/888/evolution-signals.*".into()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"total_violations": 0, "signals": []}"#)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let mut runner = AgentRunner::new(AgentConfig::default(), client)
+        .with_llm_handler(LlmHandler::mock("Mock LLM reply"));
+    let _hb_lock = heartbeat_override_lock();
+    set_test_heartbeat_timeout(1);
+
+    let result = runner
+        .run("goal")
+        .await
+        .expect("run must return Ok result on adopt path");
+    set_test_heartbeat_timeout(0);
+
+    assert!(
+        result.success,
+        "terminal-state adoption must report success after clean stream loss with no pending io: {:?}",
+        result.error
+    );
+    assert_eq!(
+        result.content, "Mock LLM reply",
+        "adopted content must be the assistant reply from the message buffer"
+    );
+    assert_eq!(
+        event_hits.load(Ordering::SeqCst),
+        2,
+        "exactly one rebuild subscription expected before adoption"
+    );
+}
+
+/// 断流恢复梯·重建失败仍 fail-visible:首流干净关闭后重建订阅失败
+/// (500)→按既有语义报 "Event stream closed"(不静默、不伪装成功)。
+#[tokio::test]
+async fn run_stream_close_with_failed_rebuild_stays_fail_visible() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mut server = mockito::Server::new_async().await;
+    let sid = "889";
+    let events_path = format!("/api/sessions/{sid}/events");
+
+    server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"session_id": 889}"#)
+        .create_async()
+        .await;
+
+    server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"/api/shared/facts.*".into()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("[]")
+        .create_async()
+        .await;
+
+    server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"/api/sessions/(889)/invariants.*".into()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"session_id": 889, "structural_invariant_violations": []}"#)
+        .create_async()
+        .await;
+
+    // SSE:第 1 次订阅立即干净关闭;第 2 次订阅(重建)返回非 2xx=重建失败
+    let event_hits = Arc::new(AtomicUsize::new(0));
+    let event_hits_for_mock = event_hits.clone();
+    server
+        .mock("GET", events_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_chunked_body(move |_w| {
+            let n = event_hits_for_mock.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                Ok(())
+            } else {
+                // 模拟重建请求失败:mockito 以响应状态门控不在此层——改用
+                // 即时关闭让 subscribe 成功但流立刻再断,等价「重建后仍死」
+                Ok(())
+            }
+        })
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", format!("/api/sessions/{sid}/command").as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{\"success\":true}")
+        .create_async()
+        .await;
+
+    server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"/api/sessions/889/evolution-signals.*".into()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"total_violations": 0, "signals": []}"#)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let mut runner = AgentRunner::new(AgentConfig::default(), client)
+        .with_llm_handler(LlmHandler::mock("unused"));
+    let _hb_lock = heartbeat_override_lock();
+    set_test_heartbeat_timeout(1);
+
+    let result = runner.run("goal").await.expect("run returns Ok envelope");
+    set_test_heartbeat_timeout(0);
+
+    assert!(
+        !result.success,
+        "rebuild-exhausted stream loss must stay fail-visible (no fake success)"
+    );
+    let err = result.error.as_deref().unwrap_or("");
+    assert!(
+        err.contains("Event stream closed"),
+        "double clean-close must fall through to the existing stream-closed failure: {err:?}"
+    );
+    assert_eq!(
+        event_hits.load(Ordering::SeqCst),
+        2,
+        "exactly one rebuild attempt expected"
+    );
+}
+
 /// 非流式 run() 心跳保活镜像——恢复第 2 级成功路径:重建订阅收到
 /// Stable 即救活,run 以 success 收尾(不弃轮)。
 #[tokio::test]
