@@ -1692,8 +1692,10 @@ async fn test_continuation_acceptance_static_criteria_wins() {
         .with_body(r#"{"success":true,"fact_id":1}"#)
         .create_async()
         .await;
+    // 断流恢复梯:空流干净断开触发一次流重建,events 订阅恰两发
     let events_mock = server
         .mock("GET", format!("/api/sessions/{sid}/events").as_str())
+        .expect(2)
         .with_status(200)
         .with_header("content-type", "text/event-stream")
         .with_body("")
@@ -1756,8 +1758,10 @@ async fn test_continuation_acceptance_recovery_success() {
         .with_body(r#"{"success":true,"fact_id":1}"#)
         .create_async()
         .await;
+    // 断流恢复梯:空流干净断开触发一次流重建,events 订阅恰两发
     let events_mock = server
         .mock("GET", format!("/api/sessions/{sid}/events").as_str())
+        .expect(2)
         .with_status(200)
         .with_header("content-type", "text/event-stream")
         .with_body("")
@@ -3509,9 +3513,10 @@ async fn test_g15_run_continuation_does_not_create_session() {
         .create_async()
         .await;
 
-    // mock subscribe_events(返回空 SSE 流 — 立即关闭)
+    // mock subscribe_events(返回空 SSE 流 — 立即关闭;断流恢复梯重建后恰两发)
     let events_mock = server
         .mock("GET", "/api/sessions/s42/events")
+        .expect(2)
         .with_status(200)
         .with_header("content-type", "text/event-stream")
         .with_body("")
@@ -3546,7 +3551,7 @@ async fn test_g15_run_continuation_does_not_create_session() {
         }
     }
 
-    // 验证:state/events/command 各被调用一次,create_session 未被调用
+    // 验证:state/command 各一次、events 恰两次(断流恢复梯重建),create_session 未被调用
     state_mock.assert_async().await;
     events_mock.assert_async().await;
     command_mock.assert_async().await;
@@ -3903,31 +3908,43 @@ async fn run_selfaudit_harness() -> (
         .with_body("[]")
         .create_async()
         .await;
-    // 自审四服务端点（entropy w4/w10 同端点两发；scope 缺省 None=第五件跳过）
+    // 断流收尾对账探测:无违规 → 原样收尾(非自审面,放行即可)
+    server
+        .mock("GET", "/api/sessions/99/evolution-signals?limit=8")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"session_id":99,"total_violations":0,"signals":[],"queue":{"pending_normal":0,"pending_meta_promotion":0}}"#,
+        )
+        .create_async()
+        .await;
+    // 自审四服务端点:断流恢复梯重建后同一 IoRequest 事件重投一次,
+    // 检查点触发两轮(entropy w4/w10 每轮两发=4;其余三件每轮一发=2;
+    // scope 缺省 None=第五件跳过)
     let entropy = server
         .mock("POST", "/api/services/trace_behavior_entropy/invoke")
-        .expect(2)
+        .expect(4)
         .with_status(200)
         .with_body("{}")
         .create_async()
         .await;
     let density = server
         .mock("POST", "/api/services/trace_approval_density/invoke")
-        .expect(1)
+        .expect(2)
         .with_status(200)
         .with_body("{}")
         .create_async()
         .await;
     let era_split = server
         .mock("POST", "/api/services/trace_era_split/invoke")
-        .expect(1)
+        .expect(2)
         .with_status(200)
         .with_body("{}")
         .create_async()
         .await;
     let sentinel = server
         .mock("POST", "/api/services/trace_era_mixing_sentinel/invoke")
-        .expect(1)
+        .expect(2)
         .with_status(200)
         .with_body("{}")
         .create_async()
@@ -3953,7 +3970,8 @@ async fn test_run_self_audit_checkpoint_fires_at_step_boundary() {
     let result = runner.run("test goal").await;
     assert!(result.is_ok(), "run() should not return Err");
 
-    // 步界检查点真触发：四服务端点全部命中（entropy 含 w4/w10 两发）
+    // 步界检查点真触发:四服务端点全部命中(重建流重投步界,检查点两轮:
+    // entropy w4/w10 每轮两发,其余三件每轮一发)
     entropy.assert();
     density.assert();
     era_split.assert();
