@@ -665,10 +665,10 @@ mod tests {
         let eval = tool
             .evaluate_proposal(&args)
             .map(|p| p["status"].to_string());
-        let call_would_propose = match tool.classify_for_agent("https://127.0.0.1:8080/admin") {
-            HostCategory::Candidate { .. } => true,
-            _ => false,
-        };
+        let call_would_propose = matches!(
+            tool.classify_for_agent("https://127.0.0.1:8080/admin"),
+            HostCategory::Candidate { .. }
+        );
         assert!(call_would_propose, "放宽实例下执行臂判 Candidate");
         assert!(
             eval.is_some(),

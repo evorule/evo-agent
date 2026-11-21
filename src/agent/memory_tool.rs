@@ -1707,7 +1707,7 @@ mod tests {
             .with_body(body)
             .create_async()
             .await;
-        let m_put = server
+        let _m_put = server
             .mock(
                 "POST",
                 mockito::Matcher::Regex(r"/api/sessions/s1/payload$".into()),
@@ -1746,7 +1746,7 @@ mod tests {
             .with_body(body)
             .create_async()
             .await;
-        let m_put = server
+        let _m_put = server
             .mock(
                 "POST",
                 mockito::Matcher::Regex(r"/api/sessions/s1/payload$".into()),

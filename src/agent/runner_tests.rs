@@ -8104,7 +8104,7 @@ fn stale_demotion_without_journal_dir_returns_original() {
 fn assistant_fold_disabled_view_is_byte_identical() {
     // 缺省关(None):发送视图与权威历史逐字节一致(D2 影响分析=工具型画像
     // 史内 assistant 占比低,折叠缺省不启用)
-    let mut runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    let runner = AgentRunner::new(AgentConfig::default(), make_test_client());
     assert!(runner.assistant_fold.is_none(), "缺省构造=未启用");
     let long = "x".repeat(20_000);
     let msgs = vec![
@@ -8378,10 +8378,8 @@ async fn heartbeat_abort_terminates_pending_io_request() {
     while let Some(ev) = stream.next().await {
         match ev {
             Ok(AgentEvent::Done(_)) => saw_done = true,
-            Ok(AgentEvent::Info(msg)) => {
-                if msg.contains("rebuilding engine event stream") {
-                    saw_rebuild_info = true;
-                }
+            Ok(AgentEvent::Info(msg)) if msg.contains("rebuilding engine event stream") => {
+                saw_rebuild_info = true;
             }
             _ => {}
         }
@@ -8491,10 +8489,8 @@ async fn heartbeat_rebuild_recovers_silent_stream() {
     while let Some(ev) = stream.next().await {
         match ev {
             Ok(AgentEvent::Done(res)) => done_success = res.success,
-            Ok(AgentEvent::Info(msg)) => {
-                if msg.contains("rebuilding engine event stream") {
-                    saw_rebuild_info = true;
-                }
+            Ok(AgentEvent::Info(msg)) if msg.contains("rebuilding engine event stream") => {
+                saw_rebuild_info = true;
             }
             _ => {}
         }

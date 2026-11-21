@@ -7592,7 +7592,7 @@ impl AgentRunner {
 
         let final_result = if !decision.approved {
             warn!(%session_id, tool = %tool_name, "G8: tool call rejected");
-            g8_rejection_payload(&decision_label, decision.auto_rejected, &decision.reason)
+            g8_rejection_payload(decision_label, decision.auto_rejected, &decision.reason)
         } else {
             // 批准 → 管道 ApprovalReexec 重执行(不递归检查 proposal):
             // 预供给决策由⑤消费(收编型直通⑦真实执行),args 注入 approved:true
@@ -8066,7 +8066,7 @@ impl AgentRunner {
                 tt.attach_approval_to_last(approval_record.clone());
             }
             return Ok((
-                g8_rejection_payload(&decision_label, decision.auto_rejected, &decision.reason),
+                g8_rejection_payload(decision_label, decision.auto_rejected, &decision.reason),
                 Some(approval_record),
             ));
         }
@@ -12514,7 +12514,7 @@ fn load_agents_md_segment_with(
     ];
     for (label, p) in levels {
         let Some(p) = p else { continue };
-        if let Ok(s) = std::fs::read_to_string(&p) {
+        if let Ok(s) = std::fs::read_to_string(p) {
             let body = s.trim();
             if body.is_empty() {
                 continue;

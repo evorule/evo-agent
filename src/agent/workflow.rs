@@ -4782,7 +4782,6 @@ mod tests {
     /// 不补标=下游 phase 门恒拒永久卡死。mockito 断言 mark 信号确已提交。
     #[tokio::test]
     async fn resume_reconciles_missing_node_done_mark() {
-        use crate::agent::driver::node_done_signal;
         let mut server = mockito::Server::new_async().await;
         // marks 会话：before=v0 → command(node_done) → poll=v1（放行）
         server

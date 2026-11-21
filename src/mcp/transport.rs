@@ -786,15 +786,11 @@ pub mod tests {
 
     // ===== stdout 单行上限(o101):超长单行内存膨胀防线 =====
 
-    fn pending_map_with(
-        id: u64,
-    ) -> (
-        Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<PendingResult>>>>,
-        oneshot::Receiver<PendingResult>,
-    ) {
+    type PendingMap = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<PendingResult>>>>;
+
+    fn pending_map_with(id: u64) -> (PendingMap, oneshot::Receiver<PendingResult>) {
         let (tx, rx) = oneshot::channel();
-        let map: Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<PendingResult>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let map: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         map.lock().unwrap().insert(id, tx);
         (map, rx)
     }

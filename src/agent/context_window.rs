@@ -1428,7 +1428,6 @@ mod tests {
         assert_eq!(cloned.strategy, TrimStrategy::None);
     }
 
-    #[test]
     /// R-3:公共计量函数单元测试(ASCII 向下取整 / 非 ASCII 1 token/字)
     #[test]
     fn test_approx_token_len_semantics() {

@@ -515,7 +515,7 @@ impl ToolExecutionPipeline {
                                     req.tool_name
                                 ),
                                 llm_payload: Some(crate::agent::runner::g8_rejection_payload(
-                                    &decision_label,
+                                    decision_label,
                                     decision.auto_rejected,
                                     &decision.reason,
                                 )),
