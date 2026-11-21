@@ -649,7 +649,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // Interaction（申报型零文件/网络/子进程触点）；Standard 免裁决 +
         // AutoPolicy 直通，不进 EXFIL_SCAN_TOOLS。spec 常驻 default_tool_specs。
         b("plan_submit", vec![Interaction]),
-        // 桌面壳 GUI 自动化二件（B-484 装备批实现，o115 manifest 对齐批入表）：
+        // 桌面壳 GUI 自动化二件（桌面壳装备批实现，manifest 对齐批入表）：
         // 经 desktop bridge IPC 观察用户前台桌面 UI（observe 含可选截图）/
         // 驱动固定 UIA 动作集（act）。桥未在场的部署形态（CLI/serve）
         // fail-visible 引导（BRIDGE_UNAVAILABLE），桌面壳装配经
@@ -729,7 +729,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
                 m.adjudication_class = AdjudicationClass::Sensitive;
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }
-            // desktop_act（o115 manifest 对齐批，前台 UI 动作面）：双闸同
+            // desktop_act（manifest 对齐批，前台 UI 动作面）：双闸同
             // session_spawn/http_request 先例——Sensitive（用户前台 UI 写
             // 动作意图必报）+ ManualDefault（每次调用人工默认否决点）
             "desktop_act" => {
@@ -1419,7 +1419,7 @@ mod tests {
     #[test]
     fn test_effect_class_calibration_locked() {
         // 读写分级标定锁（并行调度分组判据）：只读族显式标定数=35
-        // （o115 manifest 对齐批 desktop_observe 只读观察 +1）
+        // （manifest 对齐批 desktop_observe 只读观察 +1）
         // （审计摘要卡 audit_summary 只读小视图 +1；代码知识图谱只读查询
         // codegraph +1；语言服务器只读查询 lsp +1；编程环境预检
         // env_doctor +1；测试影响建议 test_impact +1；临界机验证
@@ -1523,7 +1523,7 @@ mod tests {
         "memory_tombstone",
         // 批K 段5:HTTP 写动词（双闸 Sensitive+ManualDefault——写动词意图必报）
         "http_request",
-        // o115 manifest 对齐批:desktop_act 落地 Sensitive（前台 UI 动作面
+        // manifest 对齐批:desktop_act 落地 Sensitive（前台 UI 动作面
         // 双闸，桥未在场 fail-visible 不影响裁决集语义）→ 36 条（快照重录 diff 审）
         "desktop_act",
     ];
