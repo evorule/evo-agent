@@ -907,7 +907,7 @@ impl LlmHandler {
                             let mut buffer = String::new();
                             let mut saw_reasoning = false;
                             let mut saw_done = false;
-                            // F3 终态归因计数：断流错误串携带「已有增量下行」量级，
+                            // 流断终态归因计数：断流错误串携带「已有增量下行」量级，
                             // 供 io_response/journal 事后可分辨（成功路径 finish_reason
                             // 已随 done 帧入 io_response——stop/length 可分）
                             let mut streamed_chars: usize = 0;
@@ -1013,7 +1013,7 @@ impl LlmHandler {
                                 }
                             }
                             if !saw_done {
-                                // F3 结构化终态归因：错误串携带增量下行量级——与
+                                // 流断结构化终态归因：错误串携带增量下行量级——与
                                 // done 帧的 finish_reason(stop/length) 互补，事后可
                                 // 分辨 正常收口/长度截断/网络断流 三类
                                 let msg = format!(
