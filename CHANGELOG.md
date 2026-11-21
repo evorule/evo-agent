@@ -56,8 +56,18 @@
   are deliberately not exposed.
 - 🆕 Added: `docs/headless-ci.md` — machine-facing contract for `run --json`
   (NDJSON stdout stream) and the exit-code table (0 success, 1 agent
-  failure, 2 usage/config error; 3 reserved for the planned output-schema
-  validation), with a minimal GitHub Actions recipe.
+  failure, 2 usage/config error; 3 output-schema violation), with a minimal
+  GitHub Actions recipe.
+- 🆕 Added: `run --output-schema <file>` — end-of-run output contract for
+  headless consumers: the final assistant message must parse as JSON (after
+  markdown fence stripping) and match the given JSON Schema. An invalid
+  schema file aborts at startup with exit code `2`; a violation emits the
+  structured `output_schema_violation` frame (appended to the `--json`
+  stream after the terminal frame) and exits with code `3`. Without the
+  flag, behavior is unchanged.
+- 🔄 Changed: `agents/coder.json` tool whitelist now includes `lsp`,
+  `env_doctor`, and `test_impact` (coding-environment diagnostics and test
+  selection); the whitelist remains additive and nothing else changes.
 
 ### Extraction-side variant merging (opt-in)
 

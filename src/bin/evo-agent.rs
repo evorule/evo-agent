@@ -147,6 +147,16 @@ enum Command {
         #[arg(long, value_enum)]
         profile: Option<SessionProfile>,
 
+        /// End-of-run output contract: validate the final assistant message
+        /// against the JSON Schema in this file (markdown fences are stripped
+        /// before parsing). Invalid file/schema abort at startup with the
+        /// usage/config exit code; a violation at run end emits the
+        /// structured `output_schema_violation` failure event and exits with
+        /// code 3 (see docs/headless-ci.md). Without this flag behavior is
+        /// byte-identical to the previous releases.
+        #[arg(long, value_name = "FILE", value_hint = ValueHint::FilePath)]
+        output_schema: Option<PathBuf>,
+
         /// 39 号项 A:生成项目 AGENTS.md 骨架到 {workdir}/AGENTS.md
         /// (扫描顶层结构+空节模板);已存在则拒绝覆盖,不带 goal 也可运行
         #[arg(long)]
@@ -527,6 +537,7 @@ fn main() -> ExitCode {
             json,
             json_pretty,
             profile,
+            output_schema,
             init,
         } => {
             if init {
@@ -547,6 +558,7 @@ fn main() -> ExitCode {
                     json_pretty,
                     cli.no_preflight,
                     profile.map(|p| p == SessionProfile::Coding),
+                    output_schema,
                 )
             })
         }
@@ -1122,6 +1134,75 @@ fn cmd_doctor(workdir: &Path, json: bool) -> ExitCode {
 // run —— 跑 agent
 // =============================================================================
 
+/// Build the end-of-run output validator for `run --output-schema`.
+///
+/// `None` input = flag absent (no validation; zero behavior change). A
+/// missing/unreadable file, invalid JSON, or a schema the validator cannot
+/// compile is a usage/config error (the caller exits with code 2) — never a
+/// silent skip.
+fn load_output_schema_validator(
+    path: Option<&Path>,
+) -> Result<Option<evo_agent::agent::output_validator::OutputValidator>, String> {
+    use evo_agent::agent::definition::OutputFormat;
+    use evo_agent::agent::output_validator::OutputValidator;
+
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("output schema file '{}' unreadable: {e}", path.display()))?;
+    let schema: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "output schema file '{}' is not valid JSON: {e}",
+            path.display()
+        )
+    })?;
+    let format = OutputFormat {
+        format_type: "json".to_string(),
+        schema: Some(schema),
+        max_retries: None,
+    };
+    let validator = OutputValidator::from_output_format(&format).map_err(|e| {
+        format!(
+            "output schema file '{}' is not a valid JSON Schema: {e}",
+            path.display()
+        )
+    })?;
+    Ok(Some(validator))
+}
+
+/// End-of-run output-schema check (pure, testable): validate the final
+/// assistant message against the compiled schema. Markdown code fences are
+/// stripped before parsing. An absent final message (e.g. the run ended
+/// before any assistant turn completed) is a violation — an empty output is
+/// not a valid JSON document.
+fn validate_final_output(
+    validator: &evo_agent::agent::output_validator::OutputValidator,
+    final_message: Option<&str>,
+) -> Result<(), String> {
+    let cleaned = validator.clean_output(final_message.unwrap_or(""));
+    validator.validate(&cleaned)
+}
+
+/// Terminal exit code for a completed run under `--output-schema`
+/// (headless contract, docs/headless-ci.md): a failed run keeps exit code 1;
+/// a successful run with a schema violation escalates to exit code 3.
+fn exit_code_with_output_schema(success: bool, violation: Option<&str>) -> ExitCode {
+    if !success {
+        ExitCode::from(1)
+    } else if violation.is_some() {
+        ExitCode::from(3)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Structured failure frame appended to the `--json` stdout stream after the
+/// terminal frame when `--output-schema` rejects the final assistant message.
+fn output_schema_violation_frame(error: &str) -> serde_json::Value {
+    serde_json::json!({ "type": "output_schema_violation", "error": error })
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Resolve the effective coding-profile override for `run`. `Ok(Some(on))`
 /// = explicit CLI override (settings are never consumed); `Ok(None)` =
@@ -1159,8 +1240,19 @@ fn cmd_run(
     json_pretty: bool,
     no_preflight: bool,
     profile_override: Option<bool>,
+    output_schema: Option<PathBuf>,
 ) -> ExitCode {
-    // 0. Session coding profile resolution (run entry surface, fail-fast):
+    // 0. Output schema contract (headless surface, fail-fast): an unreadable
+    // file, invalid JSON, or an uncompilable schema is a usage/config error
+    // (exit code 2) — rejected before any run-time work starts.
+    let output_validator = match load_output_schema_validator(output_schema.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    // 0.1 Session coding profile resolution (run entry surface, fail-fast):
     // the CLI flag wins over workspace settings; without the flag the
     // workspace `session.profile` value is validated here — an invalid
     // value aborts with the usage/config exit code instead of being
@@ -1680,11 +1772,11 @@ fn cmd_run(
     });
 
     let exit = if json {
-        cmd_run_json(&runtime, runner, goal, json_pretty)
+        cmd_run_json(&runtime, runner, goal, json_pretty, output_validator)
     } else if stream {
-        cmd_run_streaming(&runtime, runner, goal)
+        cmd_run_streaming(&runtime, runner, goal, output_validator)
     } else {
-        cmd_run_blocking(&runtime, runner, goal)
+        cmd_run_blocking(&runtime, runner, goal, output_validator)
     };
     // 任务已结束,停止监听 Ctrl+C
     cancel_handle.abort();
@@ -2643,6 +2735,7 @@ fn cmd_run_blocking(
     runtime: &tokio::runtime::Runtime,
     runner: AgentRunner,
     goal: &str,
+    output_validator: Option<evo_agent::agent::output_validator::OutputValidator>,
 ) -> ExitCode {
     // 消费流式 ReAct 回路聚合最终结果（delegate 同款修法，agent_api run 端点先例）。
     // 原实现调 runner.run()（引擎事件驱动单轮桥接）——引擎自宪法 v0.5.0 起仅
@@ -2657,6 +2750,10 @@ fn cmd_run_blocking(
         let mut event_stream = runner.run_streaming(goal.to_string(), Vec::new());
 
         let mut final_result: Option<evo_agent::AgentResult> = None;
+        // `--output-schema` end-of-run check: track the last assistant turn
+        // (LlmDone aggregates each turn's full content; the turn that precedes
+        // the terminal Done frame is the final assistant message).
+        let mut last_assistant: Option<String> = None;
 
         while let Some(event) = event_stream.next().await {
             match event {
@@ -2709,6 +2806,9 @@ fn cmd_run_blocking(
                 Ok(AgentEvent::Info(msg)) => {
                     eprintln!("[info: {}]", msg);
                 }
+                Ok(AgentEvent::LlmDone { content, .. }) => {
+                    last_assistant = Some(content);
+                }
                 Ok(AgentEvent::Done(result)) => {
                     final_result = Some(result);
                 }
@@ -2716,16 +2816,25 @@ fn cmd_run_blocking(
                     eprintln!("[fatal: {}]", e);
                     final_result = Some(evo_agent::AgentResult::error(e.to_string(), 0, 0));
                 }
-                // LlmDelta/LlmDone：非流式语义不逐 token 输出（stdout 仅最终 JSON）
+                // LlmDelta: non-streaming semantics print no per-token output (stdout carries the final JSON only)
                 _ => {}
             }
         }
 
-        final_result
+        final_result.map(|result| {
+            let violation = match (&output_validator, result.success) {
+                (Some(v), true) => validate_final_output(v, last_assistant.as_deref()).err(),
+                _ => None,
+            };
+            if let Some(err) = &violation {
+                eprintln!("[output schema violation: {}]", err);
+            }
+            (result, violation)
+        })
     });
 
     match final_result {
-        Some(result) => {
+        Some((result, violation)) => {
             if let Some(t) = &result.tokens {
                 eprintln!(
                     "[tokens] prompt={} completion={} total={}",
@@ -2740,11 +2849,7 @@ fn cmd_run_blocking(
                 }
             };
             println!("{}", json);
-            if result.success {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
+            exit_code_with_output_schema(result.success, violation.as_deref())
         }
         None => {
             eprintln!("agent run ended without a final result");
@@ -2758,6 +2863,7 @@ fn cmd_run_streaming(
     runtime: &tokio::runtime::Runtime,
     runner: AgentRunner,
     goal: &str,
+    output_validator: Option<evo_agent::agent::output_validator::OutputValidator>,
 ) -> ExitCode {
     use evo_agent::AgentEvent;
     use futures_util::StreamExt;
@@ -2767,6 +2873,9 @@ fn cmd_run_streaming(
         let mut event_stream = runner.run_streaming(goal.to_string(), Vec::new());
 
         let mut final_result: Option<evo_agent::AgentResult> = None;
+        // `--output-schema` end-of-run check: track the last assistant turn
+        // (the turn preceding the terminal Done frame is the final message).
+        let mut last_assistant: Option<String> = None;
 
         while let Some(event) = event_stream.next().await {
             match event {
@@ -2812,9 +2921,10 @@ fn cmd_run_streaming(
                     let _ = std::io::stderr().flush();
                 }
                 Ok(AgentEvent::LlmDone {
-                    content: _,
+                    content,
                     finish_reason,
                 }) => {
+                    last_assistant = Some(content);
                     // 本轮 LLM 输出结束
                     println!();
                     eprintln!(
@@ -2886,11 +2996,20 @@ fn cmd_run_streaming(
             }
         }
 
-        final_result
+        final_result.map(|result| {
+            let violation = match (&output_validator, result.success) {
+                (Some(v), true) => validate_final_output(v, last_assistant.as_deref()).err(),
+                _ => None,
+            };
+            if let Some(err) = &violation {
+                eprintln!("[output schema violation: {}]", err);
+            }
+            (result, violation)
+        })
     });
 
     match final_result {
-        Some(result) => {
+        Some((result, violation)) => {
             if let Some(t) = &result.tokens {
                 eprintln!(
                     "[tokens] prompt={} completion={} total={}",
@@ -2906,11 +3025,7 @@ fn cmd_run_streaming(
                 }
             };
             println!("{}", json);
-            if result.success {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
+            exit_code_with_output_schema(result.success, violation.as_deref())
         }
         None => {
             eprintln!("stream ended without result");
@@ -2925,22 +3040,28 @@ fn cmd_run_streaming(
 /// stdout 只承载事件帧(无 ANSI/横幅,日志经 stderr 变体改道,见 init_logging);
 /// 退出码与文本臂同语义:Done.success / 流级错误 / 无终帧 → 0 / 1 / 1。
 /// 进度帧默认全量包含(消费方按 type 过滤),不做衰减开关。
+/// `--output-schema` 增补:违规时在终帧后追加一行 `output_schema_violation`
+/// 失败帧并升级退出码为 3(契约见 docs/headless-ci.md)。
 fn cmd_run_json(
     runtime: &tokio::runtime::Runtime,
     runner: AgentRunner,
     goal: &str,
     pretty: bool,
+    output_validator: Option<evo_agent::agent::output_validator::OutputValidator>,
 ) -> ExitCode {
     use evo_agent::api::ws_handler::agent_event_json_line;
     use evo_agent::AgentEvent;
     use futures_util::StreamExt;
     use std::io::Write;
 
-    let final_success = runtime.block_on(async move {
+    let (final_success, schema_violation) = runtime.block_on(async move {
         let mut event_stream = runner.run_streaming(goal.to_string(), Vec::new());
         let mut stdout = std::io::stdout().lock();
 
         let mut final_success: Option<bool> = None;
+        // `--output-schema` end-of-run check: track the last assistant turn
+        // (the turn preceding the terminal Done frame is the final message).
+        let mut last_assistant: Option<String> = None;
 
         while let Some(event) = event_stream.next().await {
             // 终帧退出码先行登记(借检查在消费前结束,事件随后被序列化)
@@ -2955,6 +3076,9 @@ fn cmd_run_json(
                         );
                     }
                 }
+                Ok(AgentEvent::LlmDone { content, .. }) => {
+                    last_assistant = Some(content.clone());
+                }
                 Err(_) => final_success = Some(false),
                 _ => {}
             }
@@ -2965,17 +3089,31 @@ fn cmd_run_json(
             {
                 // 下游管道提前关闭(如 head/jq 早退):与 WS 发送端断开同语义,停止消费
                 eprintln!("json output stream closed");
-                return final_success;
+                return (final_success, None);
             }
         }
 
-        final_success
+        // Output-schema check runs only for a successful terminal frame; the
+        // violation frame is appended after the terminal frame so consumers
+        // filtering on the stream stay isomorphic (unknown-type tolerant).
+        let schema_violation = match (&output_validator, final_success) {
+            (Some(v), Some(true)) => validate_final_output(v, last_assistant.as_deref()).err(),
+            _ => None,
+        };
+        if let Some(err) = &schema_violation {
+            eprintln!("[output schema violation: {}]", err);
+            let line = output_schema_violation_frame(err);
+            let _ = writeln!(stdout, "{line}").and_then(|_| stdout.flush());
+        }
+
+        (final_success, schema_violation)
     });
 
-    match final_success {
-        Some(true) => ExitCode::SUCCESS,
-        Some(false) => ExitCode::from(1),
-        None => {
+    match (final_success, schema_violation.as_deref()) {
+        (Some(true), None) => ExitCode::SUCCESS,
+        (Some(true), Some(_)) => ExitCode::from(3),
+        (Some(false), _) => ExitCode::from(1),
+        (None, _) => {
             eprintln!("stream ended without a final result");
             ExitCode::from(1)
         }
@@ -5599,6 +5737,127 @@ mod tests {
             resolve_run_profile_override(dir.path(), Some(true)).unwrap(),
             Some(true)
         );
+    }
+
+    // === Output-schema run contract (flag load + end-of-run check) ===
+
+    const GOOD_SCHEMA_TEXT: &str = r#"
+        {
+          "type": "object",
+          "properties": { "summary": { "type": "string" } },
+          "required": ["summary"]
+        }
+    "#;
+
+    fn write_schema_file(dir: &tempfile::TempDir, text: &str) -> std::path::PathBuf {
+        let path = dir.path().join("result.schema.json");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn output_schema_flag_absent_means_no_validator() {
+        assert!(load_output_schema_validator(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn output_schema_missing_file_is_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = match load_output_schema_validator(Some(&dir.path().join("absent.json"))) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a usage error for a missing schema file"),
+        };
+        assert!(err.contains("unreadable"), "{err}");
+    }
+
+    #[test]
+    fn output_schema_invalid_json_file_is_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_schema_file(&dir, "{not json");
+        let err = match load_output_schema_validator(Some(&path)) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a usage error for invalid JSON"),
+        };
+        assert!(err.contains("not valid JSON"), "{err}");
+    }
+
+    #[test]
+    fn output_schema_uncompilable_schema_is_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A JSON number is valid JSON but not a JSON Schema document.
+        let path = write_schema_file(&dir, "12345");
+        let err = match load_output_schema_validator(Some(&path)) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a usage error for an uncompilable schema"),
+        };
+        assert!(err.contains("not a valid JSON Schema"), "{err}");
+    }
+
+    #[test]
+    fn output_schema_valid_file_compiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_schema_file(&dir, GOOD_SCHEMA_TEXT);
+        assert!(load_output_schema_validator(Some(&path)).unwrap().is_some());
+    }
+
+    #[test]
+    fn output_schema_accepts_matching_final_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_schema_file(&dir, GOOD_SCHEMA_TEXT);
+        let validator = load_output_schema_validator(Some(&path)).unwrap().unwrap();
+        validate_final_output(&validator, Some(r#"{"summary": "done"}"#)).unwrap();
+        // Markdown-fenced JSON is stripped before parsing.
+        validate_final_output(&validator, Some("```json\n{\"summary\": \"done\"}\n```")).unwrap();
+    }
+
+    #[test]
+    fn output_schema_rejects_non_json_final_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_schema_file(&dir, GOOD_SCHEMA_TEXT);
+        let validator = load_output_schema_validator(Some(&path)).unwrap().unwrap();
+        let err = validate_final_output(&validator, Some("plain prose, no JSON")).unwrap_err();
+        assert!(err.contains("not valid JSON"), "{err}");
+    }
+
+    #[test]
+    fn output_schema_rejects_schema_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_schema_file(&dir, GOOD_SCHEMA_TEXT);
+        let validator = load_output_schema_validator(Some(&path)).unwrap().unwrap();
+        let err = validate_final_output(&validator, Some(r#"{"other": 1}"#)).unwrap_err();
+        assert!(err.contains("does not match schema"), "{err}");
+    }
+
+    #[test]
+    fn output_schema_absent_final_message_is_a_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_schema_file(&dir, GOOD_SCHEMA_TEXT);
+        let validator = load_output_schema_validator(Some(&path)).unwrap().unwrap();
+        assert!(validate_final_output(&validator, None).is_err());
+    }
+
+    #[test]
+    fn output_schema_exit_code_contract() {
+        // 0: successful run, no violation.
+        assert_eq!(exit_code_with_output_schema(true, None), ExitCode::SUCCESS);
+        // 3: successful run but schema violation.
+        assert_eq!(
+            exit_code_with_output_schema(true, Some("does not match schema")),
+            ExitCode::from(3)
+        );
+        // 1: failed run keeps the agent-failure code even with a violation.
+        assert_eq!(
+            exit_code_with_output_schema(false, Some("does not match schema")),
+            ExitCode::from(1)
+        );
+        assert_eq!(exit_code_with_output_schema(false, None), ExitCode::from(1));
+    }
+
+    #[test]
+    fn output_schema_violation_frame_shape() {
+        let frame = output_schema_violation_frame("boom");
+        assert_eq!(frame["type"], "output_schema_violation");
+        assert_eq!(frame["error"], "boom");
     }
 
     fn make_event(id: &str, fact_id: Option<u64>) -> MemoryEvent {

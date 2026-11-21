@@ -50,7 +50,10 @@
     "knowledge_entry_get",
     "audit_get",
     "mcp_*",
-    "browser_*"
+    "browser_*",
+    "lsp",
+    "env_doctor",
+    "test_impact"
   ],
   "memory": {
     "type": "persistent",

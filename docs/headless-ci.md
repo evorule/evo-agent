@@ -29,10 +29,7 @@ evo-agent run --json "fix the failing test in src/lib.rs"
 | `0` | Run completed and the acceptance check passed. |
 | `1` | Agent execution failure: LLM error, tool-chain failure, or step budget exhausted. |
 | `2` | Usage / configuration error: rejected CLI arguments, invalid workspace settings (including an invalid `session.profile` value), unsupported unattended approval modes, or shell sandbox configuration failures. |
-| `3` | Reserved for output-schema validation failures (planned `--output-schema` feature; not currently emitted). |
-
-Legacy exit codes are unchanged; `3` is additive and only future schema
-validation will ever produce it.
+| `3` | Output-schema validation failure: the run completed successfully but the final assistant message failed the `--output-schema` JSON Schema contract (never emitted without the flag). |
 
 ## Coding profile selection
 
@@ -50,6 +47,30 @@ Two opt-out / override channels exist:
 | `session.profile` in `{workdir}/.evo/settings.json` | `"coding"` = on (default when absent/null), `"manual"` = off. Any other value is a configuration error: the run aborts with exit code `2`. |
 
 Priority: CLI flag > workspace settings > default (on).
+
+## Output schema contract (`--output-schema`)
+
+```bash
+evo-agent run --json --output-schema ./result.schema.json "produce the report"
+```
+
+- The flag takes the path to a JSON Schema file. The file is loaded and
+  compiled at startup: an unreadable file, invalid JSON, or a schema the
+  validator cannot compile aborts the run before any work starts with exit
+  code `2`.
+- At the end of a successful run the **final assistant message** is checked:
+  markdown code fences are stripped, the content must parse as JSON, and the
+  parsed document must match the schema.
+- On violation, `--json` mode appends one structured failure frame to stdout
+  after the terminal frame:
+  `{"type":"output_schema_violation","error":"<details>"}`, and the process
+  exits with code `3`. Text modes print the details to stderr and exit with
+  code `3`.
+- Without the flag, behavior is byte-identical to previous releases.
+- The check is independent of an agent definition's `output_format`
+  configuration; both may be combined (the definition-level validator retries
+  and degrades during the run, the CLI-level check is a hard end-of-run
+  contract).
 
 ## Minimal GitHub Actions recipe
 
@@ -94,7 +115,9 @@ Notes for CI authors:
 - `set -o pipefail` keeps a mid-pipeline failure from being masked when you
   post-process `events.ndjson` on the fly.
 - Branch on the exit code: `0` to proceed, `1` for agent failures (retry or
-  alert), `2` for configuration mistakes (fail the workflow, never retry).
+  alert), `2` for configuration mistakes (fail the workflow, never retry),
+  `3` for output-schema violations (fail the workflow or re-prompt with the
+  schema error details).
 - Constrain the working tree before unattended runs: the run path honors the
   workspace approval configuration, so review `.evo/` in the repository when
   automating write-capable agents.
