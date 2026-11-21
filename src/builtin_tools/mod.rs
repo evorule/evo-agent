@@ -476,6 +476,15 @@ fn default_safe_toolkit_core(
         crate::agent::audit_summary_tool::AUDIT_SUMMARY_TOOL,
         Arc::new(crate::agent::audit_summary_tool::AuditSummaryTool::unwired()),
     );
+    // 桌面壳 GUI 自动化二件（B-484 装备批实现，o115 manifest 对齐批入表）：
+    // 占位执行体启动期注册（桥未在场 fail-visible 引导），桌面壳装配路径经
+    // rebind_desktop_tools 注入 wired 桥执行体；治理档位见 manifest
+    // （observe Standard 只读 / act Sensitive+ManualDefault 双闸）
+    handler.register_static(
+        "desktop_observe",
+        Arc::new(desktop::DesktopObserveTool::unwired()),
+    );
+    handler.register_static("desktop_act", Arc::new(desktop::DesktopActTool::unwired()));
     // 自主开会话工具（自主交接设计 PR-H3）：同上占位/会话期重绑形态；
     // 重绑时注入链共享态与子 runner 工厂（护栏三件+fork+自动驱动在执行体内）
     handler.register_static(
@@ -565,6 +574,50 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     r#type: "integer".to_string(),
                     description: "Max characters to return (capped by the tool-result limit)"
                         .to_string(),
+                    required: false,
+                },
+            ],
+        },
+        // 桌面壳 GUI 自动化二件（B-484 装备批实现，o115 manifest 对齐批入
+        // 契约面）：仅桌面壳装配环境可用（桥未在场 fail-visible 引导
+        // BRIDGE_UNAVAILABLE）；act 每次调用出审批提案（Manifest 双闸）。
+        // 参数契约与 desktop.rs Args 结构（deny_unknown_fields）逐字段对齐。
+        ToolSpec {
+            name: "desktop_observe".to_string(),
+            description: "Observe the foreground desktop application through the desktop shell bridge: returns a structured UIA control tree (control types/names/states) and optionally attaches a screenshot as sideband payload. Call this before any desktop_act to discover observation_id/target_id, and after actions to verify outcomes. Desktop-shell deployments only; elsewhere it fails visibly with a bridge-unavailable hint.".to_string(),
+            parameters: vec![ParameterSpec {
+                name: "include_screenshot".to_string(),
+                r#type: "boolean".to_string(),
+                description: "Attach a screenshot of the foreground window to the result".to_string(),
+                required: false,
+            }],
+        },
+        ToolSpec {
+            name: "desktop_act".to_string(),
+            description: "Perform a fixed UIA action on a desktop control discovered by desktop_observe: invoke (press a button/MenuItem), set_value (type text into an input), focus. Every call requires observation_id + target_id from the latest observation and surfaces an approval proposal before executing. Desktop-shell deployments only.".to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "observation_id".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Observation id from the latest desktop_observe result".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "target_id".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Target control id from the latest desktop_observe result".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "action".to_string(),
+                    r#type: "string".to_string(),
+                    description: "One of: invoke, set_value, focus".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "value".to_string(),
+                    r#type: "string".to_string(),
+                    description: "New text value; only accepted for set_value (max 4096 chars)".to_string(),
                     required: false,
                 },
             ],
