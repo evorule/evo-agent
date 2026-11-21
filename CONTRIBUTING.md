@@ -129,6 +129,7 @@ Also use Issues with the `enhancement` label.
 6. **Open PR** on GitHub, fill in the PR template
 7. **Sign CLA** (see below)
 8. **Wait for review** — maintainers reply within 7 days
+9. **Merge policy** — merged PRs land as a single linear commit via **rebase**; squash and merge-commit strategies are disabled by repository policy. Keep your branch tip rebased onto the latest `main` before review so the final rebase lands cleanly.
 
 ### Commit message convention
 

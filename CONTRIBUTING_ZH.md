@@ -126,6 +126,7 @@
 6. **创建 PR** 到 GitHub,填写 PR 模板
 7. **CLA 签署**(见下)
 8. **等 review** — 维护者会在 7 天内回复
+9. **合并策略**:合并的 PR 以 **rebase** 方式落成单条线性提交;squash 与 merge-commit 已被仓库策略禁用。评审前请将分支顶端 rebase 到最新 `main`,确保最终 rebase 干净落地。
 
 ### 提交消息规范
 
