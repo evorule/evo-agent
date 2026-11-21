@@ -483,7 +483,7 @@ impl crate::io_handlers::tool_handler::ToolFunction for BuildCheckTool {
             .to_string();
         let gate = crate::agent::recipe::error_distill_gate();
         let distill = Self::observe_verdict(
-            &verdict,
+            verdict,
             errors,
             &diags,
             command,

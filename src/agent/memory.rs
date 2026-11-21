@@ -850,7 +850,7 @@ pub(crate) fn layerize_stable(
 
     // 召回层填充三级串联（工具族设计档 A1/A3）：族帽（A3）→ 分域限额（A1）→
     // 绝对帽（既有）。关态（配置 None）=原前缀截取语义逐条保持。
-    let recall_total = recallable.len();
+    let _recall_total = recallable.len();
     let mut kept: Vec<MemoryRecord> = Vec::new();
     let mut used = 0usize;
     let mut overflow = false;

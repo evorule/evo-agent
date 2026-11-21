@@ -344,8 +344,8 @@ mod tests {
 
     #[test]
     fn ttl_constant_reasonable() {
-        assert!(CHALLENGE_TTL_SECS >= 60, "至少 1 分钟人在场窗口");
-        assert!(CHALLENGE_TTL_SECS <= 3600, "不超过 1 小时滞留窗");
+        const _: () = assert!(CHALLENGE_TTL_SECS >= 60, "至少 1 分钟人在场窗口");
+        const _: () = assert!(CHALLENGE_TTL_SECS <= 3600, "不超过 1 小时滞留窗");
         let _ = Duration::from_secs(CHALLENGE_TTL_SECS);
     }
 }
