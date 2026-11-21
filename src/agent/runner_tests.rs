@@ -8634,7 +8634,7 @@ async fn run_heartbeat_abort_terminates_pending_io_request() {
     io_terminal.assert();
 }
 
-/// 断流恢复梯·对账采纳(o111 主层修复回归锁):干净断流(首流送出 IoRequest
+/// 断流恢复梯·对账采纳(假失败修复回归锁):干净断流(首流送出 IoRequest
 /// 后无终态事件即关闭)→重建→重建流静默→心跳梯尽→历史对账无在途 io 且
 /// enforce 兜底零命中→采纳终态成功(产出=缓冲 assistant 消息)。
 /// 修复前形态:流 None 直接 break,已完成工作被误记 "Event stream closed"
