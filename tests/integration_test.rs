@@ -145,8 +145,11 @@ async fn test_auto_rewind_on_error() {
 
     let sse_events_error =
         "data: {\"type\":\"Error\",\"payload\":{\"message\":\"LLM timeout\"}}\r\n\r\n";
+    // 断流恢复梯:Error 帧投递后流干净断开触发一次流重建,events 恰两发
+    // (重建流重投同一 Error 帧 → auto-rewind 随之二发)
     server
         .mock("GET", "/api/sessions/456/events")
+        .expect(2)
         .with_status(200)
         .with_header("Content-Type", "text/event-stream")
         .with_body(sse_events_error)
@@ -166,11 +169,23 @@ async fn test_auto_rewind_on_error() {
         .create_async()
         .await;
 
+    // 重建梯下每个 Error 帧各触发一次 auto-rewind,恰两发
     let rewind_mock = server
         .mock("GET", "/api/sessions/456/rewind?version=0")
         .with_status(200)
         .with_body(r#"{"version": 0, "payload": {}, "queue": []}"#)
-        .expect(1)
+        .expect(2)
+        .create_async()
+        .await;
+
+    // 断流收尾对账探测:无违规 → 原样收尾(非 rewind 面,放行即可)
+    server
+        .mock("GET", "/api/sessions/456/evolution-signals?limit=8")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"session_id":456,"total_violations":0,"signals":[],"queue":{"pending_normal":0,"pending_meta_promotion":0}}"#,
+        )
         .create_async()
         .await;
 
